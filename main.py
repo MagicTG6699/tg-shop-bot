@@ -23,9 +23,9 @@ ADMIN_USER_ID = int(admin_id_env) if admin_id_env and admin_id_env.isdigit() els
 ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
 
-# 读取 ADMIN_URL 并自动处理结尾斜杠与混入的符号
+# 精准清洗 ADMIN_URL，剔除 Markdown 格式干扰及多余字符
 raw_admin_url = os.environ.get("ADMIN_URL", "").strip()
-match = re.search(r'https?://[^\s\)]+', raw_admin_url)
+match = re.search(r'https?://[^\s\]\)\>\"\']+', raw_admin_url)
 if match:
     BASE_ADMIN_URL = match.group(0).rstrip('/')
 else:
@@ -376,11 +376,14 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
 async def run_shop_worker(status_msg, parsed_info, task_id: str):
     try:
         result_text = await create_and_setup_shop(parsed_info, task_id)
-        await status_msg.edit_text(result_text, parse_mode="Markdown")
+        # 转义地址显示，避免再次引起渲染解析异常
+        await status_msg.edit_text(result_text, parse_mode="Markdown", disable_web_page_preview=True)
     except asyncio.CancelledError:
         await status_msg.edit_text("🛑 **已取消建店！**")
     except Exception as e:
-        await status_msg.edit_text(f"❌ 建店出现错误：{str(e)}")
+        # 抛出错误时屏蔽 URL 预览
+        safe_err = str(e).replace("[", "\\[").replace("]", "\\]")
+        await status_msg.edit_text(f"❌ 建店出现错误：{safe_err}", parse_mode="Markdown", disable_web_page_preview=True)
     finally:
         ACTIVE_TASKS.pop(task_id, None)
 
@@ -394,7 +397,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     user_id = update.effective_user.id
 
-    # 隐私校验：若设置了管理员 ID 且非私聊管理员，则忽略
     if chat_type == "private" and (ADMIN_USER_ID is not None and user_id != ADMIN_USER_ID):
         return
 
@@ -409,7 +411,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed_info, error_msg = parse_and_validate_text(user_text)
 
     if error_msg:
-        await update.message.reply_text(error_msg, parse_mode="Markdown")
+        await update.message.reply_text(error_msg, parse_mode="Markdown", disable_web_page_preview=True)
         return
 
     task_id = f"{update.message.chat_id}_{update.message.message_id}"
@@ -423,7 +425,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    task = asyncio.create_task(run_shop_worker(status_msg, parsed_info, task_id))
+    task = asyncio.Task(run_shop_worker(status_msg, parsed_info, task_id))
 
     ACTIVE_TASKS[task_id] = {
         "task": task,
