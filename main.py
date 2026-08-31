@@ -14,18 +14,9 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright
 
-# 从环境变量中安全获取配置
-admin_id_env = os.environ.get("ADMIN_USER_ID")
-ADMIN_USER_ID = int(admin_id_env) if admin_id_env and admin_id_env.isdigit() else None
-
-# 读取 ADMIN_URL 并强行清洗可能混入的 Markdown 格式及多余符号
-raw_admin_url = os.environ.get("ADMIN_URL", "https://asdtvheq.com/admin")
-match = re.search(r'https?://[^\s\)]+', raw_admin_url)
-if match:
-    ADMIN_URL = match.group(0).rstrip(']')
-else:
-    ADMIN_URL = raw_admin_url.strip('[]() ')
-
+# 从环境变量中安全获取管理员 ID、后台网址、账号及密码
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "8496241261"))
+ADMIN_URL = os.environ.get("ADMIN_URL", "https://asdtvheq.com/admin")
 ADMIN_USER = os.environ.get("ADMIN_USER", "")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
 
@@ -185,41 +176,23 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
     final_account = base_account
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox']
-        )
+        browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
-        page.set_default_timeout(35000)
+        page.set_default_timeout(30000)
 
         if task_id in ACTIVE_TASKS:
             ACTIVE_TASKS[task_id]["page"] = page
 
         try:
-            # 1. 登录后台（处理重定向与精准匹配 ActiveAdmin / Rails 登录页）
-            login_url = ADMIN_URL if "/login" in ADMIN_URL or "/users/sign_in" in ADMIN_URL else f"{ADMIN_URL.rstrip('/')}/login"
-            await page.goto(login_url, wait_until="networkidle")
+            # 1. 登录后台
+            await page.goto("https://asdtvheq.com/admin", wait_until="domcontentloaded")
+            await page.locator("input[type='text'], input[type='email']").first.fill(ADMIN_USER)
+            await page.locator("input[type='password']").first.fill(ADMIN_PASS)
+            await page.locator("input[type='submit'], button[type='submit']").first.click()
+            await page.wait_for_url(lambda url: "/users/sign_in" not in url, timeout=20000)
 
-            # 兼容 ActiveAdmin 与常规登录页的选择器
-            user_input = page.locator(
-                "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
-            ).first
-            await user_input.wait_for(state="visible", timeout=30000)
-            await user_input.fill(ADMIN_USER)
-
-            pass_input = page.locator(
-                "#admin_user_password, #user_password, input[type='password']"
-            ).first
-            await pass_input.fill(ADMIN_PASS)
-
-            submit_btn = page.locator(
-                "input[type='submit'], button[type='submit'], input[name='commit']"
-            ).first
-            await submit_btn.click()
-            await page.wait_for_load_state("networkidle")
-
-            # 智能搜索函数
+            # 智能搜索函数（写死绝对路径，避免路径切割错误）
             async def search_account(account_name: str):
                 await page.goto("https://asdtvheq.com/admin/merchants", wait_until="domcontentloaded")
                 search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
@@ -238,7 +211,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(1)
 
-            # 2. 循环建店（查重递增）
+            # 2. 循环建店（查重递增，写死绝对路径）
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto("https://asdtvheq.com/admin/merchants/new", wait_until="domcontentloaded")
@@ -380,8 +353,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     user_id = update.effective_user.id
 
-    # 私聊判断：只有提供了 ADMIN_USER_ID 环境变量且 ID 匹配时才响应该私聊
-    if chat_type == "private" and (ADMIN_USER_ID is None or user_id != ADMIN_USER_ID):
+    if chat_type == "private" and user_id != ADMIN_USER_ID:
         return
 
     ignore_keywords = ["店铺网址", "店鋪網址", "登入密碼", "登入密码", "极速微商", "極速微商"]
@@ -436,8 +408,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_info = ACTIVE_TASKS[task_id]
         origin_user_id = task_info["user_id"]
 
-        # 判断仅指令发送者或 ADMIN_USER_ID 允许取消
-        if click_user_id != origin_user_id and (ADMIN_USER_ID is not None and click_user_id != ADMIN_USER_ID):
+        if click_user_id != origin_user_id and click_user_id != ADMIN_USER_ID:
             await query.answer("⚠️ 只有指令发送者或管理员可以取消该任务！", show_alert=True)
             return
 
