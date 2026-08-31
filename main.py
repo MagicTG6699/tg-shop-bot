@@ -185,12 +185,14 @@ async def run_playwright_single_order_build(info, order_ids):
         page = await context.new_page()
         page.set_default_timeout(30000)
 
-        # 1. 登录单笔/三笔 market_managers 后台
+        print(f"[Playwright] 正在访问单笔后台: {SINGLE_ORDER_ADMIN_URL}", flush=True)
         await page.goto(SINGLE_ORDER_ADMIN_URL, wait_until="domcontentloaded")
+        
         await page.locator("input[type='text'], input[type='email']").first.fill(SINGLE_ORDER_ACCOUNT)
         await page.locator("input[type='password']").first.fill(SINGLE_ORDER_PASSWORD)
         await page.locator("input[type='submit'], button[type='submit']").first.click()
         await page.wait_for_url(lambda url: "/sign_in" not in url, timeout=20000)
+        print("[Playwright] 单笔后台登录成功", flush=True)
 
         async def search_account(account_name: str):
             await page.goto("https://asdtvheq.com/market_managers/merchants", wait_until="domcontentloaded")
@@ -211,7 +213,16 @@ async def run_playwright_single_order_build(info, order_ids):
         # 2. 建店循环 (递增查重)
         while True:
             current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-            await page.goto("https://asdtvheq.com/market_managers/merchants/new", wait_until="domcontentloaded")
+            print(f"[Playwright] 尝试创建店铺账号: {current_account}", flush=True)
+            
+            # 访问建店页面，或者通过点击首页的“建立店铺”按钮
+            await page.goto("https://asdtvheq.com/market_managers/merchants", wait_until="domcontentloaded")
+            create_btn = page.locator("a:has-text('建立店铺'), a[href*='/merchants/new']").first
+            if await create_btn.is_visible():
+                await create_btn.click()
+            else:
+                await page.goto("https://asdtvheq.com/market_managers/merchants/new", wait_until="domcontentloaded")
+
             await page.locator("#merchant_username").wait_for(state="visible", timeout=15000)
 
             await page.locator("#merchant_username").fill(current_account)
@@ -264,11 +275,14 @@ async def run_playwright_single_order_build(info, order_ids):
 
             is_used = await page.locator("body").evaluate("el => el.innerText.includes('已经被使用') || el.innerText.includes('已經被使用')")
             if is_used:
+                print(f"[Playwright] 账号 {current_account} 已被使用，尝试递增后缀", flush=True)
                 suffix_num += 1
                 continue
             else:
                 final_account = current_account
                 break
+
+        print(f"[Playwright] 建店成功，最终账号: {final_account}", flush=True)
 
         # 3. 获取店铺网址
         await search_account(final_account)
@@ -450,6 +464,7 @@ def execute_auto_build(chat_id, status_msg_id, parsed_info, order_ids):
         bot.edit_message_text(result_text, chat_id=chat_id, message_id=status_msg_id, disable_web_page_preview=True)
 
     except Exception as e:
+        print(f"[Exception Error]: {str(e)}", flush=True)
         bot.edit_message_text(f"❌ 建店失败: {str(e)}", chat_id=chat_id, message_id=status_msg_id)
 
 @bot.message_handler(func=lambda msg: True)
@@ -458,7 +473,6 @@ def handle_message(message):
     chat_id = message.chat.id
     order_ids = extract_order_ids(text)
 
-    # 超过 3 笔单号时拦截并直接提示
     if len(order_ids) > 3:
         bot.reply_to(message, f"❌ 创建失败：单笔/三笔模式最多只支持 1~3 笔订单号！（当前检测到 {len(order_ids)} 笔）")
         return
