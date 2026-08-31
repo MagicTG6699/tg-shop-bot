@@ -173,7 +173,7 @@ def build_cancel_keyboard(chat_id):
     markup.add(InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel_build_{chat_id}"))
     return markup
 
-# ---------------- 1. 单笔/三笔 市场管理后台 ----------------
+# ---------------- 1. 单笔/三笔 市场管理后台 (修复版) ----------------
 async def run_playwright_single_order_build(info, order_ids):
     base_account = info.get("account")
     suffix_num = 0
@@ -188,6 +188,7 @@ async def run_playwright_single_order_build(info, order_ids):
         print(f"[Playwright] 正在访问单笔后台: {SINGLE_ORDER_ADMIN_URL}", flush=True)
         await page.goto(SINGLE_ORDER_ADMIN_URL, wait_until="domcontentloaded")
         
+        # 1. 登录
         await page.locator("input[type='text'], input[type='email']").first.fill(SINGLE_ORDER_ACCOUNT)
         await page.locator("input[type='password']").first.fill(SINGLE_ORDER_PASSWORD)
         await page.locator("input[type='submit'], button[type='submit']").first.click()
@@ -215,32 +216,43 @@ async def run_playwright_single_order_build(info, order_ids):
             current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
             print(f"[Playwright] 尝试创建店铺账号: {current_account}", flush=True)
             
-            # 访问建店页面，或者通过点击首页的“建立店铺”按钮
+            # 进入店铺列表页
             await page.goto("https://asdtvheq.com/market_managers/merchants", wait_until="domcontentloaded")
-            create_btn = page.locator("a:has-text('建立店铺'), a[href*='/merchants/new']").first
-            if await create_btn.is_visible():
-                await create_btn.click()
-            else:
-                await page.goto("https://asdtvheq.com/market_managers/merchants/new", wait_until="domcontentloaded")
+            
+            # 点击页面右侧的“建立店铺”按钮
+            create_btn = page.locator("a:has-text('建立店铺'), a.btn-primary, a[href*='/merchants/new']").first
+            await create_btn.wait_for(state="visible", timeout=15000)
+            await create_btn.click()
+            await page.wait_for_load_state("domcontentloaded")
 
-            await page.locator("#merchant_username").wait_for(state="visible", timeout=15000)
+            # 等待账号输入框出现（支持多种选择器）
+            username_input = page.locator("#merchant_username, input[name='merchant[username]'], input[id*='username']").first
+            await username_input.wait_for(state="visible", timeout=15000)
 
-            await page.locator("#merchant_username").fill(current_account)
-            if await page.locator("#merchant_password").is_visible():
-                await page.locator("#merchant_password").fill("a12345")
-            if await page.locator("#merchant_password_confirmation").is_visible():
-                await page.locator("#merchant_password_confirmation").fill("a12345")
+            await username_input.fill(current_account)
+            
+            password_input = page.locator("#merchant_password, input[name='merchant[password]'], input[id*='password']").first
+            if await password_input.count() > 0 and await password_input.first.is_visible():
+                await password_input.first.fill("a12345")
+                
+            confirm_input = page.locator("#merchant_password_confirmation, input[name='merchant[password_confirmation]']").first
+            if await confirm_input.count() > 0 and await confirm_input.first.is_visible():
+                await confirm_input.first.fill("a12345")
 
-            if await page.locator("#merchant_sprite_platform").is_visible():
+            platform_select = page.locator("#merchant_sprite_platform, select[name*='sprite_platform']").first
+            if await platform_select.count() > 0 and await platform_select.is_visible():
                 try:
-                    await page.locator("#merchant_sprite_platform").select_option(label="jj")
+                    await platform_select.select_option(label="jj")
                 except Exception:
-                    await page.locator("#merchant_sprite_platform").select_option(value="jj")
+                    await platform_select.select_option(value="jj")
 
-            if await page.locator("#merchant_account_name").is_visible():
-                await page.locator("#merchant_account_name").fill(info.get("name", ""))
-            if await page.locator("#merchant_phone").is_visible():
-                await page.locator("#merchant_phone").fill(info.get("phone", ""))
+            name_input = page.locator("#merchant_account_name, input[name*='account_name']").first
+            if await name_input.count() > 0 and await name_input.is_visible():
+                await name_input.fill(info.get("name", ""))
+
+            phone_input = page.locator("#merchant_phone, input[name*='phone']").first
+            if await phone_input.count() > 0 and await phone_input.is_visible():
+                await phone_input.fill(info.get("phone", ""))
 
             info_type = info.get("type", "alipay")
             default_num = "6226220809397366"
@@ -258,21 +270,23 @@ async def run_playwright_single_order_build(info, order_ids):
                 if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
                 if await card_no_input.is_visible(): await card_no_input.fill(default_num)
 
-            alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name")
+            alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name, input[id*='alipay']").first
             if info_type == "alipay":
                 if await alipay_input.is_visible(): await alipay_input.fill(info.get("alipay_account", ""))
             else:
                 if await alipay_input.is_visible(): await alipay_input.fill("")
 
-            ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name")
+            ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name, input[id*='ecny']").first
             if info_type == "digital_wallet":
                 if await ecny_input.is_visible(): await ecny_input.fill(info.get("digital_account", ""))
             else:
                 if await ecny_input.is_visible(): await ecny_input.fill("")
 
-            await page.locator("input[name='commit'][value='送出']").first.click()
+            # 提交表单
+            await page.locator("input[name='commit'][value='送出'], button[type='submit']:has-text('送出')").first.click()
             await page.wait_for_load_state("domcontentloaded")
 
+            # 检查重复账号提示
             is_used = await page.locator("body").evaluate("el => el.innerText.includes('已经被使用') || el.innerText.includes('已經被使用')")
             if is_used:
                 print(f"[Playwright] 账号 {current_account} 已被使用，尝试递增后缀", flush=True)
