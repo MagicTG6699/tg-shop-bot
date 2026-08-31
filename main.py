@@ -18,7 +18,15 @@ from playwright.async_api import async_playwright
 admin_id_env = os.environ.get("ADMIN_USER_ID")
 ADMIN_USER_ID = int(admin_id_env) if admin_id_env and admin_id_env.isdigit() else None
 
-ADMIN_URL = os.environ.get("ADMIN_URL", "https://asdtvheq.com/admin")
+# 读取 ADMIN_URL 并强行清洗可能混入的 Markdown 格式及多余符号
+raw_admin_url = os.environ.get("ADMIN_URL", "https://asdtvheq.com/admin")
+# 如果包含 [url](url) 格式则提取出真正的 url
+match = re.search(r'https?://[^\s\)]+', raw_admin_url)
+if match:
+    ADMIN_URL = match.group(0).rstrip(']')
+else:
+    ADMIN_URL = raw_admin_url.strip('[]() ')
+
 ADMIN_USER = os.environ.get("ADMIN_USER", "")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
 
