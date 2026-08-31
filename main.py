@@ -7,14 +7,7 @@ from playwright.async_api import async_playwright
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-JJ_BACKEND_URL = os.getenv("JJ_BACKEND_URL") or "https://jemnkcwc.com/admin"
-JJ_ACCOUNT = os.getenv("JJ_ACCOUNT") or "abingo2368ai@gmail.com"
-JJ_PASSWORD = os.getenv("JJ_PASSWORD") or "aa123456789"
-
-MARKET_MANAGER_URL = os.getenv("MARKET_MANAGER_URL") or "https://asdtvheq.com/market_managers/sign_in"
-MARKET_MANAGER_ACCOUNT = os.getenv("MARKET_MANAGER_ACCOUNT") or "kenny001"
-MARKET_MANAGER_PASSWORD = os.getenv("MARKET_MANAGER_PASSWORD") or "a12345"
-
+# 商城后台配置
 MALL_ADMIN_URL = os.getenv("MALL_ADMIN_URL") or "https://asdtvheq.com/admin"
 MALL_ADMIN_ACCOUNT = os.getenv("MALL_ADMIN_ACCOUNT") or "zun001"
 MALL_ADMIN_PASSWORD = os.getenv("MALL_ADMIN_PASSWORD") or "bbb123456"
@@ -41,7 +34,7 @@ def extract_order_ids(text):
     return re.findall(UUID_PATTERN, text)
 
 def extract_info(text):
-    """解析消息中的字段信息"""
+    """提取平台账号、户名、数字人民币账号、手机号"""
     account_match = re.search(r'(?:平台帳號|平台账号)\s*[:：]\s*(\S+)', text)
     name_match = re.search(r'(?:数字人民币户名|數字人民幣戶名)\s*[:：]\s*(\S+)', text)
     rmb_match = re.search(r'(?:数字人民币|數字人民幣)\s*[:：]\s*(\S+)', text)
@@ -60,22 +53,22 @@ def build_cancel_keyboard(chat_id):
     return markup
 
 async def run_playwright_build(info, order_ids):
-    target_url = clean_url(MARKET_MANAGER_URL, "https://asdtvheq.com/market_managers/sign_in")
-    print(f"[1] 打开市场人员后台...", flush=True)
+    target_url = clean_url(MALL_ADMIN_URL, "https://asdtvheq.com/admin")
+    print(f"[1] 打开商城总后台: {target_url}", flush=True)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
 
-        # 1. 打开页面并登录
+        # 1. 打开商城管理员后台并登录
         await page.goto(target_url, timeout=60000)
         await page.wait_for_selector('input[type="password"]', timeout=15000)
 
         inputs = await page.query_selector_all('input[type="text"]')
         if inputs:
-            await inputs[0].fill(MARKET_MANAGER_ACCOUNT)
-        await page.fill('input[type="password"]', MARKET_MANAGER_PASSWORD)
+            await inputs[0].fill(MALL_ADMIN_ACCOUNT)
+        await page.fill('input[type="password"]', MALL_ADMIN_PASSWORD)
 
         submit_btn = await page.query_selector('button[type="submit"], input[type="submit"]')
         if submit_btn:
@@ -84,47 +77,49 @@ async def run_playwright_build(info, order_ids):
             await page.keyboard.press("Enter")
 
         await page.wait_for_timeout(3000)
-        print("[2] 登录市场后台成功", flush=True)
+        print("[2] 登录商城总后台成功", flush=True)
 
-        # 2. 点击“建立店铺”按钮
-        shop_btn = await page.query_selector('text="建立店铺"') or await page.query_selector('text="建立店鋪"')
-        if shop_btn:
-            await shop_btn.click()
+        # 2. 点击左侧菜单“店铺管理”
+        shop_menu = await page.query_selector('text="店铺管理"') or await page.query_selector('text="店鋪管理"')
+        if shop_menu:
+            await shop_menu.click()
             await page.wait_for_timeout(2000)
-            print("[3] 点击'建立店铺'按钮成功", flush=True)
+            print("[3] 进入店铺管理页面", flush=True)
 
-            # 3. 填写表单字段
-            text_inputs = await page.query_selector_all('input[type="text"]')
+        # 3. 点击“建立店铺”按钮
+        create_btn = await page.query_selector('text="建立店铺"') or await page.query_selector('text="建立店鋪"')
+        if create_btn:
+            await create_btn.click()
+            await page.wait_for_timeout(2000)
+            print("[4] 点击'建立店铺'成功", flush=True)
+
+            # 4. 填写弹窗表单
+            text_inputs = await page.query_selector_all('.modal input[type="text"], div[role="dialog"] input[type="text"]')
+            if not text_inputs:
+                text_inputs = await page.query_selector_all('input[type="text"]')
+
             if len(text_inputs) >= 4:
                 await text_inputs[0].fill(info['account'])
                 await text_inputs[1].fill(info['name'])
                 await text_inputs[2].fill(info['rmb'])
                 await text_inputs[3].fill(info['phone'])
-            else:
-                # 备用填写方式
-                labels = {
-                    '帐号': info['account'],
-                    '账号': info['account'],
-                    '户名': info['name'],
-                    '人民币': info['rmb'],
-                    '手机': info['phone']
-                }
-                for key, val in labels.items():
-                    try:
-                        inp = await page.query_selector(f'input[placeholder*="{key}"]')
-                        if inp and val:
-                            await inp.fill(val)
-                    except:
-                        pass
+                print(f"[5] 表单填写完成: 账号={info['account']}", flush=True)
 
-            # 4. 点击保存/确定提交
-            confirm_btn = await page.query_selector('button:has-text("确定")') or await page.query_selector('button:has-text("確認")') or await page.query_selector('button:has-text("保存")')
+            # 5. 点击确定/提交保存按钮
+            confirm_btn = (
+                await page.query_selector('.modal button:has-text("确定")') or
+                await page.query_selector('.modal button:has-text("確認")') or
+                await page.query_selector('button:has-text("确定")') or
+                await page.query_selector('button:has-text("確認")')
+            )
             if confirm_btn:
                 await confirm_btn.click()
                 await page.wait_for_timeout(3000)
-                print("[4] 店铺创建表单已提交！", flush=True)
+                print("[6] ✅ 店铺建立表单提交成功！", flush=True)
+            else:
+                print("[6] ⚠️ 未找到确认按钮", flush=True)
         else:
-            print("[3] ⚠️ 未找到'建立店铺'按钮", flush=True)
+            print("[4] ⚠️ 仍然未找到'建立店铺'按钮", flush=True)
 
         await browser.close()
 
@@ -137,7 +132,6 @@ def execute_auto_build(chat_id, status_msg_id, text, order_ids):
 
         asyncio.run(run_playwright_build(info, order_ids))
 
-        base_shop_url = clean_url(SHOP_BASE_URL, "https://asdtvheq.com").rstrip('/')
         account_name = info['account'] or "test01"
         result_text = (
             f"✅ 建店完成！\n\n"
