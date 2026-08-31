@@ -185,31 +185,36 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
     final_account = base_account
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
         context = await browser.new_context()
         page = await context.new_page()
-        page.set_default_timeout(30000)
+        page.set_default_timeout(35000)
 
         if task_id in ACTIVE_TASKS:
             ACTIVE_TASKS[task_id]["page"] = page
 
         try:
-            # 1. 登录后台（优化选择器及等待逻辑）
-            await page.goto(ADMIN_URL, wait_until="domcontentloaded")
-            
+            # 1. 登录后台（处理重定向与精准匹配 ActiveAdmin / Rails 登录页）
+            login_url = ADMIN_URL if "/login" in ADMIN_URL or "/users/sign_in" in ADMIN_URL else f"{ADMIN_URL.rstrip('/')}/login"
+            await page.goto(login_url, wait_until="networkidle")
+
+            # 兼容 ActiveAdmin 与常规登录页的选择器
             user_input = page.locator(
-                "input[name*='user'], input[name*='login'], input[name*='email'], "
-                "input[id*='user'], input[id*='login'], input[type='text'], input[type='email']"
+                "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
             ).first
             await user_input.wait_for(state="visible", timeout=30000)
             await user_input.fill(ADMIN_USER)
 
-            pass_input = page.locator("input[type='password']").first
+            pass_input = page.locator(
+                "#admin_user_password, #user_password, input[type='password']"
+            ).first
             await pass_input.fill(ADMIN_PASS)
 
             submit_btn = page.locator(
-                "input[type='submit'], button[type='submit'], "
-                "button:has-text('登录'), button:has-text('登入'), .btn-primary"
+                "input[type='submit'], button[type='submit'], input[name='commit']"
             ).first
             await submit_btn.click()
             await page.wait_for_load_state("networkidle")
