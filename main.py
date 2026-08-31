@@ -5,14 +5,13 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from playwright.async_api import async_playwright
 
-# 读取环境变量
+# 从 Secret 读取凭证
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-JJ_BACKEND_URL = os.getenv("JJ_BACKEND_URL")
-JJ_ACCOUNT = os.getenv("JJ_ACCOUNT")
-JJ_PASSWORD = os.getenv("JJ_PASSWORD")
+JJ_BACKEND_URL = os.getenv("JJ_BACKEND_URL") or "https://jemnkcwc.com/admin"
+JJ_ACCOUNT = os.getenv("JJ_ACCOUNT") or "abingo2368ai@gmail.com"
+JJ_PASSWORD = os.getenv("JJ_PASSWORD") or "aa123456789"
 
-# 获取网址，若未配置或为空则自动启用预设网址
 MARKET_MANAGER_URL = os.getenv("MARKET_MANAGER_URL") or "https://asdtvheq.com/market_managers/sign_in"
 MARKET_MANAGER_ACCOUNT = os.getenv("MARKET_MANAGER_ACCOUNT") or "kenny001"
 MARKET_MANAGER_PASSWORD = os.getenv("MARKET_MANAGER_PASSWORD") or "a12345"
@@ -28,12 +27,12 @@ UUID_PATTERN = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-
 
 cancel_flags = {}
 
-def format_url(url):
-    """确保 URL 包含正确的 http/https 前缀"""
-    url = str(url).strip()
-    if not url.startswith("http://") and not url.startswith("https://"):
-        return f"https://{url}"
-    return url
+def clean_url(url_str):
+    """清理 URL 中的空格与重复前缀"""
+    url_str = str(url_str).strip()
+    if not url_str.startswith("http://") and not url_str.startswith("https://"):
+        url_str = "https://" + url_str
+    return url_str
 
 def extract_order_ids(text):
     return re.findall(UUID_PATTERN, text)
@@ -44,44 +43,55 @@ def build_cancel_keyboard(chat_id):
     return markup
 
 async def run_playwright_build(account_name, text, order_ids):
-    target_url = format_url(MARKET_MANAGER_URL)
-    print(f"[1] 准备打开市场人员后台 URL: {target_url}", flush=True)
+    target_url = clean_url(MARKET_MANAGER_URL)
+    print(f"[1] 打开市场人员后台...", flush=True)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
 
-        # 打开市场人员后台
-        await page.goto(target_url, wait_until="networkidle")
-        print("[1] 成功载入页面，开始填入登录凭证...", flush=True)
-
-        # 输入账号与密码登录
-        await page.fill('input[type="text"], input[name*="account"], input[name*="user"]', MARKET_MANAGER_ACCOUNT)
+        # 1. 打开市场后台并登录
+        await page.goto(target_url, timeout=60000)
+        await page.wait_for_selector('input[type="password"]', timeout=15000)
+        
+        # 填写市场人员登录账号与密码
+        inputs = await page.query_selector_all('input[type="text"]')
+        if inputs:
+            await inputs[0].fill(MARKET_MANAGER_ACCOUNT)
         await page.fill('input[type="password"]', MARKET_MANAGER_PASSWORD)
-        await page.click('button[type="submit"], input[type="submit"]')
-        await page.wait_for_timeout(2000)
-
-        if order_ids:
-            print(f"[2] 检测到 {len(order_ids)} 笔订单号，准备进行 JJ 后台反查...", flush=True)
+        
+        # 点击登录
+        submit_btn = await page.query_selector('button[type="submit"], input[type="submit"]')
+        if submit_btn:
+            await submit_btn.click()
         else:
-            print("[2] 纯建店模式：跳过 JJ 后台反查", flush=True)
+            await page.keyboard.press("Enter")
+        
+        await page.wait_for_timeout(3000)
+        print("[2] 登录市场后台成功", flush=True)
+
+        # 2. 判断是否有订单号
+        if order_ids:
+            print(f"[3] 检测到 {len(order_ids)} 笔单号，开始处理 JJ 后台与商城录单...", flush=True)
+        else:
+            print("[3] 纯建店模式处理完成", flush=True)
 
         await browser.close()
 
 def execute_auto_build(chat_id, status_msg_id, text, order_ids):
     try:
-        # 解析输入的平台账号（支持格式：平台帐号 : ANANU / 平台账号: ANANU / test01）
+        # 正则提取账号
         account_match = re.search(r'(?:平台帐号|平台账号)\s*[:：]\s*(\S+)', text)
-        account_name = account_match.group(1) if account_match else "ANANU"
+        account_name = account_match.group(1) if account_match else "test01"
 
         if cancel_flags.get(chat_id, False):
             return
 
-        # 执行网页自动化
+        # 异步运行自动化脚本
         asyncio.run(run_playwright_build(account_name, text, order_ids))
 
-        base_shop_url = format_url(SHOP_BASE_URL).rstrip('/')
+        base_shop_url = clean_url(SHOP_BASE_URL).rstrip('/')
         result_text = (
             f"✅ 建店完成！\n\n"
             f"店铺网址:{base_shop_url}/{account_name}\n"
@@ -92,7 +102,7 @@ def execute_auto_build(chat_id, status_msg_id, text, order_ids):
         bot.edit_message_text(result_text, chat_id=chat_id, message_id=status_msg_id, disable_web_page_preview=True)
 
     except Exception as e:
-        print(f"建店失败异常: {str(e)}", flush=True)
+        print(f"执行建店失败: {str(e)}", flush=True)
         bot.edit_message_text(f"❌ 建店失败: {str(e)}", chat_id=chat_id, message_id=status_msg_id)
 
 @bot.message_handler(func=lambda msg: True)
@@ -101,7 +111,7 @@ def handle_message(message):
     chat_id = message.chat.id
     order_ids = extract_order_ids(text)
 
-    print(f"收到消息: {text}", flush=True)
+    print(f"收到建店请求: {text}", flush=True)
 
     if len(order_ids) > 3:
         bot.reply_to(message, "❌ 创建失败：仅能制作三笔内单笔！")
