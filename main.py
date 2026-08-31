@@ -173,7 +173,7 @@ def build_cancel_keyboard(chat_id):
     markup.add(InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel_build_{chat_id}"))
     return markup
 
-# ---------------- 1. 单笔/三笔 市场管理后台 (修复版) ----------------
+# ---------------- 1. 单笔/三笔 市场管理后台 (修复跳转逻辑) ----------------
 async def run_playwright_single_order_build(info, order_ids):
     base_account = info.get("account")
     suffix_num = 0
@@ -188,7 +188,7 @@ async def run_playwright_single_order_build(info, order_ids):
         print(f"[Playwright] 正在访问单笔后台: {SINGLE_ORDER_ADMIN_URL}", flush=True)
         await page.goto(SINGLE_ORDER_ADMIN_URL, wait_until="domcontentloaded")
         
-        # 1. 登录
+        # 登录后台
         await page.locator("input[type='text'], input[type='email']").first.fill(SINGLE_ORDER_ACCOUNT)
         await page.locator("input[type='password']").first.fill(SINGLE_ORDER_PASSWORD)
         await page.locator("input[type='submit'], button[type='submit']").first.click()
@@ -211,21 +211,14 @@ async def run_playwright_single_order_build(info, order_ids):
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(1)
 
-        # 2. 建店循环 (递增查重)
+        # 2. 建店循环 (直达 new 页面，避开寻找页面按钮)
         while True:
             current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
             print(f"[Playwright] 尝试创建店铺账号: {current_account}", flush=True)
             
-            # 进入店铺列表页
-            await page.goto("https://asdtvheq.com/market_managers/merchants", wait_until="domcontentloaded")
-            
-            # 点击页面右侧的“建立店铺”按钮
-            create_btn = page.locator("a:has-text('建立店铺'), a.btn-primary, a[href*='/merchants/new']").first
-            await create_btn.wait_for(state="visible", timeout=15000)
-            await create_btn.click()
-            await page.wait_for_load_state("domcontentloaded")
+            # 直接跳转到建店路径
+            await page.goto("https://asdtvheq.com/market_managers/merchants/new", wait_until="domcontentloaded")
 
-            # 等待账号输入框出现（支持多种选择器）
             username_input = page.locator("#merchant_username, input[name='merchant[username]'], input[id*='username']").first
             await username_input.wait_for(state="visible", timeout=15000)
 
@@ -283,7 +276,7 @@ async def run_playwright_single_order_build(info, order_ids):
                 if await ecny_input.is_visible(): await ecny_input.fill("")
 
             # 提交表单
-            await page.locator("input[name='commit'][value='送出'], button[type='submit']:has-text('送出')").first.click()
+            await page.locator("input[name='commit'][value='送出'], button[type='submit']:has-text('送出'), input[type='submit']").first.click()
             await page.wait_for_load_state("domcontentloaded")
 
             # 检查重复账号提示
@@ -305,7 +298,7 @@ async def run_playwright_single_order_build(info, order_ids):
         # 4. 绑定单笔/三笔订单号 (出货订单)
         await page.locator("tbody tr").first.locator("a[href$='/deposits']").click()
         for oid in order_ids:
-            new_btn = page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單'), a:has-text('新增订单')").first
+            new_btn = page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單'), a:has-text('新增订单'), a:has-text('新增訂單')").first
             if await new_btn.is_visible():
                 await new_btn.click()
                 order_input = page.locator("input[name*='order'], #deposit_order_number, textarea[name*='order']").first
