@@ -7,7 +7,7 @@ from playwright.async_api import async_playwright
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# 后台配置
+# 一般商城后台配置
 MALL_ADMIN_URL = os.getenv("MALL_ADMIN_URL") or "https://asdtvheq.com/admin"
 MALL_ADMIN_ACCOUNT = os.getenv("MALL_ADMIN_ACCOUNT") or "zun001"
 MALL_ADMIN_PASSWORD = os.getenv("MALL_ADMIN_PASSWORD") or "bbb123456"
@@ -34,7 +34,7 @@ def extract_order_ids(text):
     return re.findall(UUID_PATTERN, text)
 
 def extract_info(text):
-    """解析发送信息中的字段"""
+    """提取平台账号、数字人民币户名、数字人民币账号、手机号"""
     account_match = re.search(r'(?:平台帳號|平台账号)\s*[:：]\s*(\S+)', text)
     name_match = re.search(r'(?:数字人民币户名|數字人民幣戶名)\s*[:：]\s*(\S+)', text)
     rmb_match = re.search(r'(?:数字人民币|數字人民幣)\s*[:：]\s*(\S+)', text)
@@ -61,7 +61,7 @@ async def run_playwright_build(info, order_ids):
         context = await browser.new_context()
         page = await context.new_page()
 
-        # 1. 登录后台
+        # 1. 登录一般商城后台
         await page.goto(base_admin_url, timeout=60000)
         await page.wait_for_selector('input[type="password"]', timeout=15000)
 
@@ -79,21 +79,13 @@ async def run_playwright_build(info, order_ids):
         await page.wait_for_timeout(3000)
         print("[2] 登录成功", flush=True)
 
-        # 2. 精确点击“建立店铺”按钮 (优先通过绝对 href 路径识别)
-        create_btn = await page.query_selector('a[href*="/merchants/new"]') or await page.query_selector('text="建立店鋪"') or await page.query_selector('text="建立店铺"')
-        
-        if create_btn:
-            await create_btn.click()
-            await page.wait_for_timeout(2000)
-            print("[3] 进入新建店铺页面", flush=True)
-        else:
-            # 如果没查找到按钮，直接跳转建店页面 URL
-            create_page_url = base_admin_url.rstrip('/admin') + "/admin/merchants/new"
-            print(f"[3] 直接跳转建店页面: {create_page_url}", flush=True)
-            await page.goto(create_page_url)
-            await page.wait_for_timeout(2000)
+        # 2. 直接访问新建店铺的准确完整 URL（避免域名末尾 .co/.com 错误切分）
+        create_page_url = "https://asdtvheq.com/admin/merchants/new"
+        print(f"[3] 直接跳转建店页面: {create_page_url}", flush=True)
+        await page.goto(create_page_url, timeout=60000)
+        await page.wait_for_timeout(2000)
 
-        # 3. 填写建店表单
+        # 3. 自动填写建店表单
         text_inputs = await page.query_selector_all('input[type="text"]')
         if len(text_inputs) >= 4:
             await text_inputs[0].fill(info['account'])
@@ -102,28 +94,22 @@ async def run_playwright_build(info, order_ids):
             await text_inputs[3].fill(info['phone'])
             print(f"[4] 表单填写完成: 账号={info['account']}", flush=True)
         else:
-            # 兼容按 label/placeholder 填写
-            field_map = [
-                ('帐号', info['account']),
-                ('户名', info['name']),
-                ('人民币', info['rmb']),
-                ('手机', info['phone'])
-            ]
-            for idx, (label, val) in enumerate(field_map):
-                if idx < len(text_inputs) and val:
-                    await text_inputs[idx].fill(val)
+            print("[4] ⚠️ 未能按顺序找到 4 个文本输入框", flush=True)
 
-        # 4. 点击提交/保存
+        # 4. 点击保存/提交按钮
         save_btn = (
             await page.query_selector('input[type="submit"]') or 
             await page.query_selector('button[type="submit"]') or 
             await page.query_selector('button:has-text("保存")') or 
-            await page.query_selector('button:has-text("確定")')
+            await page.query_selector('button:has-text("確定")') or 
+            await page.query_selector('button:has-text("确定")')
         )
         if save_btn:
             await save_btn.click()
             await page.wait_for_timeout(3000)
             print("[5] ✅ 店铺提交保存完成！", flush=True)
+        else:
+            print("[5] ⚠️ 未找到提交保存按钮", flush=True)
 
         await browser.close()
 
