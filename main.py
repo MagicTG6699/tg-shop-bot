@@ -5,10 +5,9 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from playwright.async_api import async_playwright
 
-# 读取 Token
+# 从 Secret 读取凭证
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# 网址与凭证配置（带默认兜底）
 JJ_BACKEND_URL = os.getenv("JJ_BACKEND_URL") or "https://jemnkcwc.com/admin"
 JJ_ACCOUNT = os.getenv("JJ_ACCOUNT") or "abingo2368ai@gmail.com"
 JJ_PASSWORD = os.getenv("JJ_PASSWORD") or "aa123456789"
@@ -28,10 +27,17 @@ UUID_PATTERN = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-
 
 cancel_flags = {}
 
-def get_valid_url(url_val, default_url):
-    """确保返回合法 URL 字符串"""
-    if not url_val or not isinstance(url_val, str) or len(url_val.strip()) < 8:
+def clean_url(url_val, default_url):
+    """强力清洗 URL，过滤 markdown [http](http) 及重复前缀"""
+    if not url_val or not isinstance(url_val, str):
         return default_url
+    
+    # 提取括号或文本中的合法 URL 匹配
+    match = re.search(r'https?://[^\s\]\)\"]+', url_val)
+    if match:
+        return match.group(0)
+    
+    # 清理空格
     url_str = url_val.strip()
     if not url_str.startswith("http://") and not url_str.startswith("https://"):
         return f"https://{url_str}"
@@ -46,8 +52,8 @@ def build_cancel_keyboard(chat_id):
     return markup
 
 async def run_playwright_build(account_name, text, order_ids):
-    target_url = get_valid_url(MARKET_MANAGER_URL, "https://asdtvheq.com/market_managers/sign_in")
-    print(f"[1] 打开市场人员后台: {target_url}", flush=True)
+    target_url = clean_url(MARKET_MANAGER_URL, "https://asdtvheq.com/market_managers/sign_in")
+    print(f"[1] 准备打开市场人员后台...", flush=True)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -58,7 +64,7 @@ async def run_playwright_build(account_name, text, order_ids):
         await page.goto(target_url, timeout=60000)
         await page.wait_for_selector('input[type="password"]', timeout=15000)
 
-        # 输入市场人员账号与密码
+        # 输入账号与密码
         inputs = await page.query_selector_all('input[type="text"]')
         if inputs:
             await inputs[0].fill(MARKET_MANAGER_ACCOUNT)
@@ -74,7 +80,7 @@ async def run_playwright_build(account_name, text, order_ids):
         print("[2] 登录市场后台成功", flush=True)
 
         if order_ids:
-            print(f"[3] 检测到 {len(order_ids)} 笔单号，开始处理订单反查与商城建店...", flush=True)
+            print(f"[3] 检测到 {len(order_ids)} 笔单号，开始处理订单...", flush=True)
         else:
             print("[3] 纯建店模式处理完成", flush=True)
 
@@ -90,7 +96,7 @@ def execute_auto_build(chat_id, status_msg_id, text, order_ids):
 
         asyncio.run(run_playwright_build(account_name, text, order_ids))
 
-        base_shop_url = get_valid_url(SHOP_BASE_URL, "https://asdtvheq.com").rstrip('/')
+        base_shop_url = clean_url(SHOP_BASE_URL, "https://asdtvheq.com").rstrip('/')
         result_text = (
             f"✅ 建店完成！\n\n"
             f"店铺网址:{base_shop_url}/{account_name}\n"
