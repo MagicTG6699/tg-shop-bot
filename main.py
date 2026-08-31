@@ -14,13 +14,12 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright
 
-# 从环境变量中安全获取配置（已移除硬编码的管理员 ID）
+# 从环境变量中安全获取配置
 admin_id_env = os.environ.get("ADMIN_USER_ID")
 ADMIN_USER_ID = int(admin_id_env) if admin_id_env and admin_id_env.isdigit() else None
 
 # 读取 ADMIN_URL 并强行清洗可能混入的 Markdown 格式及多余符号
 raw_admin_url = os.environ.get("ADMIN_URL", "https://asdtvheq.com/admin")
-# 如果包含 [url](url) 格式则提取出真正的 url
 match = re.search(r'https?://[^\s\)]+', raw_admin_url)
 if match:
     ADMIN_URL = match.group(0).rstrip(']')
@@ -195,12 +194,25 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             ACTIVE_TASKS[task_id]["page"] = page
 
         try:
-            # 1. 登录后台
+            # 1. 登录后台（优化选择器及等待逻辑）
             await page.goto(ADMIN_URL, wait_until="domcontentloaded")
-            await page.locator("input[type='text'], input[type='email']").first.fill(ADMIN_USER)
-            await page.locator("input[type='password']").first.fill(ADMIN_PASS)
-            await page.locator("input[type='submit'], button[type='submit']").first.click()
-            await page.wait_for_url(lambda url: "/users/sign_in" not in url, timeout=20000)
+            
+            user_input = page.locator(
+                "input[name*='user'], input[name*='login'], input[name*='email'], "
+                "input[id*='user'], input[id*='login'], input[type='text'], input[type='email']"
+            ).first
+            await user_input.wait_for(state="visible", timeout=30000)
+            await user_input.fill(ADMIN_USER)
+
+            pass_input = page.locator("input[type='password']").first
+            await pass_input.fill(ADMIN_PASS)
+
+            submit_btn = page.locator(
+                "input[type='submit'], button[type='submit'], "
+                "button:has-text('登录'), button:has-text('登入'), .btn-primary"
+            ).first
+            await submit_btn.click()
+            await page.wait_for_load_state("networkidle")
 
             # 智能搜索函数
             async def search_account(account_name: str):
