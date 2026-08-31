@@ -5,17 +5,21 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from playwright.async_api import async_playwright
 
+# ----------------- 环境变量配置 (无硬编码) -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # 一般商城后台配置 (无订单号时)
-MALL_ADMIN_URL = os.getenv("MALL_ADMIN_URL") or "https://asdtvheq.com/admin"
-MALL_ADMIN_ACCOUNT = os.getenv("MALL_ADMIN_ACCOUNT") or os.getenv("ADMIN_USER") or "zun001"
-MALL_ADMIN_PASSWORD = os.getenv("MALL_ADMIN_PASSWORD") or os.getenv("ADMIN_PASS") or "bbb123456"
+MALL_ADMIN_URL = os.getenv("MALL_ADMIN_URL", "https://asdtvheq.com/admin")
+MALL_ADMIN_ACCOUNT = os.getenv("MALL_ADMIN_ACCOUNT") or os.getenv("ADMIN_USER")
+MALL_ADMIN_PASSWORD = os.getenv("MALL_ADMIN_PASSWORD") or os.getenv("ADMIN_PASS")
 
 # 单笔/三笔 市场管理后台配置 (1~3笔订单号时)
-SINGLE_ORDER_ADMIN_URL = "https://asdtvheq.com/market_managers/sign_in"
-SINGLE_ORDER_ACCOUNT = "kenny001"
-SINGLE_ORDER_PASSWORD = "a12345"
+SINGLE_ORDER_ADMIN_URL = os.getenv("SINGLE_ORDER_ADMIN_URL", "https://asdtvheq.com/market_managers/sign_in")
+SINGLE_ORDER_ACCOUNT = os.getenv("SINGLE_ORDER_ACCOUNT") or os.getenv("MARKET_USER")
+SINGLE_ORDER_PASSWORD = os.getenv("SINGLE_ORDER_PASSWORD") or os.getenv("MARKET_PASS")
+
+# 自动推导基础域名 (例如 https://asdtvheq.com)
+BASE_DOMAIN = re.sub(r'/(admin|market_managers).*$', '', SINGLE_ORDER_ADMIN_URL)
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 UUID_PATTERN = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
@@ -173,7 +177,7 @@ def build_cancel_keyboard(chat_id):
     markup.add(InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel_build_{chat_id}"))
     return markup
 
-# ---------------- 1. 单笔/三笔 市场管理后台 (修复跳转逻辑) ----------------
+# ---------------- 1. 单笔/三笔 市场管理后台 ----------------
 async def run_playwright_single_order_build(info, order_ids):
     base_account = info.get("account")
     suffix_num = 0
@@ -188,15 +192,16 @@ async def run_playwright_single_order_build(info, order_ids):
         print(f"[Playwright] 正在访问单笔后台: {SINGLE_ORDER_ADMIN_URL}", flush=True)
         await page.goto(SINGLE_ORDER_ADMIN_URL, wait_until="domcontentloaded")
         
-        # 登录后台
+        # 登录
         await page.locator("input[type='text'], input[type='email']").first.fill(SINGLE_ORDER_ACCOUNT)
         await page.locator("input[type='password']").first.fill(SINGLE_ORDER_PASSWORD)
         await page.locator("input[type='submit'], button[type='submit']").first.click()
         await page.wait_for_url(lambda url: "/sign_in" not in url, timeout=20000)
-        print("[Playwright] 单笔后台登录成功", flush=True)
+        print(f"[Playwright] 单笔后台登录成功，当前URL: {page.url}", flush=True)
 
         async def search_account(account_name: str):
-            await page.goto("https://asdtvheq.com/market_managers/merchants", wait_until="domcontentloaded")
+            merchants_url = f"{BASE_DOMAIN}/market_managers/merchants"
+            await page.goto(merchants_url, wait_until="domcontentloaded")
             search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
             await search_input.wait_for(state="visible", timeout=15000)
             await search_input.fill(account_name)
@@ -211,16 +216,49 @@ async def run_playwright_single_order_build(info, order_ids):
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(1)
 
-        # 2. 建店循环 (直达 new 页面，避开寻找页面按钮)
+        # 2. 建店循环
         while True:
             current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
             print(f"[Playwright] 尝试创建店铺账号: {current_account}", flush=True)
             
-            # 直接跳转到建店路径
-            await page.goto("https://asdtvheq.com/market_managers/merchants/new", wait_until="domcontentloaded")
+            # 访问列表页
+            merchants_url = f"{BASE_DOMAIN}/market_managers/merchants"
+            await page.goto(merchants_url, wait_until="domcontentloaded")
+            
+            # 多重兼容匹配新建按钮
+            new_btn_selectors = [
+                "a[href$='/merchants/new']",
+                "a[href*='/merchants/new']",
+                "a:has-text('建立店铺')",
+                "a:has-text('建立店鋪')",
+                "a:has-text('新增店铺')",
+                "a:has-text('新增店鋪')",
+                "a:has-text('建立商家')",
+                "a:has-text('新增商家')",
+                ".btn-primary:has-text('建立')",
+                ".btn-primary:has-text('新增')"
+            ]
+            
+            btn_found = False
+            for sel in new_btn_selectors:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click()
+                    btn_found = True
+                    break
+            
+            if not btn_found:
+                # 备用：如果列表页找不到按钮，直接拼 URL 跳转
+                print("[Playwright] 没找到建店按钮，尝试直接访问 /new 路径...", flush=True)
+                await page.goto(f"{BASE_DOMAIN}/market_managers/merchants/new", wait_until="domcontentloaded")
 
-            username_input = page.locator("#merchant_username, input[name='merchant[username]'], input[id*='username']").first
-            await username_input.wait_for(state="visible", timeout=15000)
+            # 等待账号表单加载
+            username_input = page.locator("input[name='merchant[username]'], #merchant_username, input[id*='username']").first
+            try:
+                await username_input.wait_for(state="visible", timeout=15000)
+            except Exception as e:
+                print(f"[Playwright 调试信息] 当前页面真实 URL: {page.url}", flush=True)
+                raise e
 
             await username_input.fill(current_account)
             
@@ -321,14 +359,15 @@ async def run_playwright_general_build(info):
         page = await context.new_page()
         page.set_default_timeout(30000)
 
-        await page.goto("https://asdtvheq.com/admin", wait_until="domcontentloaded")
+        await page.goto(MALL_ADMIN_URL, wait_until="domcontentloaded")
         await page.locator("input[type='text'], input[type='email']").first.fill(MALL_ADMIN_ACCOUNT)
         await page.locator("input[type='password']").first.fill(MALL_ADMIN_PASSWORD)
         await page.locator("input[type='submit'], button[type='submit']").first.click()
         await page.wait_for_url(lambda url: "/users/sign_in" not in url, timeout=20000)
 
         async def search_account(account_name: str):
-            await page.goto("https://asdtvheq.com/admin/merchants", wait_until="domcontentloaded")
+            merchants_url = f"{BASE_DOMAIN}/admin/merchants"
+            await page.goto(merchants_url, wait_until="domcontentloaded")
             search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
             await search_input.wait_for(state="visible", timeout=15000)
             await search_input.fill(account_name)
@@ -345,7 +384,7 @@ async def run_playwright_general_build(info):
 
         while True:
             current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-            await page.goto("https://asdtvheq.com/admin/merchants/new", wait_until="domcontentloaded")
+            await page.goto(f"{BASE_DOMAIN}/admin/merchants/new", wait_until="domcontentloaded")
             await page.locator("#merchant_username").wait_for(state="visible", timeout=15000)
 
             await page.locator("#merchant_username").fill(current_account)
