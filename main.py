@@ -5,7 +5,6 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from playwright.async_api import async_playwright
 
-# 从 Secret 读取凭证
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 JJ_BACKEND_URL = os.getenv("JJ_BACKEND_URL") or "https://jemnkcwc.com/admin"
@@ -28,16 +27,11 @@ UUID_PATTERN = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-
 cancel_flags = {}
 
 def clean_url(url_val, default_url):
-    """强力清洗 URL，过滤 markdown [http](http) 及重复前缀"""
     if not url_val or not isinstance(url_val, str):
         return default_url
-    
-    # 提取括号或文本中的合法 URL 匹配
     match = re.search(r'https?://[^\s\]\)\"]+', url_val)
     if match:
         return match.group(0)
-    
-    # 清理空格
     url_str = url_val.strip()
     if not url_str.startswith("http://") and not url_str.startswith("https://"):
         return f"https://{url_str}"
@@ -46,25 +40,38 @@ def clean_url(url_val, default_url):
 def extract_order_ids(text):
     return re.findall(UUID_PATTERN, text)
 
+def extract_info(text):
+    """解析消息中的字段信息"""
+    account_match = re.search(r'(?:平台帳號|平台账号)\s*[:：]\s*(\S+)', text)
+    name_match = re.search(r'(?:数字人民币户名|數字人民幣戶名)\s*[:：]\s*(\S+)', text)
+    rmb_match = re.search(r'(?:数字人民币|數字人民幣)\s*[:：]\s*(\S+)', text)
+    phone_match = re.search(r'(?:手机号|手機號)\s*[:：]\s*(\S+)', text)
+
+    return {
+        'account': account_match.group(1) if account_match else "",
+        'name': name_match.group(1) if name_match else "",
+        'rmb': rmb_match.group(1) if rmb_match else "",
+        'phone': phone_match.group(1) if phone_match else ""
+    }
+
 def build_cancel_keyboard(chat_id):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel_build_{chat_id}"))
     return markup
 
-async def run_playwright_build(account_name, text, order_ids):
+async def run_playwright_build(info, order_ids):
     target_url = clean_url(MARKET_MANAGER_URL, "https://asdtvheq.com/market_managers/sign_in")
-    print(f"[1] 准备打开市场人员后台...", flush=True)
+    print(f"[1] 打开市场人员后台...", flush=True)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
 
-        # 打开页面
+        # 1. 打开页面并登录
         await page.goto(target_url, timeout=60000)
         await page.wait_for_selector('input[type="password"]', timeout=15000)
 
-        # 输入账号与密码
         inputs = await page.query_selector_all('input[type="text"]')
         if inputs:
             await inputs[0].fill(MARKET_MANAGER_ACCOUNT)
@@ -79,27 +86,62 @@ async def run_playwright_build(account_name, text, order_ids):
         await page.wait_for_timeout(3000)
         print("[2] 登录市场后台成功", flush=True)
 
-        if order_ids:
-            print(f"[3] 检测到 {len(order_ids)} 笔单号，开始处理订单...", flush=True)
+        # 2. 点击“建立店铺”按钮
+        shop_btn = await page.query_selector('text="建立店铺"') or await page.query_selector('text="建立店鋪"')
+        if shop_btn:
+            await shop_btn.click()
+            await page.wait_for_timeout(2000)
+            print("[3] 点击'建立店铺'按钮成功", flush=True)
+
+            # 3. 填写表单字段
+            text_inputs = await page.query_selector_all('input[type="text"]')
+            if len(text_inputs) >= 4:
+                await text_inputs[0].fill(info['account'])
+                await text_inputs[1].fill(info['name'])
+                await text_inputs[2].fill(info['rmb'])
+                await text_inputs[3].fill(info['phone'])
+            else:
+                # 备用填写方式
+                labels = {
+                    '帐号': info['account'],
+                    '账号': info['account'],
+                    '户名': info['name'],
+                    '人民币': info['rmb'],
+                    '手机': info['phone']
+                }
+                for key, val in labels.items():
+                    try:
+                        inp = await page.query_selector(f'input[placeholder*="{key}"]')
+                        if inp and val:
+                            await inp.fill(val)
+                    except:
+                        pass
+
+            # 4. 点击保存/确定提交
+            confirm_btn = await page.query_selector('button:has-text("确定")') or await page.query_selector('button:has-text("確認")') or await page.query_selector('button:has-text("保存")')
+            if confirm_btn:
+                await confirm_btn.click()
+                await page.wait_for_timeout(3000)
+                print("[4] 店铺创建表单已提交！", flush=True)
         else:
-            print("[3] 纯建店模式处理完成", flush=True)
+            print("[3] ⚠️ 未找到'建立店铺'按钮", flush=True)
 
         await browser.close()
 
 def execute_auto_build(chat_id, status_msg_id, text, order_ids):
     try:
-        account_match = re.search(r'(?:平台帐号|平台账号)\s*[:：]\s*(\S+)', text)
-        account_name = account_match.group(1) if account_match else "test01"
+        info = extract_info(text)
 
         if cancel_flags.get(chat_id, False):
             return
 
-        asyncio.run(run_playwright_build(account_name, text, order_ids))
+        asyncio.run(run_playwright_build(info, order_ids))
 
         base_shop_url = clean_url(SHOP_BASE_URL, "https://asdtvheq.com").rstrip('/')
+        account_name = info['account'] or "test01"
         result_text = (
             f"✅ 建店完成！\n\n"
-            f"店铺网址:{base_shop_url}/{account_name}\n"
+            f"店铺网址:https://{account_name}.asdtvheq.com\n"
             f"登入帐号:{account_name}\n"
             f"登入密码:a12345"
         )
