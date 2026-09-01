@@ -38,7 +38,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验（已强化银行信息关键词及切分逻辑）
+# 1. 文本解析与格式校验（已增加银行支行必填校验）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -50,7 +50,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     bank_keywords = ["银行", "銀行", "卡号", "卡號", "银", "銀", "卡"]
     alipay_keywords = ["支付宝", "支付寶", "支"]
 
-    # 判断类型，优先判断数字与银行
     if any(k in text for k in digital_keywords):
         info["type"] = "digital_wallet"
     elif any(k in text for k in bank_keywords):
@@ -78,7 +77,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"’”]+$', '', val)
 
-        # 1. 平台会员账号识别
         if "登入" not in key and (
             any(k in key for k in ["盖平台", "平台", "会员", "會員"])
             or key in ["账号", "帳號", "帐号", "会员号", "會員號", "平台账号", "平台帳號", "平台会员账号", "平台會員帳號"]
@@ -86,28 +84,24 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             if not any(k in key for k in ["支付宝", "支付寶", "银行", "銀行", "数字", "數字", "钱包", "錢包"]):
                 info["account"] = val.lower()
 
-        # 2. 户名/姓名识别
         elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名"]) or key in ["名", "数字人民币户名", "數字人民幣戶名"]:
             info["name"] = val
 
-        # 3. 手机号识别
         elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
             raw_phone = val
 
-        # 4. 支付宝识别
         elif any(k in key for k in alipay_keywords) and not any(k in key for k in ["支行", "开户支行", "银行支行"]):
             raw_accounts["alipay"] = val
 
-        # 5. 数字货币识别
         elif any(k in key for k in digital_keywords):
             raw_accounts["digital"] = val
 
-        # 6. 银行名称/支行/卡号精准强化识别
         elif any(k in key for k in ["银行名称", "銀行名稱", "银行名称与支行", "銀行名稱與支行", "开户行", "開戶行", "行名"]):
             if "-" in val or " " in val:
                 bank_parts = re.split(r'[- ]+', val, maxsplit=1)
                 info["bank_name"] = bank_parts[0].strip()
-                info["branch_name"] = bank_parts[1].strip()
+                if len(bank_parts) > 1 and bank_parts[1].strip():
+                    info["branch_name"] = bank_parts[1].strip()
             else:
                 info["bank_name"] = val
 
@@ -173,6 +167,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 info["alipay_account"] = info.get("phone")
 
     elif info_type == "bank":
+        # 1. 卡号校验
         raw_val = raw_accounts.get("bank")
         if not raw_val:
             errors.append("• 未找到【银行卡号】！")
@@ -185,6 +180,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                     errors.append(f"• 银行卡号无效：`{raw_val}`")
                 else:
                     info["bank_account"] = digits
+
+        # 2. 银行名称校验
+        if not info.get("bank_name"):
+            errors.append("• 未找到【银行名称】！")
+
+        # 3. 支行强校验：缺少支行直接拒绝制作
+        if not info.get("branch_name"):
+            errors.append("• 缺少【银行支行】信息，无法协助制作，请补充支行后再试！")
 
     if errors:
         error_summary = "❌ **建店失败！检测到以下输入错误：**\n\n" + "\n".join(errors)
@@ -225,26 +228,20 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
         try:
             # 1. 登录后台
             await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
-            current_url = page.url
-            page_title = await page.title()
-
             user_input = page.locator(
                 "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
             ).first
 
-            try:
-                await user_input.wait_for(state="visible", timeout=20000)
-            except Exception:
-                raise Exception(f"无法找到登录框！页面标题:【{page_title}】，地址: {current_url}")
-
+            await user_input.wait_for(state="visible", timeout=20000)
             await user_input.fill(ADMIN_USER)
 
             pass_input = page.locator("#admin_user_password, #user_password, input[type='password']").first
             await pass_input.fill(ADMIN_PASS)
 
             submit_btn = page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first
-            await submit_btn.click()
-            await page.wait_for_load_state("networkidle")
+            await submit_btn.click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(1)
 
             # 智能搜索函数
             async def search_account(account_name: str):
@@ -256,13 +253,13 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 try:
                     search_btn = page.locator("button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary").first
                     if await search_btn.is_visible():
-                        await search_btn.click()
+                        await search_btn.click(no_wait_after=True)
                     else:
                         await search_input.press("Enter")
                 except Exception:
                     await search_input.press("Enter")
 
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(1)
 
             # 2. 循环建店
@@ -295,23 +292,15 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']").first
 
-                # 银行模式：精准依据提取到的信息填充（银行名称、分行名称、卡号）
                 if info_type == "bank":
                     bank_name = info.get("bank_name", "")
                     branch_name = info.get("branch_name", "")
                     bank_acc = info.get("bank_account", "")
 
-                    # 兜底补充逻辑：若未抓取到银行名称，尝试以分行或卡号补全；若未抓到分行，则用银行名称或卡号补全
-                    if not bank_name:
-                        bank_name = branch_name or "银行"
-                    if not branch_name:
-                        branch_name = bank_name
-
                     if await bank_name_input.is_visible(): await bank_name_input.fill(bank_name)
                     if await branch_name_input.is_visible(): await branch_name_input.fill(branch_name)
                     if await card_no_input.is_visible(): await card_no_input.fill(bank_acc)
                 else:
-                    # 非银行模式（支付宝/数字人民币）：填充默认占位卡号
                     if await bank_name_input.is_visible(): await bank_name_input.fill(default_num)
                     if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
                     if await card_no_input.is_visible(): await card_no_input.fill(default_num)
@@ -342,8 +331,14 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                         except Exception:
                             await shop_template.select_option(index=1)
 
-                await page.locator("input[name='commit'][value='送出']").first.click()
-                await page.wait_for_load_state("domcontentloaded")
+                commit_btn = page.locator("input[name='commit'][value='送出']").first
+                await commit_btn.click(no_wait_after=True)
+
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
 
                 is_used = await page.locator("body").evaluate("el => el.innerText.includes('已经被使用') || el.innerText.includes('已經被使用')")
                 if is_used:
@@ -358,34 +353,56 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             shop_url = (await page.locator("tbody tr").first.locator("td").nth(3).inner_text()).strip()
 
             # 4. 导入 60 商品
-            await page.locator("tbody tr").first.locator("a[href$='/items']").click()
-            await page.locator("a[href*='/items/new'], a:has-text('導入商品')").first.click()
-            await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
-            await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.locator("tbody tr").first.locator("a[href$='/items']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
 
-            # 5. 仅非银行卡类型时，剔除占位银行卡；银行卡类型保留不删除
+            await page.locator("a[href*='/items/new'], a:has-text('導入商品')").first.click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+
+            await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
+            await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(1)
+
+            # 5. 仅非银行卡类型时，剔除占位银行卡
             if info_type != "bank":
                 await search_account(final_account)
-                await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
+                await page.locator("tbody tr").first.locator("a[href$='/edit']").click(no_wait_after=True)
+                await page.wait_for_load_state("domcontentloaded")
+
                 remove_btn = page.locator("a.remove_fields.dynamic, a:has-text('移除')").first
                 if await remove_btn.is_visible():
                     await remove_btn.click()
-                await page.locator("input[name='commit'], input[value='送出']").click()
+                await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(1)
 
             # 6. 出货 6000
             await search_account(final_account)
-            await page.locator("tbody tr").first.locator("a[href$='/deposits']").click()
-            await page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單')").first.click()
+            await page.locator("tbody tr").first.locator("a[href$='/deposits']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+
+            await page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單')").first.click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+
             await page.locator("#quantity, input[name='quantity']").fill("6000")
-            await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(1)
 
             # 7. 提现 6000
             await search_account(final_account)
-            await page.locator("tbody tr").first.locator("a[href$='/withdraws']").click()
+            await page.locator("tbody tr").first.locator("a[href$='/withdraws']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+
             withdraw_btn = page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href*='/withdraws/new']").first
-            await withdraw_btn.click()
+            await withdraw_btn.click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+
             await page.locator("#quantity, input[name='quantity']").fill("6000")
-            await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(1)
 
             return (
                 f"✅ **建店完成！**\n\n"
@@ -420,7 +437,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     user_id = update.effective_user.id
 
-    # 权限拦截判断：私聊仅限白名单，群组不限制
     if chat_type == "private":
         if user_id not in ADMIN_USER_IDS:
             return
@@ -477,7 +493,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_info = ACTIVE_TASKS[task_id]
         origin_user_id = task_info["user_id"]
 
-        # 仅允许指令发送者或白名单管理员取消任务
         if click_user_id != origin_user_id and (click_user_id not in ADMIN_USER_IDS):
             await query.answer("⚠️ 只有指令发送者或白名单管理员可以取消该任务！", show_alert=True)
             return
