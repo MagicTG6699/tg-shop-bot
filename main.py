@@ -71,7 +71,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
         key = re.sub(r'\s+', '', parts[0]).lower()
         val = parts[1].strip()
-        val = re.sub(r'^[<\("‘“]+|[>\)"’”]+$', '', val).strip()
+        val = re.sub(r'^[<\("‘“]+|[>\)" निकालने’]+$', '', val).strip()
 
         if not val:
             continue
@@ -301,45 +301,33 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 info_type = info.get("type", "alipay")
                 default_num = "6226220809397366"
 
+                # 确保银行卡三栏位定位并填入
+                bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
+                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
+                card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
+
+                await bank_name_input.wait_for(state="visible", timeout=10000)
+
                 if info_type == "bank":
-                    # 银行卡类型：填入真实银行卡信息
-                    bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
-                    branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
-                    card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
+                    # 1. 银行卡类型：填入真实银行卡信息
+                    await bank_name_input.fill(info.get("bank_name", ""))
+                    await branch_name_input.fill(info.get("branch_name", ""))
+                    await card_no_input.fill(info.get("bank_account", ""))
 
-                    if await bank_name_input.is_visible():
-                        await bank_name_input.fill(info.get("bank_name", ""))
-                    if await branch_name_input.is_visible():
-                        await branch_name_input.fill(info.get("branch_name", ""))
-                    if await card_no_input.is_visible():
-                        await card_no_input.fill(info.get("bank_account", ""))
+                    # 支付宝和数字人民币输入框直接留空，不做任何移除点击
+                    alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
+                    if await alipay_input.is_visible():
+                        await alipay_input.fill("")
 
-                    # 移除“支付宝”与“数字人民币”区域，保留银行卡
-                    remove_target = page.locator(
-                        "div[class*='alipay_accounts'] a.remove_fields, "
-                        "div[class*='ecny_accounts'] a.remove_fields, "
-                        "#merchant_alipay_accounts_attributes_0_account_name ~ a, "
-                        "#merchant_ecny_accounts_attributes_0_account_name ~ a"
-                    )
-                    count = await remove_target.count()
-                    for i in range(count):
-                        try:
-                            btn = remove_target.nth(i)
-                            if await btn.is_visible():
-                                await btn.click()
-                                await asyncio.sleep(0.3)
-                        except Exception:
-                            pass
+                    ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name").first
+                    if await ecny_input.is_visible():
+                        await ecny_input.fill("")
 
                 else:
-                    # 支付宝 / 数字人民币类型：银行卡填入默认占位号
-                    bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
-                    branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
-                    card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
-
-                    if await bank_name_input.is_visible(): await bank_name_input.fill(default_num)
-                    if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
-                    if await card_no_input.is_visible(): await card_no_input.fill(default_num)
+                    # 2. 支付宝 / 数字人民币类型：银行卡填入占位号
+                    await bank_name_input.fill(default_num)
+                    await branch_name_input.fill(default_num)
+                    await card_no_input.fill(default_num)
 
                     # 支付宝栏位处理：非对应类型留空
                     alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
