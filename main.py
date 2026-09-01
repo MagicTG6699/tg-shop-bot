@@ -95,20 +95,21 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in digital_keywords):
             raw_accounts["digital"] = val
 
-        # 银行名称解析（优先匹配：银行名称、开户行、行名、银行）
-        elif any(k in key for k in ["银行名称", "銀行名稱", "银行名称与支行", "銀行名稱與支行", "开户行", "開戶行", "行名"]) or key in ["银行", "銀行"]:
-            if "-" in val or " " in val:
-                bank_parts = re.split(r'[- ]+', val, maxsplit=1)
-                info["bank_name"] = bank_parts[0].strip()
-                info["branch_name"] = bank_parts[1].strip()
-            else:
-                info["bank_name"] = val
-
-        # 支行 / 分行名称解析（匹配：银行支行、支行、分行、开户支行、网点）
-        elif any(k in key for k in ["银行支行", "銀行支行", "支行", "分行", "开户支行", "開戶支行", "网点", "網點"]):
+        # 1. 优先提取：支行 / 分行 / 网点名称（优先级高于银行名称，防止误匹配）
+        elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
             info["branch_name"] = val
 
-        # 银行卡号解析（严格匹配卡号关键词）
+        # 2. 提取：银行名称（精准排除带有“支行”关键词的整行）
+        elif any(k in key for k in ["银行名称", "銀行名稱", "开户行", "開戶行", "行名"]) or key in ["银行", "銀行"]:
+            if "支行" not in key:
+                if "-" in val or " " in val:
+                    bank_parts = re.split(r'[- ]+', val, maxsplit=1)
+                    info["bank_name"] = bank_parts[0].strip()
+                    info["branch_name"] = bank_parts[1].strip()
+                else:
+                    info["bank_name"] = val
+
+        # 3. 银行卡号解析
         elif any(k in key for k in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號"]) or key in ["银", "銀"]:
             raw_accounts["bank"] = val
 
@@ -181,7 +182,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_account"] = digits
 
-        # 强校验：缺少银行或支行时精确提示
+        # 强校验：缺少银行或支行时精准提示
         if not info.get("bank_name"):
             errors.append("• 缺少【银行名称】！")
         if not info.get("branch_name"):
