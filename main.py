@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import re
+import traceback
 import tkinter as tk
 from tkinter import messagebox
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,7 +18,7 @@ from playwright.async_api import async_playwright
 # 从环境变量中安全获取所有敏感配置
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-# 解析环境变量中的白名单 ID（支持单个 ID，或用逗号/分号/空格分隔的多 ID）
+# 解析环境变量中的白名单 ID
 admin_id_env = os.environ.get("ADMIN_USER_ID", "").strip()
 ADMIN_USER_IDS = set(
     int(x) for x in re.split(r'[,;\s]+', admin_id_env) if x.isdigit()
@@ -26,7 +27,7 @@ ADMIN_USER_IDS = set(
 ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
 
-# 精准清洗 ADMIN_URL，剔除 Markdown 格式干扰及多余字符
+# 精准清洗 ADMIN_URL
 raw_admin_url = os.environ.get("ADMIN_URL", "").strip()
 match = re.search(r'https?://[^\s\]\)\>\"\']+', raw_admin_url)
 if match:
@@ -38,7 +39,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验
+# 1. 文本解析与格式校验（增加严格的 11 位手机号校验）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -72,14 +73,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if len(parts) < 2:
             continue
 
-        key = re.sub(r'\s+', '', parts[0])
+        key = re.sub(r'\s+', '', parts[0]).lower()
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"’”]+$', '', val).strip()
 
         if not val:
             continue
 
-        # 会员账号匹配
+        # 平台会员账号匹配
         if "登入" not in key and (
             any(k in key for k in ["盖平台", "平台", "会员", "會員"])
             or key in ["账号", "帳號", "帐号", "会员号", "會員號", "平台账号", "平台帳號", "平台会员账号", "平台會員帳號"]
@@ -88,7 +89,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 info["account"] = val.lower()
 
         # 姓名/户名匹配
-        elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名"]) or key in ["名", "数字人民币户名", "數字人民幣戶名"]:
+        elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名", "银行户名", "銀行戶名"]) or key in ["名", "数字人民币户名", "數字人民幣戶名"]:
             info["name"] = val
 
         # 手机号匹配
@@ -104,7 +105,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             raw_accounts["digital"] = val
 
         # 银行名称匹配
-        elif any(k in key for k in ["银行名", "銀行名", "银行名称", "銀行名稱", "银行名称与支行", "銀行名稱與支行", "开户行", "開戶行", "行名"]):
+        elif key in ["银行名", "銀行名", "银行名称", "銀行名稱", "开户行", "開戶行", "行名", "银行", "銀行"]:
             if "-" in val or " " in val:
                 bank_parts = re.split(r'[- ]+', val, maxsplit=1)
                 info["bank_name"] = bank_parts[0].strip()
@@ -114,27 +115,33 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 info["bank_name"] = val
 
         # 支行名称匹配
-        elif any(k in key for k in ["银行支行", "銀行支行", "支行", "分行", "开户支行", "開戶支行", "网点", "網點"]):
+        elif key in ["支行", "分行", "银行支行", "銀行支行", "开户支行", "開戶支行", "网点", "網點"]:
             info["branch_name"] = val
 
-        # 银行卡号匹配
-        elif any(k in key for k in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號"]) or key in ["银行", "銀行", "银", "銀"]:
-            raw_accounts["bank"] = val
+        # 银行卡号/账号匹配
+        elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號", "账号", "帳號", "帐号"]:
+            if info.get("type") == "bank" and "account" in info and not raw_accounts.get("bank"):
+                raw_accounts["bank"] = val
+            elif not raw_accounts.get("bank"):
+                raw_accounts["bank"] = val
 
     errors = []
 
     if not info.get("account"):
         errors.append("• 未提取到【平台会员账号】！")
 
+    # 手机号精准拦截：只允许 11 位纯数字
     if raw_phone:
         if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_phone):
-            errors.append(f"• 手机号错误：`{raw_phone}`（只允许数字，不能包含英文或中文）")
+            errors.append(f"• 手机号格式错误：`{raw_phone}`（包含非数字字符）")
         else:
             digits_phone = re.sub(r'\D', '', raw_phone)
-            if len(digits_phone) < 11:
-                errors.append(f"• 手机号位数错误：`{raw_phone}`（最少必须为 11 位数字）")
+            if len(digits_phone) != 11:
+                errors.append(f"• 手机号位数错误：`{raw_phone}`（当前为 {len(digits_phone)} 位，必须为 11 位）")
             else:
                 info["phone"] = digits_phone
+    else:
+        errors.append("• 未找到【手机号】！")
 
     info_type = info.get("type")
 
@@ -143,14 +150,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if not raw_val:
             errors.append("• 未找到【数字人民币账号】！")
         else:
-            if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                errors.append(f"• 数字人民币账号错误：`{raw_val}`（只允许数字，不能包含英文或中文）")
+            digits = re.sub(r'\D', '', raw_val)
+            if not digits:
+                errors.append(f"• 数字人民币账号无效：`{raw_val}`")
             else:
-                digits = re.sub(r'\D', '', raw_val)
-                if not digits:
-                    errors.append(f"• 数字人民币账号无效：`{raw_val}`")
-                else:
-                    info["digital_account"] = digits
+                info["digital_account"] = digits
 
     elif info_type == "alipay":
         raw_val = raw_accounts.get("alipay")
@@ -162,14 +166,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     errors.append(f"• 支付宝邮箱格式错误：`{raw_val}`")
             else:
-                if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                    errors.append(f"• 支付宝账号错误：`{raw_val}`（仅支持手机号或邮箱格式）")
+                digits = re.sub(r'\D', '', raw_val)
+                if not digits:
+                    errors.append(f"• 支付宝账号无效：`{raw_val}`")
                 else:
-                    digits = re.sub(r'\D', '', raw_val)
-                    if not digits:
-                        errors.append(f"• 支付宝账号无效：`{raw_val}`")
-                    else:
-                        info["alipay_account"] = digits
+                    info["alipay_account"] = digits
         else:
             if not info.get("phone") and not errors:
                 errors.append("• 缺失支付宝账号及手机号！")
@@ -179,22 +180,19 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     elif info_type == "bank":
         raw_val = raw_accounts.get("bank")
         if not raw_val:
-            errors.append("• 未找到【银行卡号】！")
+            errors.append("• 未找到【银行卡号/银行账号】！")
         else:
-            if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                errors.append(f"• 银行卡号错误：`{raw_val}`（只允许数字，不能包含英文或中文）")
+            digits = re.sub(r'\D', '', raw_val)
+            if not digits:
+                errors.append(f"• 银行卡号无效：`{raw_val}`")
             else:
-                digits = re.sub(r'\D', '', raw_val)
-                if not digits:
-                    errors.append(f"• 银行卡号无效：`{raw_val}`")
-                else:
-                    info["bank_account"] = digits
+                info["bank_account"] = digits
 
         if not info.get("bank_name"):
             errors.append("• 未找到【银行名称】！")
 
         if not info.get("branch_name"):
-            errors.append("• 缺少【银行支行】信息，无法协助制作，请补充支行后再试！")
+            errors.append("• 缺少【支行】信息，请补充支行后再试！")
 
     if errors:
         error_summary = "❌ **建店失败！检测到以下输入错误：**\n\n" + "\n".join(errors)
@@ -305,7 +303,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 info_type = info.get("type", "alipay")
                 default_num = "6226220809397366"
 
-                # 根据 DOM 提取的精确 Element ID 定位
                 bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
                 branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
@@ -319,7 +316,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await branch_name_input.is_visible(): await branch_name_input.fill(branch_name)
                     if await card_no_input.is_visible(): await card_no_input.fill(bank_acc)
                 else:
-                    # 页面自带银行帐户为必填项时，使用默认占位数据填充以顺利提交表单
                     if await bank_name_input.is_visible(): await bank_name_input.fill(default_num)
                     if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
                     if await card_no_input.is_visible(): await card_no_input.fill(default_num)
@@ -433,7 +429,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await browser.close()
 
 
-# 后台工作协程：处理单个建店流程
+# 后台工作协程
 async def run_shop_worker(status_msg, parsed_info, task_id: str):
     try:
         result_text = await create_and_setup_shop(parsed_info, task_id)
@@ -441,8 +437,10 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str):
     except asyncio.CancelledError:
         await status_msg.edit_text("🛑 **已取消建店！**")
     except Exception as e:
+        print(f"执行建店过程捕获异常: {e}")
+        traceback.print_exc()
         safe_err = str(e).replace("[", "\\[").replace("]", "\\]")
-        await status_msg.edit_text(f"❌ 建店出现错误：{safe_err}", parse_mode="Markdown", disable_web_page_preview=True)
+        await status_msg.edit_text(f"❌ **建店出现错误：** {safe_err}", parse_mode="Markdown", disable_web_page_preview=True)
     finally:
         ACTIVE_TASKS.pop(task_id, None)
 
@@ -457,14 +455,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if chat_type == "private":
-        if user_id not in ADMIN_USER_IDS:
+        if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
             return
 
     ignore_keywords = ["店铺网址", "店鋪網址", "登入密碼", "登入密码", "极速微商", "極速微商"]
     if any(k in user_text for k in ignore_keywords):
         return
 
-    trigger_keywords = ["账号", "帳號", "帐号", "盖平台", "平台", "平台账号", "平台帳號", "数字人民币", "數字人民幣", "数字", "數字", "支付宝", "支付寶", "银行", "銀行"]
+    trigger_keywords = ["账号", "帳號", "帐号", "盖平台", "平台", "平台账号", "平台帳號", "数字人民币", "數字人民幣", "数字", "數字", "支付宝", "支付寶", "银行", "銀行", "支行"]
     if not any(k in user_text for k in trigger_keywords):
         return
 
@@ -512,7 +510,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_info = ACTIVE_TASKS[task_id]
         origin_user_id = task_info["user_id"]
 
-        if click_user_id != origin_user_id and (click_user_id not in ADMIN_USER_IDS):
+        if click_user_id != origin_user_id and (ADMIN_USER_IDS and click_user_id not in ADMIN_USER_IDS):
             await query.answer("⚠️ 只有指令发送者或白名单管理员可以取消该任务！", show_alert=True)
             return
 
