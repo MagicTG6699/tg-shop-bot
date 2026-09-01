@@ -11,7 +11,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # 1. 环境变量配置解析
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -186,7 +186,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
-# 3. Playwright 自动化建店
+# 3. Playwright 自动化建店 (超时优化版)
 async def create_and_setup_shop(info: dict, task_id: str) -> str:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
@@ -206,33 +206,43 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
-        page.set_default_timeout(30000)
+        
+        # 优化1：缩短全局默认超时（由30秒缩短至12秒），避免单步卡死导致长时间无响应
+        page.set_default_timeout(12000)
 
         if task_id in ACTIVE_TASKS:
             ACTIVE_TASKS[task_id]["page"] = page
 
+        # 辅助点击与等待（替代容易因长连接超时的 networkidle）
+        async def click_and_wait_element(click_locator, wait_locator, timeout=15000):
+            await click_locator.click()
+            await wait_locator.wait_for(state="visible", timeout=timeout)
+
         try:
-            # 1. 登录
+            # 1. 登录优化
             await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
             user_input = page.locator(
                 "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
             ).first
 
             try:
-                await user_input.wait_for(state="visible", timeout=20000)
+                await user_input.wait_for(state="visible", timeout=15000)
             except Exception:
                 raise Exception(f"无法找到登录框！标题:【{await page.title()}】，地址: {page.url}")
 
             await user_input.fill(ADMIN_USER)
             await page.locator("#admin_user_password, #user_password, input[type='password']").first.fill(ADMIN_PASS)
-            await page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first.click()
-            await page.wait_for_load_state("networkidle")
+            
+            # 点击登录，改用等待关键组件或 URL 变动
+            submit_btn = page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first
+            await submit_btn.click()
+            await page.wait_for_load_state("domcontentloaded")
 
             # 搜索辅助闭包
             async def search_account(acc_name: str):
                 await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
                 search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
-                await search_input.wait_for(state="visible", timeout=15000)
+                await search_input.wait_for(state="visible", timeout=10000)
                 await search_input.fill(acc_name)
 
                 search_btn = page.locator("button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary").first
@@ -241,14 +251,13 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 else:
                     await search_input.press("Enter")
 
-                await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(1)
+                await page.locator("tbody tr").first.wait_for(state="visible", timeout=10000)
 
             # 2. 尝试递增后缀建店
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
-                await page.locator("#merchant_username").wait_for(state="visible", timeout=15000)
+                await page.locator("#merchant_username").wait_for(state="visible", timeout=10000)
 
                 await page.locator("#merchant_username").fill(current_account)
                 if await page.locator("#merchant_password").is_visible():
@@ -323,11 +332,18 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await search_account(final_account)
             shop_url = (await page.locator("tbody tr").first.locator("td").nth(3).inner_text()).strip()
 
-            # 4. 批量商品
-            await page.locator("tbody tr").first.locator("a[href$='/items']").click()
-            await page.locator("a[href*='/items/new'], a:has-text('導入商品')").first.click()
+            # 4. 批量商品（加入显式超时等待）
+            await click_and_wait_element(
+                page.locator("tbody tr").first.locator("a[href$='/items']"),
+                page.locator("a[href*='/items/new'], a:has-text('導入商品')").first
+            )
+            await click_and_wait_element(
+                page.locator("a[href*='/items/new'], a:has-text('導入商品')").first,
+                page.locator("#count_of_items, input[name='count_of_items']")
+            )
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
             await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.wait_for_load_state("domcontentloaded")
 
             # 5. 移除非银行卡占位符
             if info_type != "bank":
@@ -337,21 +353,36 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 if await remove_btn.is_visible():
                     await remove_btn.click()
                 await page.locator("input[name='commit'], input[value='送出']").click()
+                await page.wait_for_load_state("domcontentloaded")
 
             # 6. 出货订单
             await search_account(final_account)
-            await page.locator("tbody tr").first.locator("a[href$='/deposits']").click()
-            await page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單')").first.click()
+            await click_and_wait_element(
+                page.locator("tbody tr").first.locator("a[href$='/deposits']"),
+                page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單')").first
+            )
+            await click_and_wait_element(
+                page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單')").first,
+                page.locator("#quantity, input[name='quantity']")
+            )
             await page.locator("#quantity, input[name='quantity']").fill("6000")
             await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.wait_for_load_state("domcontentloaded")
 
             # 7. 提现订单
             await search_account(final_account)
-            await page.locator("tbody tr").first.locator("a[href$='/withdraws']").click()
+            await click_and_wait_element(
+                page.locator("tbody tr").first.locator("a[href$='/withdraws']"),
+                page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href*='/withdraws/new']").first
+            )
             withdraw_btn = page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href*='/withdraws/new']").first
             await withdraw_btn.click()
-            await page.locator("#quantity, input[name='quantity']").fill("6000")
+            
+            qty_input = page.locator("#quantity, input[name='quantity']")
+            await qty_input.wait_for(state="visible", timeout=10000)
+            await qty_input.fill("6000")
             await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.wait_for_load_state("domcontentloaded")
 
             return (
                 f"✅ <b>建店完成！</b>\n\n"
@@ -359,6 +390,8 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 f"登入帳號 : <code>{html.escape(final_account)}</code>\n"
                 f"登入密码 : <code>a12345</code>"
             )
+        except PlaywrightTimeoutError:
+            raise Exception("网络等待超时，后台可能响应较慢，请稍后再试。")
         finally:
             await browser.close()
 
@@ -414,7 +447,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-    # 替换为 create_task
     task = asyncio.create_task(run_shop_worker(status_msg, parsed_info, task_id))
 
     ACTIVE_TASKS[task_id] = {
