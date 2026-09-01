@@ -194,7 +194,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_account"] = digits
 
-        # 强校验：缺少银行或支行时精准提示
         if not info.get("bank_name"):
             errors.append("• 缺少【银行名称】！")
         if not info.get("branch_name"):
@@ -416,12 +415,12 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
+            # 恢复最原始格式（使用 <code> 标签实现点击一键复制，且不显式添加界面字段）
             msg_text = (
                 f"✅ <b>建店完成！</b>\n\n"
                 f"店铺网址 : <code>{html.escape(shop_url)}</code>\n"
                 f"登入帳號 : <code>{html.escape(final_account)}</code>\n"
-                f"登入密码 : <code>a12345</code>\n"
-                f"当前界面 : <b>{html.escape(target_skin)}</b>"
+                f"登入密码 : <code>a12345</code>"
             )
             return msg_text, final_account
         except PlaywrightTimeoutError:
@@ -477,8 +476,16 @@ async def update_shop_skin(account_name: str, new_skin: str):
             await browser.close()
 
 
-# 生成界面选择的键盘
-def build_skin_keyboard(account: str) -> InlineKeyboardMarkup:
+# 1. 默认按钮：显示 ✨ 更改商城界面（当前XXX）
+def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(f"✨ 更改商城界面（当前{current_skin}）", callback_data=f"open_skin_{account}_{current_skin}")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+# 2. 展开按钮：展示模板选项 + ⬅️ 收起按钮
+def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton("极速微商", callback_data=f"skin_jisumeishang_{account}"),
@@ -487,24 +494,12 @@ def build_skin_keyboard(account: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("柒月", callback_data=f"skin_qiyue_{account}"),
             InlineKeyboardButton("音你而来", callback_data=f"skin_yinnierlai_{account}")
+        ],
+        [
+            InlineKeyboardButton("⬅️ 收起", callback_data=f"close_skin_{account}_{current_skin}")
         ]
     ]
     return InlineKeyboardMarkup(buttons)
-
-
-# 后台 Task 包装
-async def run_shop_worker(status_msg, parsed_info, task_id: str):
-    try:
-        result_text, final_account = await create_and_setup_shop(parsed_info, task_id)
-        keyboard = build_skin_keyboard(final_account)
-        await status_msg.edit_text(result_text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
-    except asyncio.CancelledError:
-        await status_msg.edit_text("🛑 <b>已取消建店！</b>", parse_mode="HTML")
-    except Exception as e:
-        safe_err = html.escape(str(e))
-        await status_msg.edit_text(f"❌ 建店出现错误：{safe_err}", parse_mode="HTML", disable_web_page_preview=True)
-    finally:
-        ACTIVE_TASKS.pop(task_id, None)
 
 
 # 4. Telegram 消息接收处理
@@ -553,6 +548,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 
+# 后台 Task 包装
+async def run_shop_worker(status_msg, parsed_info, task_id: str):
+    try:
+        initial_skin = parsed_info.get("skin", "极速微商")
+        result_text, final_account = await create_and_setup_shop(parsed_info, task_id)
+        keyboard = build_main_keyboard(final_account, initial_skin)
+        await status_msg.edit_text(result_text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
+    except asyncio.CancelledError:
+        await status_msg.edit_text("🛑 <b>已取消建店！</b>", parse_mode="HTML")
+    except Exception as e:
+        safe_err = html.escape(str(e))
+        await status_msg.edit_text(f"❌ 建店出现错误：{safe_err}", parse_mode="HTML", disable_web_page_preview=True)
+    finally:
+        ACTIVE_TASKS.pop(task_id, None)
+
+
 # 5. 回调事件处理
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -586,33 +597,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if task and not task.done():
             task.cancel()
 
+    # 点击展开选项
+    elif data.startswith("open_skin_"):
+        parts = data.split("_")
+        account = parts[2]
+        current_skin = parts[3] if len(parts) > 3 else "极速微商"
+        keyboard = build_skin_options_keyboard(account, current_skin)
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+
+    # 点击收起选项
+    elif data.startswith("close_skin_"):
+        parts = data.split("_")
+        account = parts[2]
+        current_skin = parts[3] if len(parts) > 3 else "极速微商"
+        keyboard = build_main_keyboard(account, current_skin)
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+
+    # 执行选择并修改界面
     elif data.startswith("skin_"):
-        # 切换界面模式
         _, skin_key, account = data.split("_", 2)
         new_skin_name = SKIN_OPTIONS.get(skin_key, "极速微商")
 
-        current_text = query.message.text
-        await query.edit_message_text(f"⏳ 正在将商城界面切换为【<b>{new_skin_name}</b>】，请稍候...", parse_mode="HTML")
+        await query.answer(f"⏳ 正在修改界面为【{new_skin_name}】...", show_alert=False)
 
         try:
             await update_shop_skin(account, new_skin_name)
-            
-            # 更新文本中的“当前界面”
-            if "当前界面 :" in current_text:
-                new_text = re.sub(r'当前界面 : .*', f'当前界面 : <b>{html.escape(new_skin_name)}</b>', current_text)
-            else:
-                new_text = current_text + f"\n当前界面 : <b>{html.escape(new_skin_name)}</b>"
-
-            keyboard = build_skin_keyboard(account)
-            await query.edit_message_text(
-                new_text,
-                reply_markup=keyboard,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            await query.answer(f"✅ 界面已切换为: {new_skin_name}", show_alert=True)
+            keyboard = build_main_keyboard(account, new_skin_name)
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            await query.answer(f"✅ 界面已成功更改为: {new_skin_name}", show_alert=True)
         except Exception as e:
-            await query.edit_message_text(f"❌ 修改界面失败：{html.escape(str(e))}", parse_mode="HTML")
+            await query.answer(f"❌ 修改界面失败：{str(e)}", show_alert=True)
 
 
 # 6. 程序入口
