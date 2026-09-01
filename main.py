@@ -77,7 +77,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
         key = re.sub(r'\s+', '', parts[0])
         val = parts[1].strip()
-        val = re.sub(r'^[<\("‘“]+|[>\)"’”]+$', '', val)
+        val = re.sub(r'^[<\("‘“]+|[>\)"”]+$', '', val)
 
         if "登入" not in key and (
             any(k in key for k in ["盖平台", "平台", "会员", "會員"])
@@ -123,11 +123,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     if raw_phone:
         if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_phone):
-            errors.append(f"• 手机号错误：{html.escape(raw_phone)}（只允许数字）")
+            errors.append(f"• 手机号错误：<code>{html.escape(raw_phone)}</code>（只允许数字）")
         else:
             digits_phone = re.sub(r'\D', '', raw_phone)
             if len(digits_phone) < 11:
-                errors.append(f"• 手机号位数错误：{html.escape(raw_phone)}（至少11位）")
+                errors.append(f"• 手机号位数错误：<code>{html.escape(raw_phone)}</code>（至少11位）")
             else:
                 info["phone"] = digits_phone
 
@@ -139,11 +139,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             errors.append("• 未找到【数字人民币账号】！")
         else:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                errors.append(f"• 数字人民币账号错误：{html.escape(raw_val)}（只允许数字）")
+                errors.append(f"• 数字人民币账号错误：<code>{html.escape(raw_val)}</code>（只允许数字）")
             else:
                 digits = re.sub(r'\D', '', raw_val)
                 if not digits:
-                    errors.append(f"• 数字人民币账号无效：{html.escape(raw_val)}")
+                    errors.append(f"• 数字人民币账号无效：<code>{html.escape(raw_val)}</code>")
                 else:
                     info["digital_account"] = digits
 
@@ -155,14 +155,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 if email_match:
                     info["alipay_account"] = email_match.group(0)
                 else:
-                    errors.append(f"• 支付宝邮箱格式错误：{html.escape(raw_val)}")
+                    errors.append(f"• 支付宝邮箱格式错误：<code>{html.escape(raw_val)}</code>")
             else:
                 if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                    errors.append(f"• 支付宝账号错误：{html.escape(raw_val)}（仅支持手机号或邮箱）")
+                    errors.append(f"• 支付宝账号错误：<code>{html.escape(raw_val)}</code>（仅支持手机号或邮箱）")
                 else:
                     digits = re.sub(r'\D', '', raw_val)
                     if not digits:
-                        errors.append(f"• 支付宝账号无效：{html.escape(raw_val)}")
+                        errors.append(f"• 支付宝账号无效：<code>{html.escape(raw_val)}</code>")
                     else:
                         info["alipay_account"] = digits
         else:
@@ -177,11 +177,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             errors.append("• 未找到【银行卡号/账号】！")
         else:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                errors.append(f"• 银行卡号错误：{html.escape(raw_val)}（只允许数字）")
+                errors.append(f"• 银行卡号错误：<code>{html.escape(raw_val)}</code>（只允许数字）")
             else:
                 digits = re.sub(r'\D', '', raw_val)
                 if not digits:
-                    errors.append(f"• 银行卡号无效：{html.escape(raw_val)}")
+                    errors.append(f"• 银行卡号无效：<code>{html.escape(raw_val)}</code>")
                 else:
                     info["bank_account"] = digits
 
@@ -406,12 +406,12 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
-            # 移除复制黑框，使用纯文本格式
+            # 移除所有空行，紧凑排版
             msg_text = (
-                "✅ <b>建店完成！</b>\n\n"
-                f"店铺网址:\n{html.escape(shop_url)}\n\n"
-                f"登入帳號:\n{html.escape(final_account)}\n\n"
-                "登入密码:\na12345"
+                "✅ <b>建店完成！</b>\n"
+                f"店铺网址:<code>{html.escape(shop_url)}</code>\n"
+                f"登入帳號:<code>{html.escape(final_account)}</code>\n"
+                "登入密码:<code>a12345</code>"
             )
             return msg_text, final_account
         except PlaywrightTimeoutError:
@@ -467,7 +467,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
             await browser.close()
 
 
-# 默认收起状态按钮（文案：当前极速微商）
+# 默认收起状态按钮
 def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
@@ -476,7 +476,7 @@ def build_main_keyboard(account: str, current_skin: str = "极速微商") -> Inl
     return InlineKeyboardMarkup(buttons)
 
 
-# 展开状态按钮：2x2 四宫格样式 + 底部收起
+# 展开状态按钮：2x2 四宫格 + 收起
 def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
