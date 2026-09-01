@@ -66,9 +66,16 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     raw_accounts = {}
     raw_phone = None
 
+    # 需要忽略的干扰关键词
+    ignore_keys = ["余额", "餘額", "状态", "狀態", "备注", "備註", "限制", "风控", "風控"]
+
     for line in clean_text.splitlines():
         line = line.strip()
         if not line:
+            continue
+
+        # 如果整行或键名中包含干扰关键词（如：余额、状态、限制等），直接忽略
+        if any(ik in line for ik in ignore_keys):
             continue
 
         parts = re.split(r'[:：]', line, maxsplit=1)
@@ -78,6 +85,9 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         key = re.sub(r'\s+', '', parts[0])
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"”]+$', '', val)
+
+        if not val or any(ik in key for ik in ignore_keys):
+            continue
 
         if "登入" not in key and (
             any(k in key for k in ["盖平台", "平台", "会员", "會員"])
@@ -406,7 +416,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
-            # 移除所有空行，紧凑排版
             msg_text = (
                 "✅ <b>建店完成！</b>\n"
                 f"店铺网址:<code>{html.escape(shop_url)}</code>\n"
