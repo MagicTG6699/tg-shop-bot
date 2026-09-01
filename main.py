@@ -44,9 +44,13 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         "数字人民币", "數字人民幣", "数币", "數幣",
         "数字", "數字", "钱包", "錢包", "ecny"
     ]
-    bank_keywords = ["银行", "銀行", "卡号", "卡號", "银", "銀", "卡", "支行"]
+    alipay_keywords = ["支付宝", "支付寶"]
+    bank_keywords = ["银行", "銀行", "卡号", "卡號", "银", "銀", "支行"]
 
-    if any(k in text for k in digital_keywords):
+    # 优先判定：出现“支付宝”即判定为支付宝，出现数字人民币词汇即判定为数字钱包，其余判定为银行卡
+    if any(k in text for k in alipay_keywords):
+        info["type"] = "alipay"
+    elif any(k in text for k in digital_keywords):
         info["type"] = "digital_wallet"
     elif any(k in text for k in bank_keywords):
         info["type"] = "bank"
@@ -93,7 +97,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             raw_phone = val
 
         # 支付宝账号匹配
-        elif any(k in key for k in ["支付宝", "支付寶", "支"]) and not any(k in key for k in ["支行", "开户支行", "银行支行"]):
+        elif any(k in key for k in alipay_keywords):
             raw_accounts["alipay"] = val
 
         # 数字人民币匹配
@@ -152,7 +156,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 info["digital_account"] = digits
 
     elif info_type == "alipay":
-        raw_val = raw_accounts.get("alipay")
+        raw_val = raw_accounts.get("alipay") or raw_accounts.get("bank")
         if raw_val:
             if "@" in raw_val:
                 email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', raw_val)
@@ -301,20 +305,20 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 info_type = info.get("type", "alipay")
                 default_num = "6226220809397366"
 
-                # 确保银行卡三栏位定位并填入
+                # 银行卡三栏位选择器
                 bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
                 branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
 
-                await bank_name_input.wait_for(state="visible", timeout=10000)
-
                 if info_type == "bank":
-                    # 1. 银行卡类型：填入真实银行卡信息
-                    await bank_name_input.fill(info.get("bank_name", ""))
-                    await branch_name_input.fill(info.get("branch_name", ""))
-                    await card_no_input.fill(info.get("bank_account", ""))
+                    # 1. 银行卡类型
+                    if await bank_name_input.is_visible():
+                        await bank_name_input.fill(info.get("bank_name", ""))
+                    if await branch_name_input.is_visible():
+                        await branch_name_input.fill(info.get("branch_name", ""))
+                    if await card_no_input.is_visible():
+                        await card_no_input.fill(info.get("bank_account", ""))
 
-                    # 支付宝和数字人民币输入框直接留空，不做任何移除点击
                     alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
                     if await alipay_input.is_visible():
                         await alipay_input.fill("")
@@ -324,12 +328,14 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                         await ecny_input.fill("")
 
                 else:
-                    # 2. 支付宝 / 数字人民币类型：银行卡填入占位号
-                    await bank_name_input.fill(default_num)
-                    await branch_name_input.fill(default_num)
-                    await card_no_input.fill(default_num)
+                    # 2. 支付宝 / 数字人民币类型：填占位卡号
+                    if await bank_name_input.is_visible():
+                        await bank_name_input.fill(default_num)
+                    if await branch_name_input.is_visible():
+                        await branch_name_input.fill(default_num)
+                    if await card_no_input.is_visible():
+                        await card_no_input.fill(default_num)
 
-                    # 支付宝栏位处理：非对应类型留空
                     alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
                     if await alipay_input.is_visible():
                         if info_type == "alipay":
@@ -337,7 +343,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                         else:
                             await alipay_input.fill("")
 
-                    # 数字人民币栏位处理：非对应类型留空
                     ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name").first
                     if await ecny_input.is_visible():
                         if info_type == "digital_wallet":
@@ -380,7 +385,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 final_account = current_account
                 break
 
-            # 3. 建店成功，检索并提取店铺网址
+            # 3. 检索并提取店铺网址
             await search_account(final_account)
             
             first_row = page.locator("tbody tr").first
@@ -397,7 +402,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             if not shop_url and td_count >= 4:
                 shop_url = (await td_elements.nth(3).inner_text()).strip()
 
-            # 4. 导入 60 个商品（必须在移除银行卡前执行）
+            # 4. 导入 60 个商品
             await search_account(final_account)
             await page.locator("tbody tr").first.locator("a[href$='/items']").click(no_wait_after=True)
             await page.wait_for_load_state("domcontentloaded")
@@ -410,7 +415,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(1)
 
-            # 5. 支付宝 / 数字人民币类型：商品导入完成后，编辑店铺移除占位银行卡
+            # 5. 支付宝/数字人民币移除占位银行卡
             if info_type != "bank":
                 await search_account(final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click(no_wait_after=True)
