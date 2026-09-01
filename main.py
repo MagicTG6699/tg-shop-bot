@@ -15,10 +15,8 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright
 
-# 从环境变量中安全获取所有敏感配置
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-# 解析环境变量中的白名单 ID
 admin_id_env = os.environ.get("ADMIN_USER_ID", "").strip()
 ADMIN_USER_IDS = set(
     int(x) for x in re.split(r'[,;\s]+', admin_id_env) if x.isdigit()
@@ -27,7 +25,6 @@ ADMIN_USER_IDS = set(
 ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
 
-# 精准清洗 ADMIN_URL
 raw_admin_url = os.environ.get("ADMIN_URL", "").strip()
 match = re.search(r'https?://[^\s\]\)\>\"\']+', raw_admin_url)
 if match:
@@ -35,7 +32,6 @@ if match:
 else:
     BASE_ADMIN_URL = raw_admin_url.rstrip('/')
 
-# 全局字典：用于记录当前正在运行的建店任务
 ACTIVE_TASKS = {}
 
 
@@ -247,7 +243,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(2)
 
-            # 智能搜寻函数：找到刚刚建立的店铺并读取其专属数据
             async def search_account(account_name: str):
                 await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
                 search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
@@ -267,7 +262,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 await asyncio.sleep(1.5)
                 await page.locator("tbody tr").first.wait_for(state="visible", timeout=15000)
 
-            # 2. 循环建店：重复或者被占用则自动自增 01, 02 ...
+            # 2. 循环建店
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
@@ -306,39 +301,55 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 info_type = info.get("type", "alipay")
                 default_num = "6226220809397366"
 
-                bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
-                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
-                card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
-
-                # 判断类型：真实银行卡填真实数据，支付宝/数字人民币填 3 栏位占位卡号
                 if info_type == "bank":
-                    bank_name = info.get("bank_name", "")
-                    branch_name = info.get("branch_name", "")
-                    bank_acc = info.get("bank_account", "")
+                    # 银行卡类型：填入银行卡信息
+                    bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
+                    branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
+                    card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
 
-                    if await bank_name_input.is_visible(): await bank_name_input.fill(bank_name)
-                    if await branch_name_input.is_visible(): await branch_name_input.fill(branch_name)
-                    if await card_no_input.is_visible(): await card_no_input.fill(bank_acc)
+                    if await bank_name_input.is_visible():
+                        await bank_name_input.fill(info.get("bank_name", ""))
+                    if await branch_name_input.is_visible():
+                        await branch_name_input.fill(info.get("branch_name", ""))
+                    if await card_no_input.is_visible():
+                        await card_no_input.fill(info.get("bank_account", ""))
+
+                    # 点击移除“支付宝”与“数字人民币”栏位
+                    remove_btns = page.locator("a.remove_fields.dynamic, a:has-text('移除')")
+                    btn_count = await remove_btns.count()
+                    for _ in range(btn_count):
+                        try:
+                            if await remove_btns.first.is_visible():
+                                await remove_btns.first.click()
+                                await asyncio.sleep(0.3)
+                        except Exception:
+                            pass
+
                 else:
+                    # 支付宝 / 数字人民币类型：银行卡填默认占位号
+                    bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
+                    branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
+                    card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
+
                     if await bank_name_input.is_visible(): await bank_name_input.fill(default_num)
                     if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
                     if await card_no_input.is_visible(): await card_no_input.fill(default_num)
 
-                alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
-                if info_type == "alipay":
+                    # 支付宝栏位处理
+                    alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
                     if await alipay_input.is_visible():
-                        await alipay_input.fill(info.get("alipay_account", ""))
-                else:
-                    if await alipay_input.is_visible():
-                        await alipay_input.fill("")
+                        if info_type == "alipay":
+                            await alipay_input.fill(info.get("alipay_account", ""))
+                        else:
+                            await alipay_input.fill(default_num)
 
-                ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name").first
-                if info_type == "digital_wallet":
+                    # 数字人民币栏位处理
+                    ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name").first
                     if await ecny_input.is_visible():
-                        await ecny_input.fill(info.get("digital_account", ""))
-                else:
-                    if await ecny_input.is_visible():
-                        await ecny_input.fill("")
+                        if info_type == "digital_wallet":
+                            await ecny_input.fill(info.get("digital_account", ""))
+                        else:
+                            await ecny_input.fill(default_num)
 
                 shop_template = page.locator("#merchant_store_skin_type").first
                 if await shop_template.is_visible():
@@ -364,12 +375,10 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
 
                 body_text = await page.locator("body").inner_text()
 
-                # 1. 检查账号是否已被占用，若占用则增加后缀重新提交
                 if "已被使用" in body_text or "已經被使用" in body_text:
                     suffix_num += 1
                     continue
 
-                # 2. 拦截表单提交的其他错误（如手机号校验等）
                 error_match = re.search(r'([\u4e00-\u9fa5A-Za-z0-9_]+位数错误|格式错误|不能为空)', body_text)
                 if error_match and "成功" not in body_text:
                     raise Exception(f"后台提交表单报错：{error_match.group(0)}")
@@ -406,7 +415,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(1)
 
-            # 5. 非银行卡类型（支付宝或数字人民币）时，移除预填的 6226220809397366 占位银行卡
+            # 5. 非银行卡类型时，才在建店后编辑清理占位卡
             if info_type != "bank":
                 await search_account(final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click(no_wait_after=True)
