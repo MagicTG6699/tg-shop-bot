@@ -123,11 +123,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     if raw_phone:
         if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_phone):
-            errors.append(f"• 手机号错误：<code>{html.escape(raw_phone)}</code>（只允许数字）")
+            errors.append(f"• 手机号错误：{html.escape(raw_phone)}（只允许数字）")
         else:
             digits_phone = re.sub(r'\D', '', raw_phone)
             if len(digits_phone) < 11:
-                errors.append(f"• 手机号位数错误：<code>{html.escape(raw_phone)}</code>（至少11位）")
+                errors.append(f"• 手机号位数错误：{html.escape(raw_phone)}（至少11位）")
             else:
                 info["phone"] = digits_phone
 
@@ -139,11 +139,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             errors.append("• 未找到【数字人民币账号】！")
         else:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                errors.append(f"• 数字人民币账号错误：<code>{html.escape(raw_val)}</code>（只允许数字）")
+                errors.append(f"• 数字人民币账号错误：{html.escape(raw_val)}（只允许数字）")
             else:
                 digits = re.sub(r'\D', '', raw_val)
                 if not digits:
-                    errors.append(f"• 数字人民币账号无效：<code>{html.escape(raw_val)}</code>")
+                    errors.append(f"• 数字人民币账号无效：{html.escape(raw_val)}")
                 else:
                     info["digital_account"] = digits
 
@@ -155,14 +155,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 if email_match:
                     info["alipay_account"] = email_match.group(0)
                 else:
-                    errors.append(f"• 支付宝邮箱格式错误：<code>{html.escape(raw_val)}</code>")
+                    errors.append(f"• 支付宝邮箱格式错误：{html.escape(raw_val)}")
             else:
                 if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                    errors.append(f"• 支付宝账号错误：<code>{html.escape(raw_val)}</code>（仅支持手机号或邮箱）")
+                    errors.append(f"• 支付宝账号错误：{html.escape(raw_val)}（仅支持手机号或邮箱）")
                 else:
                     digits = re.sub(r'\D', '', raw_val)
                     if not digits:
-                        errors.append(f"• 支付宝账号无效：<code>{html.escape(raw_val)}</code>")
+                        errors.append(f"• 支付宝账号无效：{html.escape(raw_val)}")
                     else:
                         info["alipay_account"] = digits
         else:
@@ -177,11 +177,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             errors.append("• 未找到【银行卡号/账号】！")
         else:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
-                errors.append(f"• 银行卡号错误：<code>{html.escape(raw_val)}</code>（只允许数字）")
+                errors.append(f"• 银行卡号错误：{html.escape(raw_val)}（只允许数字）")
             else:
                 digits = re.sub(r'\D', '', raw_val)
                 if not digits:
-                    errors.append(f"• 银行卡号无效：<code>{html.escape(raw_val)}</code>")
+                    errors.append(f"• 银行卡号无效：{html.escape(raw_val)}")
                 else:
                     info["bank_account"] = digits
 
@@ -406,12 +406,12 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
-            # 整段包裹在 <pre> 中，右上角一键复制全部，并自动显示打勾
+            # 移除复制黑框，使用纯文本格式
             msg_text = (
                 "✅ <b>建店完成！</b>\n\n"
-                f"<pre>店铺网址:\n{html.escape(shop_url)}\n\n"
+                f"店铺网址:\n{html.escape(shop_url)}\n\n"
                 f"登入帳號:\n{html.escape(final_account)}\n\n"
-                "登入密码:\na12345</pre>"
+                "登入密码:\na12345"
             )
             return msg_text, final_account
         except PlaywrightTimeoutError:
@@ -476,15 +476,21 @@ def build_main_keyboard(account: str, current_skin: str = "极速微商") -> Inl
     return InlineKeyboardMarkup(buttons)
 
 
-# 展开状态按钮（包含收起按钮）
+# 展开状态按钮：2x2 四宫格样式 + 底部收起
 def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
-        [InlineKeyboardButton("极速微商", callback_data=f"skin_jisumeishang_{account}")],
-        [InlineKeyboardButton("七喵", callback_data=f"skin_qimiao_{account}")],
-        [InlineKeyboardButton("柒月", callback_data=f"skin_qiyue_{account}")],
-        [InlineKeyboardButton("音你而来", callback_data=f"skin_yinnierlai_{account}")],
-        [InlineKeyboardButton("⬅️ 收起", callback_data=f"close_skin_{account}_{current_skin}")]
+        [
+            InlineKeyboardButton("极速微商", callback_data=f"skin_jisumeishang_{account}"),
+            InlineKeyboardButton("七喵", callback_data=f"skin_qimiao_{account}")
+        ],
+        [
+            InlineKeyboardButton("柒月", callback_data=f"skin_qiyue_{account}"),
+            InlineKeyboardButton("音你而来", callback_data=f"skin_yinnierlai_{account}")
+        ],
+        [
+            InlineKeyboardButton("⬅️ 收起", callback_data=f"close_skin_{account}_{current_skin}")
+        ]
     ]
     return InlineKeyboardMarkup(buttons)
 
