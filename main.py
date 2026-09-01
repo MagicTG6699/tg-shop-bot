@@ -47,7 +47,8 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         "数字人民币", "數字人民幣", "数币", "數幣",
         "数字", "數字", "钱包", "錢包", "ecny"
     ]
-    bank_keywords = ["银行", "銀行", "卡号", "卡號", "支行"]
+    # 扩展银行类型触发关键词
+    bank_keywords = ["银行", "銀行", "卡号", "卡號", "支行", "分行", "银行账号", "銀行帳號", "银行卡号", "銀行卡號"]
     alipay_keywords = ["支付宝", "支付寶", "支"]
 
     if any(k in text for k in digital_keywords):
@@ -77,6 +78,10 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"’”]+$', '', val)
 
+        # 忽略无需解析的统计/状态行
+        if any(k in key for k in ["余额", "餘額", "状态", "狀態"]):
+            continue
+
         if "登入" not in key and (
             any(k in key for k in ["盖平台", "平台", "会员", "會員"])
             or key in ["账号", "帳號", "帐号", "会员号", "會員號", "平台账号", "平台帳號", "平台会员账号", "平台會員帳號"]
@@ -96,20 +101,22 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in digital_keywords):
             raw_accounts["digital"] = val
 
-        # ==================== [修改区域：适配独立 银行/支行/卡号 识别] ====================
-        elif key in ["银行", "銀行"]:
-            info["bank_name"] = val
-        elif key in ["支行", "分行"]:
-            info["branch_name"] = val
-        elif "银行名称" in key or "銀行名稱" in key:
+        # ==================== [修正及增强区域：精准定位与扩大侦测词] ====================
+        elif key in ["银行", "銀行", "银行名称", "銀行名稱"]:
             if "-" in val:
                 bank_parts = val.split("-")
                 info["bank_name"] = bank_parts[0].strip()
                 info["branch_name"] = bank_parts[1].strip()
             else:
                 info["bank_name"] = val
-                info["branch_name"] = val
-        elif any(k in key for k in bank_keywords):
+
+        elif key in ["支行", "分行", "支行名", "支行名稱", "支行名称", "分行名", "分行名稱", "分行名称"]:
+            info["branch_name"] = val
+
+        elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號"]:
+            raw_accounts["bank"] = val
+
+        elif any(k in key for k in ["卡号", "卡號", "银行账号", "銀行帳號"]):
             raw_accounts["bank"] = val
         # ============================================================================
 
@@ -171,7 +178,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     elif info_type == "bank":
         raw_val = raw_accounts.get("bank")
         if not raw_val:
-            errors.append("• 未找到【银行卡号】！")
+            errors.append("• 未找到【银行卡号/银行账号】！")
         else:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
                 errors.append(f"• 银行卡号错误：`{raw_val}`（只允许数字，不能包含英文或中文）")
@@ -182,7 +189,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_account"] = digits
 
-        # 如果提取到支行但未明确填入银行名称，使用支行内容做补全兼容
+        # 如果提取到支行但未明确填入银行名称，使用支行内容补全
         if info.get("branch_name") and not info.get("bank_name"):
             info["bank_name"] = info["branch_name"]
 
@@ -351,7 +358,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
             await page.locator("input[name='commit'], input[value='送出']").click()
 
-            # 5. 剔除占位银行卡（只有非银行卡模式才执行移除）
+            # 5. 剔除占位银行卡（只有非银行卡模式才执行移除，银行模式跳过移除）
             if info_type != "bank":
                 await search_account(final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
@@ -416,7 +423,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(k in user_text for k in ignore_keywords):
         return
 
-    trigger_keywords = ["账号", "帳號", "帐号", "盖平台", "平台", "平台账号", "平台帳號", "数字人民币", "數字人民幣", "数字", "數字", "支付宝", "支付寶", "银行", "銀行"]
+    trigger_keywords = ["账号", "帳號", "帐号", "盖平台", "平台", "平台账号", "平台帳號", "数字人民币", "數字人民幣", "数字", "數字", "支付宝", "支付寶", "银行", "銀行", "支行", "分行"]
     if not any(k in user_text for k in trigger_keywords):
         return
 
