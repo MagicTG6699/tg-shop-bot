@@ -38,7 +38,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验
+# 1. 文本解析与格式校验（重构前缀区分逻辑）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -50,6 +50,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     bank_keywords = ["银行", "銀行", "卡号", "卡號", "支行", "分行", "银行账号", "銀行帳號", "银行卡号", "銀行卡號", "银行名", "銀行名", "分行名称", "分行名稱", "银行户名", "銀行戶名"]
     alipay_keywords = ["支付宝", "支付寶", "支"]
 
+    # 类型初判
     if any(k in text for k in digital_keywords):
         info["type"] = "digital_wallet"
     elif any(k in text for k in bank_keywords):
@@ -77,31 +78,37 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"’”]+$', '', val)
 
-        # 忽略无需解析的统计/状态行
+        # 1. 过滤无关状态行
         if any(k in key for k in ["余额", "餘額", "状态", "狀態"]):
             continue
 
-        # 只要包含 户名/姓名/名字 -> * 银行姓名
+        # 2. 精准匹配：* 银行姓名（只要包含户名/姓名）
         if any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名", "银行户名", "銀行戶名"]) or key in ["名", "数字人民币户名", "數字人民幣戶名"]:
             info["name"] = val
 
-        elif "登入" not in key and (
-            any(k in key for k in ["盖平台", "平台", "会员", "會員"])
-            or key in ["账号", "帳號", "帐号", "会员号", "會員號", "平台账号", "平台帳號", "平台会员账号", "平台會員帳號"]
-        ):
-            if not any(k in key for k in ["支付宝", "支付寶", "银行", "銀行", "数字", "數字", "钱包", "錢包"]):
+        # 3. 精准匹配：平台会员账号（严格区分！）
+        elif any(k in key for k in ["平台会员账号", "平台會員帳號", "平台账号", "平台帳號", "会员账号", "會員帳號", "平台会员", "平台會員", "会员号", "會員號"]) or key in ["账号", "帳號", "帐号"]:
+            # 只有在不含银行、支付宝、数字人民币等前缀时，才认定为平台会员账号
+            if not any(k in key for k in ["银行", "銀行", "支付宝", "支付寶", "数字", "數字", "钱包", "錢包"]):
                 info["account"] = val.lower()
 
-        elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
-            raw_phone = val
+        # 4. 精准匹配：银行账号 / 银行卡号（必须有银行相关前缀）
+        elif any(k in key for k in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "银行卡", "銀行卡"]) or key in ["卡号", "卡號"]:
+            raw_accounts["bank"] = val
 
-        elif any(k in key for k in alipay_keywords):
+        # 5. 精准匹配：支付宝账号
+        elif any(k in key for k in ["支付宝账号", "支付寶帳號", "支付宝卡号", "支付宝", "支付寶"]):
             raw_accounts["alipay"] = val
 
+        # 6. 精准匹配：数字人民币账号
         elif any(k in key for k in digital_keywords):
             raw_accounts["digital"] = val
 
-        # 银行名 = 银行名称
+        # 7. 精准匹配：手机号
+        elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
+            raw_phone = val
+
+        # 8. 银行名 = 银行名称
         elif key in ["银行", "銀行", "银行名称", "銀行名稱", "银行名", "銀行名"]:
             if "-" in val:
                 bank_parts = val.split("-")
@@ -110,19 +117,17 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             else:
                 info["bank_name"] = val
 
-        # 支行 = 分行名称
+        # 9. 支行 = 分行名称
         elif key in ["支行", "分行", "支行名", "支行名稱", "支行名称", "分行名", "分行名稱", "分行名称"]:
             info["branch_name"] = val
 
-        # 银行卡号 = 银行账号
-        elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號"]:
-            raw_accounts["bank"] = val
-
     errors = []
 
+    # 校验 platform account
     if not info.get("account"):
         errors.append("• 未提取到【平台会员账号】！")
 
+    # 校验 银行姓名
     if not info.get("name"):
         errors.append("• 未提取到【银行户名 / * 銀行姓名】！")
 
@@ -295,7 +300,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                         except Exception:
                             pass
 
-                # * 银行姓名 必填项填入
+                # * 银行姓名 填入
                 name_val = info.get("name", "")
                 account_name_input = page.locator("#merchant_account_name, input[name*='account_name']").first
                 if await account_name_input.is_visible():
@@ -307,13 +312,13 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 info_type = info.get("type", "bank")
                 default_num = "6226220809397366"
 
-                # 表单的 3 格银行卡相关框
+                # 银行名 / 支行 / 银行账号 表单输入框
                 bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']").first
                 branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']").first
 
                 if info_type == "bank":
-                    # 银行模式：直接写入用户解析出的具体数据
+                    # 银行模式：精准填入
                     if await bank_name_input.is_visible():
                         await bank_name_input.fill(info.get("bank_name", ""))
                     if await branch_name_input.is_visible():
@@ -321,7 +326,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await card_no_input.is_visible():
                         await card_no_input.fill(info.get("bank_account", ""))
                 else:
-                    # 非银行模式：填入占位通用卡号
+                    # 非银行模式：填充默认卡号
                     if await bank_name_input.is_visible():
                         await bank_name_input.fill(default_num)
                     if await branch_name_input.is_visible():
@@ -343,7 +348,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                             except Exception:
                                 pass
 
-                # 点击提交送出按钮
+                # 提交
                 submit_btn = page.locator("input[name='commit'][value='送出'], input[type='submit']").first
                 await submit_btn.click()
                 await page.wait_for_load_state("networkidle")
