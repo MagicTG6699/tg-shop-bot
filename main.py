@@ -50,7 +50,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         "数字", "數字", "钱包", "錢包", "ecny"
     ]
     bank_keywords = ["银行", "銀行", "卡号", "卡號", "银", "銀", "卡"]
-    alipay_keywords = ["支付宝", "支付寶", "支"]
 
     if any(k in text for k in digital_keywords):
         info["type"] = "digital_wallet"
@@ -66,7 +65,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     raw_accounts = {}
     raw_phone = None
 
-    # 需要彻底无视的干扰词列表（包含余额、状态、备注、风控、限制等）
+    # 彻底无视的干扰词列表
     ignore_keys = ["余额", "餘額", "状态", "狀態", "备注", "備註", "限制", "风控", "風控"]
 
     for line in clean_text.splitlines():
@@ -74,7 +73,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if not line:
             continue
 
-        # 规则：如果整行包含“余额/状态/备注/风控/限制”等词，直接无视并跳过
+        # 规则1：如果整行包含干扰词，直接跳过
         if any(ik in line for ik in ignore_keys):
             continue
 
@@ -86,7 +85,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"”]+$', '', val)
 
-        # 字段名包含干扰词或值为空也无视
+        # 规则2：字段名包含干扰词或值为空也跳过
         if not val or any(ik in key for ik in ignore_keys):
             continue
 
@@ -106,10 +105,12 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val.replace("预设", "")
 
-        elif any(k in key for k in alipay_keywords) and not any(k in key for k in ["支行", "开户支行", "银行支行"]):
+        # 精准定位支付宝账号
+        elif key in ["支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支"]:
             raw_accounts["alipay"] = val
 
-        elif any(k in key for k in digital_keywords):
+        # 精准定位数字人民币账号（排除数字余额、数字状态等）
+        elif key in ["数字人民币", "數字人民幣", "数字R人民币", "數字R人民幣", "数字R", "數字R", "数币", "數幣", "数字", "數字", "钱包", "錢包", "数字人民币账号", "數字人民幣帳號"]:
             raw_accounts["digital"] = val
 
         elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
@@ -124,7 +125,8 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_name"] = val
 
-        elif any(k in key for k in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號"]) or key in ["银", "銀"]:
+        # 精准定位银行卡号（排除银行余额、银行状态等）
+        elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號", "银", "銀"]:
             raw_accounts["bank"] = val
 
     errors = []
@@ -369,16 +371,24 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("导入商品", step_items())
 
-            # 5. 移除非银行卡占位符
+            # 5. 移除默认填充的银行卡占位符（非银行卡建店时）
             if info_type != "bank":
                 async def step_remove_placeholder():
                     await search_account(final_account)
                     await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
-                    remove_btn = page.locator("a.remove_fields.dynamic, a:has-text('移除')").first
+                    await page.wait_for_load_state("domcontentloaded")
+                    
+                    # 准确定位“銀行帳戶”卡片块内的移除按钮
+                    bank_section = page.locator(".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)").first
+                    remove_btn = bank_section.locator("a.remove_fields, a:has-text('移除')").first
+                    
+                    if not await remove_btn.is_visible():
+                        remove_btn = page.locator("a.remove_fields, a:has-text('移除')").first
+
                     if await remove_btn.is_visible():
                         await remove_btn.click()
-                    await page.locator("input[name='commit'], input[value='送出']").click()
-                    await page.wait_for_load_state("domcontentloaded")
+                        await page.locator("input[name='commit'][value='送出']").first.click()
+                        await page.wait_for_load_state("domcontentloaded")
 
                 await run_sub_step("移除占位符", step_remove_placeholder())
 
@@ -418,7 +428,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             await run_sub_step("输入提现订单", step_withdraw())
 
             msg_text = (
-                "✅ <b>建店完成！ </b>\n"
+                "✅ <b>建店完成！</b>\n\n"
                 f"店铺网址:<code>{html.escape(shop_url)}</code>\n"
                 f"登入帳號:<code>{html.escape(final_account)}</code>\n"
                 "登入密码:<code>a12345</code>"
