@@ -170,7 +170,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     elif info_type == "bank":
         raw_val = raw_accounts.get("bank")
         if not raw_val:
-            errors.append("• 未找到【银行卡号】！")
+            errors.append("• 未找到【银行卡号/账号】！")
         else:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
                 errors.append(f"• 银行卡号错误：<code>{html.escape(raw_val)}</code>（只允许数字）")
@@ -180,6 +180,12 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                     errors.append(f"• 银行卡号无效：<code>{html.escape(raw_val)}</code>")
                 else:
                     info["bank_account"] = digits
+
+        # 强校验：缺少银行或支行时精确提示
+        if not info.get("bank_name"):
+            errors.append("• 缺少【银行名称】！")
+        if not info.get("branch_name"):
+            errors.append("• 缺少【支行名称】！")
 
     if errors:
         error_summary = "❌ <b>建店失败！检测到以下输入错误：</b>\n\n" + "\n".join(errors)
@@ -209,13 +215,11 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
         )
         page = await context.new_page()
         
-        # 将默认超时调回 20 秒，保障响应较慢时的顺畅执行
         page.set_default_timeout(20000)
 
         if task_id in ACTIVE_TASKS:
             ACTIVE_TASKS[task_id]["page"] = page
 
-        # 辅助点击与等待闭包
         async def click_and_wait_element(click_locator, wait_locator, timeout=20000):
             await click_locator.click()
             await wait_locator.wait_for(state="visible", timeout=timeout)
@@ -239,7 +243,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await submit_btn.click()
             await page.wait_for_load_state("domcontentloaded")
 
-            # 搜索辅助闭包
             async def search_account(acc_name: str):
                 await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
                 search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
@@ -289,11 +292,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     branch_name = info.get("branch_name", "")
                     bank_acc = info.get("bank_account", "")
 
-                    if not bank_name:
-                        bank_name = branch_name or "银行"
-                    if not branch_name:
-                        branch_name = bank_name
-
                     if await bank_name_input.is_visible(): await bank_name_input.fill(bank_name)
                     if await branch_name_input.is_visible(): await branch_name_input.fill(branch_name)
                     if await card_no_input.is_visible(): await card_no_input.fill(bank_acc)
@@ -334,18 +332,17 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     final_account = current_account
                     break
 
-            # 3. 提取店铺 Link（走到这里代表店铺主体已创建完成）
+            # 3. 提取店铺 Link
             await search_account(final_account)
             shop_url = (await page.locator("tbody tr").first.locator("td").nth(3).inner_text()).strip()
 
-            # 内部辅助函数：给非核心后续步骤套上单独的容错机制
             async def run_sub_step(step_name, coro):
                 try:
                     await coro
                 except Exception as sub_e:
                     print(f"⚠️ [{step_name}] 执行失败或超时（不影响建店主体）: {sub_e}")
 
-            # 4. 批量商品 (容错隔离)
+            # 4. 批量商品
             async def step_items():
                 await click_and_wait_element(
                     page.locator("tbody tr").first.locator("a[href$='/items']"),
@@ -361,7 +358,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
 
             await run_sub_step("导入商品", step_items())
 
-            # 5. 移除非银行卡占位符 (容错隔离)
+            # 5. 移除非银行卡占位符
             if info_type != "bank":
                 async def step_remove_placeholder():
                     await search_account(final_account)
@@ -374,7 +371,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
 
                 await run_sub_step("移除占位符", step_remove_placeholder())
 
-            # 6. 出货订单 (容错隔离)
+            # 6. 出货订单
             async def step_deposit():
                 await search_account(final_account)
                 await click_and_wait_element(
@@ -391,7 +388,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
 
             await run_sub_step("输入出货订单", step_deposit())
 
-            # 7. 提现订单 (容错隔离)
+            # 7. 提现订单
             async def step_withdraw():
                 await search_account(final_account)
                 await click_and_wait_element(
@@ -409,7 +406,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
-            # 返回建店结果
             return (
                 f"✅ <b>建店完成！</b>\n\n"
                 f"店铺网址 : <code>{html.escape(shop_url)}</code>\n"
