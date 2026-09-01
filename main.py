@@ -39,7 +39,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验（增加严格的 11 位手机号校验）
+# 1. 文本解析与格式校验（手机号调整为：最少 11 位）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -130,14 +130,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     if not info.get("account"):
         errors.append("• 未提取到【平台会员账号】！")
 
-    # 手机号精准拦截：只允许 11 位纯数字
+    # 手机号校验逻辑：只有少于 11 位才拦截，不少于 11 位则通过
     if raw_phone:
         if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_phone):
             errors.append(f"• 手机号格式错误：`{raw_phone}`（包含非数字字符）")
         else:
             digits_phone = re.sub(r'\D', '', raw_phone)
-            if len(digits_phone) != 11:
-                errors.append(f"• 手机号位数错误：`{raw_phone}`（当前为 {len(digits_phone)} 位，必须为 11 位）")
+            if len(digits_phone) < 11:
+                errors.append(f"• 手机号位数不够：`{raw_phone}`（当前为 {len(digits_phone)} 位，最少需 11 位）")
             else:
                 info["phone"] = digits_phone
     else:
