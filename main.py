@@ -39,7 +39,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验（手机号不截取，满 11 位及以上直接通过）
+# 1. 文本解析与格式校验
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -130,7 +130,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     if not info.get("account"):
         errors.append("• 未提取到【平台会员账号】！")
 
-    # 手机号校验逻辑：少于 11 位拦截，等于或大于 11 位保留原值放行
     if raw_phone:
         if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_phone):
             errors.append(f"• 手机号格式错误：`{raw_phone}`（包含非数字字符）")
@@ -248,7 +247,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(2)
 
-            # 智能搜索函数
+            # 智能搜寻函数：找到刚刚建立的店铺并读取其专属数据
             async def search_account(account_name: str):
                 await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
                 search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
@@ -265,9 +264,10 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     await search_input.press("Enter")
 
                 await page.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
+                await page.locator("tbody tr").first.wait_for(state="visible", timeout=15000)
 
-            # 2. 循环建店
+            # 2. 循环建店：重复或者被占用则自动自增 01, 02 ...
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
@@ -299,7 +299,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 if await acc_name_field.is_visible():
                     await acc_name_field.fill(info.get("name", ""))
 
-                # 手机号直接不截取全量写入
                 phone_field = page.locator("#merchant_phone").first
                 if await phone_field.is_visible():
                     await phone_field.fill(info.get("phone", ""))
@@ -311,6 +310,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
 
+                # 判断类型：真实银行卡填真实数据，支付宝/数字人民币填 3 栏位占位卡号
                 if info_type == "bank":
                     bank_name = info.get("bank_name", "")
                     branch_name = info.get("branch_name", "")
@@ -362,19 +362,39 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     pass
                 await asyncio.sleep(2)
 
-                is_used = await page.locator("body").evaluate("el => el.innerText.includes('已经被使用') || el.innerText.includes('已經被使用')")
-                if is_used:
+                body_text = await page.locator("body").inner_text()
+
+                # 1. 检查账号是否已被占用，若占用则增加后缀重新提交
+                if "已被使用" in body_text or "已經被使用" in body_text:
                     suffix_num += 1
                     continue
-                else:
-                    final_account = current_account
+
+                # 2. 拦截表单提交的其他错误（如手机号校验等）
+                error_match = re.search(r'([\u4e00-\u9fa5A-Za-z0-9_]+位数错误|格式错误|不能为空)', body_text)
+                if error_match and "成功" not in body_text:
+                    raise Exception(f"后台提交表单报错：{error_match.group(0)}")
+
+                final_account = current_account
+                break
+
+            # 3. 建店成功，通过搜寻读取店铺网址
+            await search_account(final_account)
+            
+            first_row = page.locator("tbody tr").first
+            td_elements = first_row.locator("td")
+            td_count = await td_elements.count()
+
+            shop_url = ""
+            for idx in range(td_count):
+                txt = (await td_elements.nth(idx).inner_text()).strip()
+                if "http" in txt or ".com" in txt or "shop" in txt:
+                    shop_url = txt
                     break
 
-            # 3. 获取店铺网址
-            await search_account(final_account)
-            shop_url = (await page.locator("tbody tr").first.locator("td").nth(3).inner_text()).strip()
+            if not shop_url and td_count >= 4:
+                shop_url = (await td_elements.nth(3).inner_text()).strip()
 
-            # 4. 导入 60 商品
+            # 4. 导入 60 个商品
             await page.locator("tbody tr").first.locator("a[href$='/items']").click(no_wait_after=True)
             await page.wait_for_load_state("domcontentloaded")
 
@@ -386,7 +406,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(1)
 
-            # 5. 非银行卡类型时，移除预填的占位银行卡
+            # 5. 非银行卡类型（支付宝或数字人民币）时，移除预填的 6226220809397366 占位银行卡
             if info_type != "bank":
                 await search_account(final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click(no_wait_after=True)
