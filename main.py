@@ -47,7 +47,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         "数字人民币", "數字人民幣", "数币", "數幣",
         "数字", "數字", "钱包", "錢包", "ecny"
     ]
-    bank_keywords = ["银行", "銀行", "卡号", "卡號", "支行", "分行", "银行账号", "銀行帳號", "银行卡号", "銀行卡號", "银行名", "銀行名", "分行名称", "分行名稱", "银行名称", "銀行名稱", "银行户名", "銀行戶名"]
+    bank_keywords = ["银行", "銀行", "卡号", "卡號", "支行", "分行", "银行账号", "銀行帳號", "银行卡号", "銀行卡號", "银行名", "銀行名", "分行名称", "分行名稱", "银行户名", "銀行戶名"]
     alipay_keywords = ["支付宝", "支付寶", "支"]
 
     if any(k in text for k in digital_keywords):
@@ -81,7 +81,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if any(k in key for k in ["余额", "餘額", "状态", "狀態"]):
             continue
 
-        # 只要谈到户名/姓名 -> * 银行姓名
+        # 只要包含 户名/姓名/名字 -> * 银行姓名
         if any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名", "银行户名", "銀行戶名"]) or key in ["名", "数字人民币户名", "數字人民幣戶名"]:
             info["name"] = val
 
@@ -122,6 +122,9 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     if not info.get("account"):
         errors.append("• 未提取到【平台会员账号】！")
+
+    if not info.get("name"):
+        errors.append("• 未提取到【银行户名 / * 銀行姓名】！")
 
     if raw_phone:
         if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_phone):
@@ -281,49 +284,69 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 if await page.locator("#merchant_password_confirmation").is_visible():
                     await page.locator("#merchant_password_confirmation").fill("a12345")
 
-                if await page.locator("#merchant_sprite_platform").is_visible():
+                # 选择平台
+                platform_select = page.locator("#merchant_sprite_platform")
+                if await platform_select.is_visible():
                     try:
-                        await page.locator("#merchant_sprite_platform").select_option(label="jj")
+                        await platform_select.select_option(label="jj", timeout=3000)
                     except Exception:
-                        await page.locator("#merchant_sprite_platform").select_option(value="jj")
+                        try:
+                            await platform_select.select_option(value="jj", timeout=3000)
+                        except Exception:
+                            pass
 
-                # * 银行姓名（无论如何都准确填入解析到的户名）
-                if await page.locator("#merchant_account_name").is_visible():
-                    await page.locator("#merchant_account_name").fill(info.get("name", ""))
+                # * 银行姓名 必填项填入
+                name_val = info.get("name", "")
+                account_name_input = page.locator("#merchant_account_name, input[name*='account_name']").first
+                if await account_name_input.is_visible():
+                    await account_name_input.fill(name_val)
+
                 if await page.locator("#merchant_phone").is_visible():
                     await page.locator("#merchant_phone").fill(info.get("phone", ""))
 
                 info_type = info.get("type", "bank")
                 default_num = "6226220809397366"
 
-                # 页面自带的 3 格银行输入框映射
+                # 表单的 3 格银行卡相关框
                 bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']").first
                 branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']").first
 
                 if info_type == "bank":
-                    # 银行模式：直接写入解析的数据
-                    await bank_name_input.fill(info.get("bank_name", ""))
-                    await branch_name_input.fill(info.get("branch_name", ""))
-                    await card_no_input.fill(info.get("bank_account", ""))
+                    # 银行模式：直接写入用户解析出的具体数据
+                    if await bank_name_input.is_visible():
+                        await bank_name_input.fill(info.get("bank_name", ""))
+                    if await branch_name_input.is_visible():
+                        await branch_name_input.fill(info.get("branch_name", ""))
+                    if await card_no_input.is_visible():
+                        await card_no_input.fill(info.get("bank_account", ""))
                 else:
-                    # 非银行模式：填充默认卡号
-                    await bank_name_input.fill(default_num)
-                    await branch_name_input.fill(default_num)
-                    await card_no_input.fill(default_num)
+                    # 非银行模式：填入占位通用卡号
+                    if await bank_name_input.is_visible():
+                        await bank_name_input.fill(default_num)
+                    if await branch_name_input.is_visible():
+                        await branch_name_input.fill(default_num)
+                    if await card_no_input.is_visible():
+                        await card_no_input.fill(default_num)
 
+                # 店铺皮肤选择
                 shop_template = page.locator("#merchant_store_skin_type")
                 if await shop_template.is_visible():
                     try:
-                        await shop_template.select_option(label="极速微商")
+                        await shop_template.select_option(label="极速微商", timeout=3000)
                     except Exception:
                         try:
-                            await shop_template.select_option(label="極速微商")
+                            await shop_template.select_option(label="極速微商", timeout=3000)
                         except Exception:
-                            await shop_template.select_option(index=1)
+                            try:
+                                await shop_template.select_option(index=1, timeout=3000)
+                            except Exception:
+                                pass
 
-                await page.locator("input[name='commit'][value='送出']").first.click()
-                await page.wait_for_load_state("domcontentloaded")
+                # 点击提交送出按钮
+                submit_btn = page.locator("input[name='commit'][value='送出'], input[type='submit']").first
+                await submit_btn.click()
+                await page.wait_for_load_state("networkidle")
 
                 is_used = await page.locator("body").evaluate("el => el.innerText.includes('已经被使用') || el.innerText.includes('已經被使用')")
                 if is_used:
@@ -343,7 +366,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
             await page.locator("input[name='commit'], input[value='送出']").click()
 
-            # 5. 剔除占位银行卡（仅在非银行模式下执行移除）
+            # 5. 剔除占位银行卡（非银行模式执行）
             if info_type != "bank":
                 await search_account(final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
