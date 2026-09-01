@@ -33,7 +33,7 @@ ACTIVE_TASKS = {}
 
 # 商城界面选项（与后台对应）
 SKIN_OPTIONS = {
-    "jisumeishang": "极速微商",
+    "jisumeishang": "预设极速微商",
     "qimiao": "七喵",
     "qiyue": "柒月",
     "yinnierlai": "音你而来"
@@ -79,7 +79,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"’”]+$', '', val)
 
-        # 平台账号
         if "登入" not in key and (
             any(k in key for k in ["盖平台", "平台", "会员", "會員"])
             or key in ["账号", "帳號", "帐号", "会员号", "會員號", "平台账号", "平台帳號", "平台会员账号", "平台會員帳號"]
@@ -87,31 +86,24 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             if not any(k in key for k in ["支付宝", "支付寶", "银行", "銀行", "数字", "數字", "钱包", "錢包"]):
                 info["account"] = val.lower()
 
-        # 姓名
         elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名"]) or key in ["名", "数字人民币户名", "數字人民幣戶名"]:
             info["name"] = val
 
-        # 手机号
         elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
             raw_phone = val
 
-        # 商城界面 / 模板
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val
 
-        # 支付宝
         elif any(k in key for k in alipay_keywords) and not any(k in key for k in ["支行", "开户支行", "银行支行"]):
             raw_accounts["alipay"] = val
 
-        # 数字货币
         elif any(k in key for k in digital_keywords):
             raw_accounts["digital"] = val
 
-        # 1. 优先提取：支行 / 分行 / 网点名称
         elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
             info["branch_name"] = val
 
-        # 2. 提取：银行名称
         elif any(k in key for k in ["银行名称", "銀行名稱", "开户行", "開戶行", "行名"]) or key in ["银行", "銀行"]:
             if "支行" not in key:
                 if "-" in val or " " in val:
@@ -121,7 +113,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_name"] = val
 
-        # 3. 银行卡号解析
         elif any(k in key for k in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號"]) or key in ["银", "銀"]:
             raw_accounts["bank"] = val
 
@@ -415,12 +406,16 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
-            # 恢复最原始格式（使用 <code> 标签实现点击一键复制，且不显式添加界面字段）
+            # 带有代码块（渲染右上角原生复制图标）的消息文本
             msg_text = (
                 f"✅ <b>建店完成！</b>\n\n"
-                f"店铺网址 : <code>{html.escape(shop_url)}</code>\n"
-                f"登入帳號 : <code>{html.escape(final_account)}</code>\n"
-                f"登入密码 : <code>a12345</code>"
+                f"店铺网址 :\n<code>{html.escape(shop_url)}</code>\n\n"
+                f"登入帳號 :\n<code>{html.escape(final_account)}</code>\n\n"
+                f"登入密码 :\n<code>a12345</code>\n\n"
+                f"完整建店信息 :\n"
+                f"<pre>店铺网址: {html.escape(shop_url)}\n"
+                f"登入帳號: {html.escape(final_account)}\n"
+                f"登入密码: a12345</pre>"
             )
             return msg_text, final_account
         except PlaywrightTimeoutError:
@@ -450,7 +445,6 @@ async def update_shop_skin(account_name: str, new_skin: str):
             await page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first.click()
             await page.wait_for_load_state("domcontentloaded")
 
-            # 搜索账号
             await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
             search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
             await search_input.fill(account_name)
@@ -461,14 +455,16 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 await search_input.press("Enter")
             await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
-            # 点击编辑
             await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
             await page.wait_for_load_state("domcontentloaded")
 
-            # 修改界面
             shop_template = page.locator("#merchant_store_skin_type")
             if await shop_template.is_visible():
-                await shop_template.select_option(label=new_skin)
+                real_skin_label = new_skin.replace("预设", "")
+                try:
+                    await shop_template.select_option(label=real_skin_label)
+                except Exception:
+                    await shop_template.select_option(label=new_skin)
 
             await page.locator("input[name='commit'][value='送出']").first.click()
             await page.wait_for_load_state("domcontentloaded")
@@ -476,28 +472,22 @@ async def update_shop_skin(account_name: str, new_skin: str):
             await browser.close()
 
 
-# 1. 默认按钮：显示 ✨ 更改商城界面（当前XXX）
-def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
+# 默认收起状态按钮
+def build_main_keyboard(account: str, current_skin: str = "预设极速微商") -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(f"✨ 更改商城界面（当前{current_skin}）", callback_data=f"open_skin_{account}_{current_skin}")]
     ]
     return InlineKeyboardMarkup(buttons)
 
 
-# 2. 展开按钮：展示模板选项 + ⬅️ 收起按钮
-def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
+# 展开状态按钮（包含收起按钮）
+def build_skin_options_keyboard(account: str, current_skin: str = "预设极速微商") -> InlineKeyboardMarkup:
     buttons = [
-        [
-            InlineKeyboardButton("极速微商", callback_data=f"skin_jisumeishang_{account}"),
-            InlineKeyboardButton("七喵", callback_data=f"skin_qimiao_{account}")
-        ],
-        [
-            InlineKeyboardButton("柒月", callback_data=f"skin_qiyue_{account}"),
-            InlineKeyboardButton("音你而来", callback_data=f"skin_yinnierlai_{account}")
-        ],
-        [
-            InlineKeyboardButton("⬅️ 收起", callback_data=f"close_skin_{account}_{current_skin}")
-        ]
+        [InlineKeyboardButton("预设极速微商", callback_data=f"skin_jisumeishang_{account}")],
+        [InlineKeyboardButton("七喵", callback_data=f"skin_qimiao_{account}")],
+        [InlineKeyboardButton("柒月", callback_data=f"skin_qiyue_{account}")],
+        [InlineKeyboardButton("音你而来", callback_data=f"skin_yinnierlai_{account}")],
+        [InlineKeyboardButton("⬅️ 收起", callback_data=f"close_skin_{account}_{current_skin}")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -551,7 +541,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 后台 Task 包装
 async def run_shop_worker(status_msg, parsed_info, task_id: str):
     try:
-        initial_skin = parsed_info.get("skin", "极速微商")
+        initial_skin = parsed_info.get("skin", "预设极速微商")
+        if not initial_skin.startswith("预设") and initial_skin == "极速微商":
+            initial_skin = "预设极速微商"
+
         result_text, final_account = await create_and_setup_shop(parsed_info, task_id)
         keyboard = build_main_keyboard(final_account, initial_skin)
         await status_msg.edit_text(result_text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
@@ -597,26 +590,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if task and not task.done():
             task.cancel()
 
-    # 点击展开选项
     elif data.startswith("open_skin_"):
         parts = data.split("_")
         account = parts[2]
-        current_skin = parts[3] if len(parts) > 3 else "极速微商"
+        current_skin = parts[3] if len(parts) > 3 else "预设极速微商"
         keyboard = build_skin_options_keyboard(account, current_skin)
         await query.edit_message_reply_markup(reply_markup=keyboard)
 
-    # 点击收起选项
     elif data.startswith("close_skin_"):
         parts = data.split("_")
         account = parts[2]
-        current_skin = parts[3] if len(parts) > 3 else "极速微商"
+        current_skin = parts[3] if len(parts) > 3 else "预设极速微商"
         keyboard = build_main_keyboard(account, current_skin)
         await query.edit_message_reply_markup(reply_markup=keyboard)
 
-    # 执行选择并修改界面
     elif data.startswith("skin_"):
         _, skin_key, account = data.split("_", 2)
-        new_skin_name = SKIN_OPTIONS.get(skin_key, "极速微商")
+        new_skin_name = SKIN_OPTIONS.get(skin_key, "预设极速微商")
 
         await query.answer(f"⏳ 正在修改界面为【{new_skin_name}】...", show_alert=False)
 
