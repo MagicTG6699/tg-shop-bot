@@ -427,12 +427,12 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
-            # 缩小空格：冒号后仅留一个半角空格
+            # 冒号前后各留一个半角空格
             msg_text = (
                 "✅ <b>建店完成！</b>\n\n"
-                f"店铺网址: {html.escape(shop_url)}\n"
-                f"登入帳號: <code>{html.escape(final_account)}</code>\n"
-                "登入密码: <code>a12345</code>"
+                f"店铺网址 : <code>{html.escape(shop_url)}</code>\n"
+                f"登入帳號 : <code>{html.escape(final_account)}</code>\n"
+                "登入密码 : <code>a12345</code>"
             )
             return msg_text, final_account
         except PlaywrightTimeoutError:
