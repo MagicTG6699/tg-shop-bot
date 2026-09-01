@@ -65,16 +65,19 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     raw_accounts = {}
     raw_phone = None
 
-    # 彻底无视的干扰词列表
-    ignore_keys = ["余额", "餘額", "状态", "狀態", "备注", "備註", "限制", "风控", "風控"]
+    # 基础干扰词列表
+    base_ignore_keys = ["余额", "餘額", "状态", "狀態", "备注", "備註", "限制", "风控", "風控", "交易日"]
 
     for line in clean_text.splitlines():
         line = line.strip()
         if not line:
             continue
 
-        # 规则1：如果整行包含干扰词，直接跳过
-        if any(ik in line for ik in ignore_keys):
+        # 规则1：如果包含基础干扰词，或者同时包含“订单/訂單”与“最后/最後”，则跳过该行
+        has_base_ignore = any(ik in line for ik in base_ignore_keys)
+        has_order_and_last = ("订单" in line or "訂單" in line) and ("最后" in line or "最後" in line)
+
+        if has_base_ignore or has_order_and_last:
             continue
 
         parts = re.split(r'[:：]', line, maxsplit=1)
@@ -85,8 +88,8 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"”]+$', '', val)
 
-        # 规则2：字段名包含干扰词或值为空也跳过
-        if not val or any(ik in key for ik in ignore_keys):
+        # 规则2：字段名包含基础干扰词或值为空也跳过
+        if not val or any(ik in key for ik in base_ignore_keys):
             continue
 
         if "登入" not in key and (
