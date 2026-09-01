@@ -17,8 +17,11 @@ from playwright.async_api import async_playwright
 # 从环境变量中安全获取所有敏感配置
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
+# 解析环境变量中的白名单 ID（支持单个 ID，或用逗号/分号/空格分隔的多 ID）
 admin_id_env = os.environ.get("ADMIN_USER_ID", "").strip()
-ADMIN_USER_ID = int(admin_id_env) if admin_id_env and admin_id_env.isdigit() else None
+ADMIN_USER_IDS = set(
+    int(x) for x in re.split(r'[,;\s]+', admin_id_env) if x.isdigit()
+)
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
@@ -376,12 +379,10 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
 async def run_shop_worker(status_msg, parsed_info, task_id: str):
     try:
         result_text = await create_and_setup_shop(parsed_info, task_id)
-        # 转义地址显示，避免再次引起渲染解析异常
         await status_msg.edit_text(result_text, parse_mode="Markdown", disable_web_page_preview=True)
     except asyncio.CancelledError:
         await status_msg.edit_text("🛑 **已取消建店！**")
     except Exception as e:
-        # 抛出错误时屏蔽 URL 预览
         safe_err = str(e).replace("[", "\\[").replace("]", "\\]")
         await status_msg.edit_text(f"❌ 建店出现错误：{safe_err}", parse_mode="Markdown", disable_web_page_preview=True)
     finally:
@@ -397,8 +398,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     user_id = update.effective_user.id
 
-    if chat_type == "private" and (ADMIN_USER_ID is not None and user_id != ADMIN_USER_ID):
-        return
+    # 权限拦截判断：
+    # 如果是私聊（private），必须在环境变量白名单 ADMIN_USER_IDS 中才允许响应，否则静默忽略
+    if chat_type == "private":
+        if user_id not in ADMIN_USER_IDS:
+            return
 
     ignore_keywords = ["店铺网址", "店鋪網址", "登入密碼", "登入密码", "极速微商", "極速微商"]
     if any(k in user_text for k in ignore_keywords):
@@ -452,8 +456,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_info = ACTIVE_TASKS[task_id]
         origin_user_id = task_info["user_id"]
 
-        if click_user_id != origin_user_id and (ADMIN_USER_ID is not None and click_user_id != ADMIN_USER_ID):
-            await query.answer("⚠️ 只有指令发送者或管理员可以取消该任务！", show_alert=True)
+        # 仅允许指令发送者或白名单用户取消任务
+        if click_user_id != origin_user_id and (click_user_id not in ADMIN_USER_IDS):
+            await query.answer("⚠️ 只有指令发送者或白名单管理员可以取消该任务！", show_alert=True)
             return
 
         page = task_info.get("page")
