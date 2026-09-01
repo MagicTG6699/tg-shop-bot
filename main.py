@@ -39,7 +39,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验（手机号调整为：最少 11 位）
+# 1. 文本解析与格式校验（手机号不截取，满 11 位及以上直接通过）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -130,7 +130,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     if not info.get("account"):
         errors.append("• 未提取到【平台会员账号】！")
 
-    # 手机号校验逻辑：只有少于 11 位才拦截，不少于 11 位则通过
+    # 手机号校验逻辑：少于 11 位拦截，等于或大于 11 位保留原值放行
     if raw_phone:
         if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_phone):
             errors.append(f"• 手机号格式错误：`{raw_phone}`（包含非数字字符）")
@@ -290,12 +290,16 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     try:
                         await sprite_platform.select_option(label="jj")
                     except Exception:
-                        await sprite_platform.select_option(value="jj")
+                        try:
+                            await sprite_platform.select_option(value="jj")
+                        except Exception:
+                            pass
 
                 acc_name_field = page.locator("#merchant_account_name").first
                 if await acc_name_field.is_visible():
                     await acc_name_field.fill(info.get("name", ""))
 
+                # 手机号直接不截取全量写入
                 phone_field = page.locator("#merchant_phone").first
                 if await phone_field.is_visible():
                     await phone_field.fill(info.get("phone", ""))
@@ -344,7 +348,10 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                         try:
                             await shop_template.select_option(label="極速微商")
                         except Exception:
-                            await shop_template.select_option(index=1)
+                            try:
+                                await shop_template.select_option(index=1)
+                            except Exception:
+                                pass
 
                 commit_btn = page.locator("input[name='commit'][value='送出'], input[type='submit']").first
                 await commit_btn.click(no_wait_after=True)
@@ -439,8 +446,8 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str):
     except Exception as e:
         print(f"执行建店过程捕获异常: {e}")
         traceback.print_exc()
-        safe_err = str(e).replace("[", "\\[").replace("]", "\\]")
-        await status_msg.edit_text(f"❌ **建店出现错误：** {safe_err}", parse_mode="Markdown", disable_web_page_preview=True)
+        err_msg = str(e).replace("_", "\\_").replace("*", "\\*").replace("`", "'")
+        await status_msg.edit_text(f"❌ **建店出现错误：**\n`{err_msg}`", parse_mode="Markdown", disable_web_page_preview=True)
     finally:
         ACTIVE_TASKS.pop(task_id, None)
 
