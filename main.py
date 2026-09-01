@@ -38,7 +38,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验
+# 1. 文本解析与格式校验（已强化银行信息关键词及切分逻辑）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -47,9 +47,10 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         "数字人民币", "數字人民幣", "数币", "數幣",
         "数字", "數字", "钱包", "錢包", "ecny"
     ]
-    bank_keywords = ["银行", "銀行", "卡号", "卡號"]
+    bank_keywords = ["银行", "銀行", "卡号", "卡號", "银", "銀", "卡"]
     alipay_keywords = ["支付宝", "支付寶", "支"]
 
+    # 判断类型，优先判断数字与银行
     if any(k in text for k in digital_keywords):
         info["type"] = "digital_wallet"
     elif any(k in text for k in bank_keywords):
@@ -77,34 +78,43 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"’”]+$', '', val)
 
+        # 1. 平台会员账号识别
         if "登入" not in key and (
             any(k in key for k in ["盖平台", "平台", "会员", "會員"])
-            or key in ["账号", "帳號", "帐号", "会员号", "會員號", "平台账号", "平台帳號"]
+            or key in ["账号", "帳號", "帐号", "会员号", "會員號", "平台账号", "平台帳號", "平台会员账号", "平台會員帳號"]
         ):
             if not any(k in key for k in ["支付宝", "支付寶", "银行", "銀行", "数字", "數字", "钱包", "錢包"]):
                 info["account"] = val.lower()
 
+        # 2. 户名/姓名识别
         elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名"]) or key in ["名", "数字人民币户名", "數字人民幣戶名"]:
             info["name"] = val
 
+        # 3. 手机号识别
         elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
             raw_phone = val
 
-        elif any(k in key for k in alipay_keywords):
+        # 4. 支付宝识别
+        elif any(k in key for k in alipay_keywords) and not any(k in key for k in ["支行", "开户支行", "银行支行"]):
             raw_accounts["alipay"] = val
 
+        # 5. 数字货币识别
         elif any(k in key for k in digital_keywords):
             raw_accounts["digital"] = val
 
-        elif "银行名称" in key or "銀行名稱" in key:
-            if "-" in val:
-                bank_parts = val.split("-")
+        # 6. 银行名称/支行/卡号精准强化识别
+        elif any(k in key for k in ["银行名称", "銀行名稱", "银行名称与支行", "銀行名稱與支行", "开户行", "開戶行", "行名"]):
+            if "-" in val or " " in val:
+                bank_parts = re.split(r'[- ]+', val, maxsplit=1)
                 info["bank_name"] = bank_parts[0].strip()
                 info["branch_name"] = bank_parts[1].strip()
             else:
                 info["bank_name"] = val
-                info["branch_name"] = val
-        elif any(k in key for k in bank_keywords):
+
+        elif any(k in key for k in ["银行支行", "銀行支行", "支行", "分行", "开户支行", "開戶支行", "网点", "網點"]):
+            info["branch_name"] = val
+
+        elif any(k in key for k in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號"]) or key in ["银行", "銀行", "银", "銀"]:
             raw_accounts["bank"] = val
 
     errors = []
@@ -285,11 +295,23 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']").first
 
+                # 银行模式：精准依据提取到的信息填充（银行名称、分行名称、卡号）
                 if info_type == "bank":
-                    if await bank_name_input.is_visible(): await bank_name_input.fill(info.get("bank_name", ""))
-                    if await branch_name_input.is_visible(): await branch_name_input.fill(info.get("branch_name", ""))
-                    if await card_no_input.is_visible(): await card_no_input.fill(info.get("bank_account", ""))
+                    bank_name = info.get("bank_name", "")
+                    branch_name = info.get("branch_name", "")
+                    bank_acc = info.get("bank_account", "")
+
+                    # 兜底补充逻辑：若未抓取到银行名称，尝试以分行或卡号补全；若未抓到分行，则用银行名称或卡号补全
+                    if not bank_name:
+                        bank_name = branch_name or "银行"
+                    if not branch_name:
+                        branch_name = bank_name
+
+                    if await bank_name_input.is_visible(): await bank_name_input.fill(bank_name)
+                    if await branch_name_input.is_visible(): await branch_name_input.fill(branch_name)
+                    if await card_no_input.is_visible(): await card_no_input.fill(bank_acc)
                 else:
+                    # 非银行模式（支付宝/数字人民币）：填充默认占位卡号
                     if await bank_name_input.is_visible(): await bank_name_input.fill(default_num)
                     if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
                     if await card_no_input.is_visible(): await card_no_input.fill(default_num)
@@ -341,7 +363,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
             await page.locator("input[name='commit'], input[value='送出']").click()
 
-            # 5. 剔除占位银行卡
+            # 5. 仅非银行卡类型时，剔除占位银行卡；银行卡类型保留不删除
             if info_type != "bank":
                 await search_account(final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
@@ -398,8 +420,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     user_id = update.effective_user.id
 
-    # 权限拦截判断：
-    # 如果是私聊（private），必须在环境变量白名单 ADMIN_USER_IDS 中才允许响应，否则静默忽略
+    # 权限拦截判断：私聊仅限白名单，群组不限制
     if chat_type == "private":
         if user_id not in ADMIN_USER_IDS:
             return
@@ -456,7 +477,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_info = ACTIVE_TASKS[task_id]
         origin_user_id = task_info["user_id"]
 
-        # 仅允许指令发送者或白名单用户取消任务
+        # 仅允许指令发送者或白名单管理员取消任务
         if click_user_id != origin_user_id and (click_user_id not in ADMIN_USER_IDS):
             await query.answer("⚠️ 只有指令发送者或白名单管理员可以取消该任务！", show_alert=True)
             return
