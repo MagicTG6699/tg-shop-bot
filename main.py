@@ -243,8 +243,8 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await pass_input.fill(ADMIN_PASS)
 
             submit_btn = page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first
-            await submit_btn.click()
-            await page.wait_for_load_state("networkidle")
+            await submit_btn.click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
 
             # 智能搜索函数
             async def search_account(account_name: str):
@@ -256,13 +256,13 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 try:
                     search_btn = page.locator("button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary").first
                     if await search_btn.is_visible():
-                        await search_btn.click()
+                        await search_btn.click(no_wait_after=True)
                     else:
                         await search_input.press("Enter")
                 except Exception:
                     await search_input.press("Enter")
 
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(1)
 
             # 2. 循环建店
@@ -342,8 +342,10 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                         except Exception:
                             await shop_template.select_option(index=1)
 
-                await page.locator("input[name='commit'][value='送出']").first.click()
+                # 修改关键点：添加 no_wait_after=True 避免提交表单超时
+                await page.locator("input[name='commit'][value='送出']").first.click(no_wait_after=True)
                 await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(2)
 
                 is_used = await page.locator("body").evaluate("el => el.innerText.includes('已经被使用') || el.innerText.includes('已經被使用')")
                 if is_used:
@@ -361,7 +363,9 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.locator("tbody tr").first.locator("a[href$='/items']").click()
             await page.locator("a[href*='/items/new'], a:has-text('導入商品')").first.click()
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
-            await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(1)
 
             # 5. 仅非银行卡类型时，剔除占位银行卡；银行卡类型保留不删除
             if info_type != "bank":
@@ -370,14 +374,18 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 remove_btn = page.locator("a.remove_fields.dynamic, a:has-text('移除')").first
                 if await remove_btn.is_visible():
                     await remove_btn.click()
-                await page.locator("input[name='commit'], input[value='送出']").click()
+                await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(1)
 
             # 6. 出货 6000
             await search_account(final_account)
             await page.locator("tbody tr").first.locator("a[href$='/deposits']").click()
             await page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單')").first.click()
             await page.locator("#quantity, input[name='quantity']").fill("6000")
-            await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(1)
 
             # 7. 提现 6000
             await search_account(final_account)
@@ -385,7 +393,8 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             withdraw_btn = page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href*='/withdraws/new']").first
             await withdraw_btn.click()
             await page.locator("#quantity, input[name='quantity']").fill("6000")
-            await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
+            await page.wait_for_load_state("domcontentloaded")
 
             return (
                 f"✅ **建店完成！**\n\n"
