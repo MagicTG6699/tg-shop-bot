@@ -38,7 +38,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验（已彻底修复正则表达式与逻辑）
+# 1. 文本解析与格式校验
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -103,7 +103,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in digital_keywords):
             raw_accounts["digital"] = val
 
-        # 银行名称匹配（包含“银行名”等简写）
+        # 银行名称匹配
         elif any(k in key for k in ["银行名", "銀行名", "银行名称", "銀行名稱", "银行名称与支行", "銀行名稱與支行", "开户行", "開戶行", "行名"]):
             if "-" in val or " " in val:
                 bank_parts = re.split(r'[- ]+', val, maxsplit=1)
@@ -113,7 +113,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             else:
                 info["bank_name"] = val
 
-        # 支行名称匹配（包含“支行”等简写）
+        # 支行名称匹配
         elif any(k in key for k in ["银行支行", "銀行支行", "支行", "分行", "开户支行", "開戶支行", "网点", "網點"]):
             info["branch_name"] = val
 
@@ -177,7 +177,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 info["alipay_account"] = info.get("phone")
 
     elif info_type == "bank":
-        # 1. 卡号校验
         raw_val = raw_accounts.get("bank")
         if not raw_val:
             errors.append("• 未找到【银行卡号】！")
@@ -191,11 +190,9 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_account"] = digits
 
-        # 2. 银行名称校验
         if not info.get("bank_name"):
             errors.append("• 未找到【银行名称】！")
 
-        # 3. 支行强校验：缺少支行直接拒绝制作
         if not info.get("branch_name"):
             errors.append("• 缺少【银行支行】信息，无法协助制作，请补充支行后再试！")
 
@@ -277,40 +274,41 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
 
-                username_input = page.locator("#merchant_username, input[name='merchant[username]'], input[id*='username']").first
+                username_input = page.locator("#merchant_username").first
                 await username_input.wait_for(state="visible", timeout=20000)
 
                 await username_input.fill(current_account)
                 
-                pass_field = page.locator("#merchant_password, input[name='merchant[password]']").first
+                pass_field = page.locator("#merchant_password").first
                 if await pass_field.is_visible():
                     await pass_field.fill("a12345")
                     
-                pass_confirm = page.locator("#merchant_password_confirmation, input[name='merchant[password_confirmation]']").first
+                pass_confirm = page.locator("#merchant_password_confirmation").first
                 if await pass_confirm.is_visible():
                     await pass_confirm.fill("a12345")
 
-                sprite_platform = page.locator("#merchant_sprite_platform, select[name*='sprite_platform']").first
+                sprite_platform = page.locator("#merchant_sprite_platform").first
                 if await sprite_platform.is_visible():
                     try:
                         await sprite_platform.select_option(label="jj")
                     except Exception:
                         await sprite_platform.select_option(value="jj")
 
-                acc_name_field = page.locator("#merchant_account_name, input[name*='account_name']").first
+                acc_name_field = page.locator("#merchant_account_name").first
                 if await acc_name_field.is_visible():
                     await acc_name_field.fill(info.get("name", ""))
 
-                phone_field = page.locator("#merchant_phone, input[name*='phone']").first
+                phone_field = page.locator("#merchant_phone").first
                 if await phone_field.is_visible():
                     await phone_field.fill(info.get("phone", ""))
 
                 info_type = info.get("type", "alipay")
                 default_num = "6226220809397366"
 
-                bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']").first
-                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
-                card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']").first
+                # 根据 DOM 提取的精确 Element ID 定位
+                bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
+                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
+                card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
 
                 if info_type == "bank":
                     bank_name = info.get("bank_name", "")
@@ -321,11 +319,12 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await branch_name_input.is_visible(): await branch_name_input.fill(branch_name)
                     if await card_no_input.is_visible(): await card_no_input.fill(bank_acc)
                 else:
+                    # 页面自带银行帐户为必填项时，使用默认占位数据填充以顺利提交表单
                     if await bank_name_input.is_visible(): await bank_name_input.fill(default_num)
                     if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
                     if await card_no_input.is_visible(): await card_no_input.fill(default_num)
 
-                alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name, input[id$='_alipay_accounts_attributes_0_account_name']").first
+                alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
                 if info_type == "alipay":
                     if await alipay_input.is_visible():
                         await alipay_input.fill(info.get("alipay_account", ""))
@@ -333,7 +332,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await alipay_input.is_visible():
                         await alipay_input.fill("")
 
-                ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name, input[id$='_ecny_accounts_attributes_0_account_name']").first
+                ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name").first
                 if info_type == "digital_wallet":
                     if await ecny_input.is_visible():
                         await ecny_input.fill(info.get("digital_account", ""))
@@ -341,7 +340,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await ecny_input.is_visible():
                         await ecny_input.fill("")
 
-                shop_template = page.locator("#merchant_store_skin_type, select[name*='store_skin_type']").first
+                shop_template = page.locator("#merchant_store_skin_type").first
                 if await shop_template.is_visible():
                     try:
                         await shop_template.select_option(label="极速微商")
@@ -384,7 +383,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(1)
 
-            # 5. 仅非银行卡类型时，剔除占位银行卡
+            # 5. 非银行卡类型时，移除预填的占位银行卡
             if info_type != "bank":
                 await search_account(final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click(no_wait_after=True)
