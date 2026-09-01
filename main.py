@@ -31,6 +31,14 @@ BASE_ADMIN_URL = match.group(0).rstrip('/') if match else raw_admin_url.rstrip('
 # 全局任务字典
 ACTIVE_TASKS = {}
 
+# 商城界面选项（与后台对应）
+SKIN_OPTIONS = {
+    "jisumeishang": "极速微商",
+    "qimiao": "七喵",
+    "qiyue": "柒月",
+    "yinnierlai": "音你而来"
+}
+
 
 # 2. 文本解析与格式校验
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
@@ -87,6 +95,10 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
             raw_phone = val
 
+        # 商城界面 / 模板
+        elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
+            info["skin"] = val
+
         # 支付宝
         elif any(k in key for k in alipay_keywords) and not any(k in key for k in ["支行", "开户支行", "银行支行"]):
             raw_accounts["alipay"] = val
@@ -95,11 +107,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in digital_keywords):
             raw_accounts["digital"] = val
 
-        # 1. 优先提取：支行 / 分行 / 网点名称（优先级高于银行名称，防止误匹配）
+        # 1. 优先提取：支行 / 分行 / 网点名称
         elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
             info["branch_name"] = val
 
-        # 2. 提取：银行名称（精准排除带有“支行”关键词的整行）
+        # 2. 提取：银行名称
         elif any(k in key for k in ["银行名称", "銀行名稱", "开户行", "開戶行", "行名"]) or key in ["银行", "銀行"]:
             if "支行" not in key:
                 if "-" in val or " " in val:
@@ -195,8 +207,8 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
-# 3. Playwright 自动化建店
-async def create_and_setup_shop(info: dict, task_id: str) -> str:
+# 3. Playwright 自动化建店与修改界面
+async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
     if not ADMIN_USER or not ADMIN_PASS:
@@ -205,6 +217,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
     base_account = info.get("account")
     suffix_num = 0
     final_account = base_account
+    target_skin = info.get("skin", "极速微商")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -215,7 +228,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
-        
         page.set_default_timeout(20000)
 
         if task_id in ACTIVE_TASKS:
@@ -316,12 +328,9 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 shop_template = page.locator("#merchant_store_skin_type")
                 if await shop_template.is_visible():
                     try:
-                        await shop_template.select_option(label="极速微商")
+                        await shop_template.select_option(label=target_skin)
                     except Exception:
-                        try:
-                            await shop_template.select_option(label="極速微商")
-                        except Exception:
-                            await shop_template.select_option(index=1)
+                        await shop_template.select_option(index=1)
 
                 await page.locator("input[name='commit'][value='送出']").first.click()
                 await page.wait_for_load_state("domcontentloaded")
@@ -407,23 +416,88 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
-            return (
+            msg_text = (
                 f"✅ <b>建店完成！</b>\n\n"
                 f"店铺网址 : <code>{html.escape(shop_url)}</code>\n"
                 f"登入帳號 : <code>{html.escape(final_account)}</code>\n"
-                f"登入密码 : <code>a12345</code>"
+                f"登入密码 : <code>a12345</code>\n"
+                f"当前界面 : <b>{html.escape(target_skin)}</b>"
             )
+            return msg_text, final_account
         except PlaywrightTimeoutError:
             raise Exception("建店关键流程超时，后台响应较慢，请稍后前往后台核对。")
         finally:
             await browser.close()
 
 
+# 修改商城界面的专用函数
+async def update_shop_skin(account_name: str, new_skin: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+        )
+        context = await browser.new_context()
+        page = await context.new_page()
+        page.set_default_timeout(20000)
+
+        try:
+            await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
+            user_input = page.locator(
+                "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
+            ).first
+            await user_input.fill(ADMIN_USER)
+            await page.locator("#admin_user_password, #user_password, input[type='password']").first.fill(ADMIN_PASS)
+            await page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first.click()
+            await page.wait_for_load_state("domcontentloaded")
+
+            # 搜索账号
+            await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
+            search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
+            await search_input.fill(account_name)
+            search_btn = page.locator("button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary").first
+            if await search_btn.is_visible():
+                await search_btn.click()
+            else:
+                await search_input.press("Enter")
+            await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
+
+            # 点击编辑
+            await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
+            await page.wait_for_load_state("domcontentloaded")
+
+            # 修改界面
+            shop_template = page.locator("#merchant_store_skin_type")
+            if await shop_template.is_visible():
+                await shop_template.select_option(label=new_skin)
+
+            await page.locator("input[name='commit'][value='送出']").first.click()
+            await page.wait_for_load_state("domcontentloaded")
+        finally:
+            await browser.close()
+
+
+# 生成界面选择的键盘
+def build_skin_keyboard(account: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton("极速微商", callback_data=f"skin_jisumeishang_{account}"),
+            InlineKeyboardButton("七喵", callback_data=f"skin_qimiao_{account}")
+        ],
+        [
+            InlineKeyboardButton("柒月", callback_data=f"skin_qiyue_{account}"),
+            InlineKeyboardButton("音你而来", callback_data=f"skin_yinnierlai_{account}")
+        ]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 # 后台 Task 包装
 async def run_shop_worker(status_msg, parsed_info, task_id: str):
     try:
-        result_text = await create_and_setup_shop(parsed_info, task_id)
-        await status_msg.edit_text(result_text, parse_mode="HTML", disable_web_page_preview=True)
+        result_text, final_account = await create_and_setup_shop(parsed_info, task_id)
+        keyboard = build_skin_keyboard(final_account)
+        await status_msg.edit_text(result_text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
     except asyncio.CancelledError:
         await status_msg.edit_text("🛑 <b>已取消建店！</b>", parse_mode="HTML")
     except Exception as e:
@@ -445,7 +519,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type == "private" and ADMIN_USER_IDS and (user_id not in ADMIN_USER_IDS):
         return
 
-    ignore_keywords = ["店铺网址", "店鋪網址", "登入密碼", "登入密码", "极速微商", "極速微商"]
+    ignore_keywords = ["店铺网址", "店鋪網址", "登入密碼", "登入密码", "当前界面"]
     if any(k in user_text for k in ignore_keywords):
         return
 
@@ -511,6 +585,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task = task_info.get("task")
         if task and not task.done():
             task.cancel()
+
+    elif data.startswith("skin_"):
+        # 切换界面模式
+        _, skin_key, account = data.split("_", 2)
+        new_skin_name = SKIN_OPTIONS.get(skin_key, "极速微商")
+
+        current_text = query.message.text
+        await query.edit_message_text(f"⏳ 正在将商城界面切换为【<b>{new_skin_name}</b>】，请稍候...", parse_mode="HTML")
+
+        try:
+            await update_shop_skin(account, new_skin_name)
+            
+            # 更新文本中的“当前界面”
+            if "当前界面 :" in current_text:
+                new_text = re.sub(r'当前界面 : .*', f'当前界面 : <b>{html.escape(new_skin_name)}</b>', current_text)
+            else:
+                new_text = current_text + f"\n当前界面 : <b>{html.escape(new_skin_name)}</b>"
+
+            keyboard = build_skin_keyboard(account)
+            await query.edit_message_text(
+                new_text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            await query.answer(f"✅ 界面已切换为: {new_skin_name}", show_alert=True)
+        except Exception as e:
+            await query.edit_message_text(f"❌ 修改界面失败：{html.escape(str(e))}", parse_mode="HTML")
 
 
 # 6. 程序入口
