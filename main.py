@@ -302,7 +302,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 default_num = "6226220809397366"
 
                 if info_type == "bank":
-                    # 银行卡类型：填入银行卡信息
+                    # 银行卡类型：填入真实银行卡信息
                     bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
                     branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
                     card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
@@ -314,19 +314,25 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await card_no_input.is_visible():
                         await card_no_input.fill(info.get("bank_account", ""))
 
-                    # 点击移除“支付宝”与“数字人民币”栏位
-                    remove_btns = page.locator("a.remove_fields.dynamic, a:has-text('移除')")
-                    btn_count = await remove_btns.count()
-                    for _ in range(btn_count):
+                    # 移除“支付宝”与“数字人民币”区域，保留银行卡
+                    remove_target = page.locator(
+                        "div[class*='alipay_accounts'] a.remove_fields, "
+                        "div[class*='ecny_accounts'] a.remove_fields, "
+                        "#merchant_alipay_accounts_attributes_0_account_name ~ a, "
+                        "#merchant_ecny_accounts_attributes_0_account_name ~ a"
+                    )
+                    count = await remove_target.count()
+                    for i in range(count):
                         try:
-                            if await remove_btns.first.is_visible():
-                                await remove_btns.first.click()
+                            btn = remove_target.nth(i)
+                            if await btn.is_visible():
+                                await btn.click()
                                 await asyncio.sleep(0.3)
                         except Exception:
                             pass
 
                 else:
-                    # 支付宝 / 数字人民币类型：银行卡填默认占位号
+                    # 支付宝 / 数字人民币类型：银行卡填入默认占位号
                     bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name").first
                     branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name").first
                     card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no").first
@@ -335,21 +341,21 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
                     if await card_no_input.is_visible(): await card_no_input.fill(default_num)
 
-                    # 支付宝栏位处理
+                    # 支付宝栏位处理：非对应类型留空
                     alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
                     if await alipay_input.is_visible():
                         if info_type == "alipay":
                             await alipay_input.fill(info.get("alipay_account", ""))
                         else:
-                            await alipay_input.fill(default_num)
+                            await alipay_input.fill("")
 
-                    # 数字人民币栏位处理
+                    # 数字人民币栏位处理：非对应类型留空
                     ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name").first
                     if await ecny_input.is_visible():
                         if info_type == "digital_wallet":
                             await ecny_input.fill(info.get("digital_account", ""))
                         else:
-                            await ecny_input.fill(default_num)
+                            await ecny_input.fill("")
 
                 shop_template = page.locator("#merchant_store_skin_type").first
                 if await shop_template.is_visible():
@@ -386,7 +392,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                 final_account = current_account
                 break
 
-            # 3. 建店成功，通过搜寻读取店铺网址
+            # 3. 建店成功，检索并提取店铺网址
             await search_account(final_account)
             
             first_row = page.locator("tbody tr").first
@@ -403,7 +409,8 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             if not shop_url and td_count >= 4:
                 shop_url = (await td_elements.nth(3).inner_text()).strip()
 
-            # 4. 导入 60 个商品
+            # 4. 导入 60 个商品（必须在移除银行卡前执行）
+            await search_account(final_account)
             await page.locator("tbody tr").first.locator("a[href$='/items']").click(no_wait_after=True)
             await page.wait_for_load_state("domcontentloaded")
 
@@ -415,15 +422,16 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(1)
 
-            # 5. 非银行卡类型时，才在建店后编辑清理占位卡
+            # 5. 支付宝 / 数字人民币类型：商品导入完成后，编辑店铺移除占位银行卡
             if info_type != "bank":
                 await search_account(final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click(no_wait_after=True)
                 await page.wait_for_load_state("domcontentloaded")
 
-                remove_btn = page.locator("a.remove_fields.dynamic, a:has-text('移除')").first
-                if await remove_btn.is_visible():
-                    await remove_btn.click()
+                bank_remove_btn = page.locator("div[class*='bank_accounts'] a.remove_fields, #merchant_bank_accounts_attributes_0_account_no ~ a").first
+                if await bank_remove_btn.is_visible():
+                    await bank_remove_btn.click()
+                
                 await page.locator("input[name='commit'], input[value='送出']").click(no_wait_after=True)
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(1)
