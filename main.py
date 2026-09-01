@@ -429,9 +429,9 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             msg_text = (
                 "✅ <b>建店完成！</b>\n\n"
-                f"店铺网址:<code>{html.escape(shop_url)}</code>\n"
-                f"登入帳號:<code>{html.escape(final_account)}</code>\n"
-                "登入密码:<code>a12345</code>"
+                f"店铺网址: <code>{html.escape(shop_url)}</code>\n"
+                f"登入帳號: <code>{html.escape(final_account)}</code>\n"
+                "登入密码: <code>a12345</code>"
             )
             return msg_text, final_account
         except PlaywrightTimeoutError:
