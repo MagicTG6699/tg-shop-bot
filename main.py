@@ -38,7 +38,7 @@ else:
 ACTIVE_TASKS = {}
 
 
-# 1. 文本解析与格式校验（已增加银行支行必填校验）
+# 1. 文本解析与格式校验（含银行支行必填校验）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
@@ -185,7 +185,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if not info.get("bank_name"):
             errors.append("• 未找到【银行名称】！")
 
-        # 3. 支行强校验：缺少支行直接拒绝制作
+        # 3. 支行校验
         if not info.get("branch_name"):
             errors.append("• 缺少【银行支行】信息，无法协助制作，请补充支行后再试！")
 
@@ -196,7 +196,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
-# 2. Playwright 自动化处理
+# 2. Playwright 自动化处理（优化登录与建店表单定位）
 async def create_and_setup_shop(info: dict, task_id: str) -> str:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL，请配置后再试！")
@@ -239,9 +239,11 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             await pass_input.fill(ADMIN_PASS)
 
             submit_btn = page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first
-            await submit_btn.click(no_wait_after=True)
+            await submit_btn.click()
+            
+            # 等待确认登录完成
             await page.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
             # 智能搜索函数
             async def search_account(account_name: str):
@@ -266,24 +268,35 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
-                await page.locator("#merchant_username").wait_for(state="visible", timeout=15000)
 
-                await page.locator("#merchant_username").fill(current_account)
-                if await page.locator("#merchant_password").is_visible():
-                    await page.locator("#merchant_password").fill("a12345")
-                if await page.locator("#merchant_password_confirmation").is_visible():
-                    await page.locator("#merchant_password_confirmation").fill("a12345")
+                # 多选择器兼容：兼容 #merchant_username 及其他常见的账号输入框
+                username_input = page.locator("#merchant_username, input[name='merchant[username]'], input[id*='username']").first
+                await username_input.wait_for(state="visible", timeout=20000)
 
-                if await page.locator("#merchant_sprite_platform").is_visible():
+                await username_input.fill(current_account)
+                
+                pass_field = page.locator("#merchant_password, input[name='merchant[password]']").first
+                if await pass_field.is_visible():
+                    await pass_field.fill("a12345")
+                    
+                pass_confirm = page.locator("#merchant_password_confirmation, input[name='merchant[password_confirmation]']").first
+                if await pass_confirm.is_visible():
+                    await pass_confirm.fill("a12345")
+
+                sprite_platform = page.locator("#merchant_sprite_platform, select[name*='sprite_platform']").first
+                if await sprite_platform.is_visible():
                     try:
-                        await page.locator("#merchant_sprite_platform").select_option(label="jj")
+                        await sprite_platform.select_option(label="jj")
                     except Exception:
-                        await page.locator("#merchant_sprite_platform").select_option(value="jj")
+                        await sprite_platform.select_option(value="jj")
 
-                if await page.locator("#merchant_account_name").is_visible():
-                    await page.locator("#merchant_account_name").fill(info.get("name", ""))
-                if await page.locator("#merchant_phone").is_visible():
-                    await page.locator("#merchant_phone").fill(info.get("phone", ""))
+                acc_name_field = page.locator("#merchant_account_name, input[name*='account_name']").first
+                if await acc_name_field.is_visible():
+                    await acc_name_field.fill(info.get("name", ""))
+
+                phone_field = page.locator("#merchant_phone, input[name*='phone']").first
+                if await phone_field.is_visible():
+                    await phone_field.fill(info.get("phone", ""))
 
                 info_type = info.get("type", "alipay")
                 default_num = "6226220809397366"
@@ -305,7 +318,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await branch_name_input.is_visible(): await branch_name_input.fill(default_num)
                     if await card_no_input.is_visible(): await card_no_input.fill(default_num)
 
-                alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name")
+                alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name, input[id$='_alipay_accounts_attributes_0_account_name']").first
                 if info_type == "alipay":
                     if await alipay_input.is_visible():
                         await alipay_input.fill(info.get("alipay_account", ""))
@@ -313,7 +326,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await alipay_input.is_visible():
                         await alipay_input.fill("")
 
-                ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name")
+                ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name, input[id$='_ecny_accounts_attributes_0_account_name']").first
                 if info_type == "digital_wallet":
                     if await ecny_input.is_visible():
                         await ecny_input.fill(info.get("digital_account", ""))
@@ -321,7 +334,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                     if await ecny_input.is_visible():
                         await ecny_input.fill("")
 
-                shop_template = page.locator("#merchant_store_skin_type")
+                shop_template = page.locator("#merchant_store_skin_type, select[name*='store_skin_type']").first
                 if await shop_template.is_visible():
                     try:
                         await shop_template.select_option(label="极速微商")
@@ -331,7 +344,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> str:
                         except Exception:
                             await shop_template.select_option(index=1)
 
-                commit_btn = page.locator("input[name='commit'][value='送出']").first
+                commit_btn = page.locator("input[name='commit'][value='送出'], input[type='submit']").first
                 await commit_btn.click(no_wait_after=True)
 
                 try:
