@@ -40,11 +40,11 @@ SKIN_OPTIONS = {
 }
 
 
-# 2. 文本解析与格式校验（精准区分平台账号与多变体账号）
+# 2. 文本解析与格式校验（包含支付宝户名、支付宝名与智能路由）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
-    # 数字人民币特征词
+    # 特征词定义
     digital_keywords = [
         "数字R人民币", "數字R人民幣", "数字R", "數字R",
         "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
@@ -53,9 +53,12 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         "钱包", "錢包", "ecny"
     ]
     bank_keywords = ["银行", "銀行", "开户行", "開戶行", "支行"]
+    alipay_keywords = ["支付宝", "支付寶", "支付宝户名", "支付寶戶名", "支付宝名", "支付寶名"]
 
-    # 优先判定整单类型
-    if any(k in text for k in digital_keywords):
+    # 优先判定整单类型：如果包含支付宝关键词，强锁定为 alipay
+    if any(k in text for k in alipay_keywords):
+        info["type"] = "alipay"
+    elif any(k in text for k in digital_keywords):
         info["type"] = "digital_wallet"
     elif any(k in text for k in bank_keywords):
         info["type"] = "bank"
@@ -120,8 +123,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if "account" not in info and key in ["账号", "帳號", "帐号", "会员号", "會員號"]:
             info["account"] = val.lower()
 
-        # 姓名提取
-        elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名"]) or key in [
+        # 姓名提取（包含支付宝户名/支付宝名）
+        elif any(k in key for k in [
+            "户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名",
+            "支付宝户名", "支付寶戶名", "支付宝名", "支付寶名"
+        ]) or key in [
             "名", "数字名", "數字名", "数位名", "數位名",
             "数字人民币户名", "數字人民幣戶名", "數位人民幣戶名", "数位人民币户名"
         ]:
@@ -135,11 +141,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val.replace("预设", "")
 
-        # 支付宝账号提取
-        elif key in ["支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支"]:
+        # 支付宝账号提取（当类型为 alipay 且平台账号已决定时，包含通用“卡号/账号”）
+        elif key in [
+            "支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支",
+            "支付宝卡号", "支付寶卡號"
+        ] or (info.get("type") == "alipay" and info.get("account") and key in ["卡号", "卡號", "账号", "帳號"]):
             raw_accounts["alipay"] = val
 
-        # 数字人民币账号提取（在平台账号已决定的情况下，自动捕获通用“账号/卡号”）
+        # 数字人民币账号提取
         elif key in [
             "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
             "数字人民币账号", "數字人民幣帳號", "數位人民幣帳號", "数位人民币账号",
@@ -147,11 +156,8 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             "数字卡号", "數字卡號", "数位卡号", "數位卡號",
             "数字R人民币", "數字R人民幣", "数字R", "數字R",
             "数币", "數幣", "数字", "數字", "数位", "數位", "钱包", "錢包"
-        ] or (info.get("account") and key in ["账号", "帳號", "卡号", "卡號"]):
-            if info.get("type") == "digital_wallet":
-                raw_accounts["digital"] = val
-            elif info.get("type") == "bank":
-                raw_accounts["bank"] = val
+        ] or (info.get("type") == "digital_wallet" and info.get("account") and key in ["账号", "帳號", "卡号", "卡號"]):
+            raw_accounts["digital"] = val
 
         # 支行名称
         elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
@@ -168,10 +174,12 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                     info["bank_name"] = val
 
         # 银行卡号提取
-        elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號", "银", "銀"]:
+        elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "银", "銀"] or (
+            info.get("type") == "bank" and info.get("account") and key in ["卡号", "卡號", "账号", "帳號"]
+        ):
             raw_accounts["bank"] = val
 
-    # 智能纠错与兜底：如果为数字人民币且缺失账号，转移通用“卡号/账号”
+    # 智能纠错与兜底
     if info.get("type") == "digital_wallet" and not raw_accounts.get("digital") and raw_accounts.get("bank"):
         raw_accounts["digital"] = raw_accounts.pop("bank")
 
