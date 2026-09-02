@@ -40,9 +40,10 @@ SKIN_OPTIONS = {
 }
 
 
-# 2. 文本解析与格式校验（包含支付宝户名、支付宝名与智能路由）
+# 2. 文本解析与格式校验（包含空值/空格检测与支付宝优化）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
+    errors = []
 
     # 特征词定义
     digital_keywords = [
@@ -55,7 +56,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     bank_keywords = ["银行", "銀行", "开户行", "開戶行", "支行"]
     alipay_keywords = ["支付宝", "支付寶", "支付宝户名", "支付寶戶名", "支付宝名", "支付寶名"]
 
-    # 优先判定整单类型：如果包含支付宝关键词，强锁定为 alipay
+    # 优先判定整单类型
     if any(k in text for k in alipay_keywords):
         info["type"] = "alipay"
     elif any(k in text for k in digital_keywords):
@@ -71,8 +72,8 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     raw_accounts = {}
     raw_phone = None
+    empty_fields = []  # 记录所有冒号后为空或只有空格的字段
 
-    # 干扰词过滤
     base_ignore_keys = ["余额", "餘額", "状态", "狀態", "备注", "備註", "限制", "风控", "風控", "交易日"]
 
     lines = clean_text.splitlines()
@@ -94,10 +95,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             or key in ["平台账号", "平台帳號", "平台会员账号", "平台會員帳號", "会员账号", "會員帳號"]
         ):
             if not any(k in key for k in ["支付宝", "支付寶", "银行", "銀行", "数字", "數字", "数位", "數位", "钱包", "錢包"]):
-                info["account"] = val.lower()
-                break
+                if val:
+                    info["account"] = val.lower()
+                    break
 
-    # 第二阶段：遍历提取各具体字段
+    # 第二阶段：遍历提取各具体字段并捕获空值
     for line in lines:
         line = line.strip()
         if not line:
@@ -116,7 +118,13 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"”]+$', '', val)
 
-        if not val or any(ik in key for ik in base_ignore_keys):
+        if any(ik in key for ik in base_ignore_keys):
+            continue
+
+        # 如果冒号后面为空/只有空格，记录缺失的字段名
+        if not val:
+            if not any(ik in key for ik in ["商城", "模板", "界面"]):
+                empty_fields.append(parts[0].strip())
             continue
 
         # 如果第一阶段未提取到 platform 账号，此处提取通用“账号”
@@ -141,7 +149,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val.replace("预设", "")
 
-        # 支付宝账号提取（当类型为 alipay 且平台账号已决定时，包含通用“卡号/账号”）
+        # 支付宝账号提取
         elif key in [
             "支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支",
             "支付宝卡号", "支付寶卡號"
@@ -179,11 +187,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         ):
             raw_accounts["bank"] = val
 
+    # 优先处理空值报错
+    if empty_fields:
+        for ef in empty_fields:
+            errors.append(f"• 【<b>{html.escape(ef)}</b>】内容为空，请检查是否有漏填或只有空格！")
+
     # 智能纠错与兜底
     if info.get("type") == "digital_wallet" and not raw_accounts.get("digital") and raw_accounts.get("bank"):
         raw_accounts["digital"] = raw_accounts.pop("bank")
-
-    errors = []
 
     if not info.get("account"):
         errors.append("• 未提取到【平台会员账号】！")
@@ -202,9 +213,9 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     if info_type == "digital_wallet":
         raw_val = raw_accounts.get("digital")
-        if not raw_val:
+        if not raw_val and "卡号" not in empty_fields and "账号" not in empty_fields:
             errors.append("• 未找到【数字人民币账号】！")
-        else:
+        elif raw_val:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
                 errors.append(f"• 数字人民币账号错误: <code>{html.escape(raw_val)}</code>（只允许数字）")
             else:
@@ -233,16 +244,16 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                     else:
                         info["alipay_account"] = digits
         else:
-            if not info.get("phone") and not errors:
+            if not info.get("phone") and not errors and "卡号" not in empty_fields:
                 errors.append("• 缺失支付宝账号及手机号！")
             elif info.get("phone"):
                 info["alipay_account"] = info.get("phone")
 
     elif info_type == "bank":
         raw_val = raw_accounts.get("bank")
-        if not raw_val:
+        if not raw_val and "卡号" not in empty_fields and "账号" not in empty_fields:
             errors.append("• 未找到【银行卡号/账号】！")
-        else:
+        elif raw_val:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
                 errors.append(f"• 银行卡号错误: <code>{html.escape(raw_val)}</code>（只允许数字）")
             else:
@@ -252,9 +263,9 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_account"] = digits
 
-        if not info.get("bank_name"):
+        if not info.get("bank_name") and "银行" not in empty_fields:
             errors.append("• 缺少【银行名称】！")
-        if not info.get("branch_name"):
+        if not info.get("branch_name") and "支行" not in empty_fields:
             errors.append("• 缺少【支行名称】！")
 
     if errors:
