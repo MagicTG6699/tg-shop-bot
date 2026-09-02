@@ -40,11 +40,11 @@ SKIN_OPTIONS = {
 }
 
 
-# 2. 文本解析与格式校验（全面支持繁简双体 + 智能纠错逻辑）
+# 2. 文本解析与格式校验（精准区分平台账号与多变体账号）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
-    # 1. 扩充数字人民币识别词（涵盖繁简各种变体：數/位/幣/錢包/R 等组合）
+    # 数字人民币特征词
     digital_keywords = [
         "数字R人民币", "數字R人民幣", "数字R", "數字R",
         "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
@@ -69,18 +69,39 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     raw_accounts = {}
     raw_phone = None
 
-    # 基础干扰词列表
+    # 干扰词过滤
     base_ignore_keys = ["余额", "餘額", "状态", "狀態", "备注", "備註", "限制", "风控", "風控", "交易日"]
 
-    for line in clean_text.splitlines():
+    lines = clean_text.splitlines()
+
+    # 第一阶段：优先提取明确带“平台”/“会员”标识的平台账号
+    for line in lines:
+        line = line.strip()
+        if not line or any(ik in line for ik in base_ignore_keys):
+            continue
+        parts = re.split(r'[:：]', line, maxsplit=1)
+        if len(parts) < 2:
+            continue
+        key = re.sub(r'\s+', '', parts[0])
+        val = parts[1].strip()
+        val = re.sub(r'^[<\("‘“]+|[>\)"”]+$', '', val)
+
+        if "登入" not in key and (
+            any(k in key for k in ["平台", "会员", "會員"])
+            or key in ["平台账号", "平台帳號", "平台会员账号", "平台會員帳號", "会员账号", "會員帳號"]
+        ):
+            if not any(k in key for k in ["支付宝", "支付寶", "银行", "銀行", "数字", "數字", "数位", "數位", "钱包", "錢包"]):
+                info["account"] = val.lower()
+                break
+
+    # 第二阶段：遍历提取各具体字段
+    for line in lines:
         line = line.strip()
         if not line:
             continue
 
-        # 规则1：如果包含基础干扰词，或者同时包含“订单/訂單”与“最后/最後”，则跳过该行
         has_base_ignore = any(ik in line for ik in base_ignore_keys)
         has_order_and_last = ("订单" in line or "訂單" in line) and ("最后" in line or "最後" in line)
-
         if has_base_ignore or has_order_and_last:
             continue
 
@@ -92,19 +113,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         val = parts[1].strip()
         val = re.sub(r'^[<\("‘“]+|[>\)"”]+$', '', val)
 
-        # 规则2：字段名包含基础干扰词或值为空也跳过
         if not val or any(ik in key for ik in base_ignore_keys):
             continue
 
-        # 平台账号提取
-        if "登入" not in key and (
-            any(k in key for k in ["盖平台", "平台", "会员", "會員"])
-            or key in ["账号", "帳號", "帐号", "会员号", "會員號", "平台账号", "平台帳號", "平台会员账号", "平台會員帳號"]
-        ):
-            if not any(k in key for k in ["支付宝", "支付寶", "银行", "銀行", "数字", "數字", "数位", "數位", "钱包", "錢包"]):
-                info["account"] = val.lower()
+        # 如果第一阶段未提取到 platform 账号，此处提取通用“账号”
+        if "account" not in info and key in ["账号", "帳號", "帐号", "会员号", "會員號"]:
+            info["account"] = val.lower()
 
-        # 姓名提取（扩充数字名、數位名等变体）
+        # 姓名提取
         elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名"]) or key in [
             "名", "数字名", "數字名", "数位名", "數位名",
             "数字人民币户名", "數字人民幣戶名", "數位人民幣戶名", "数位人民币户名"
@@ -119,11 +135,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val.replace("预设", "")
 
-        # 精准定位支付宝账号
+        # 支付宝账号提取
         elif key in ["支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支"]:
             raw_accounts["alipay"] = val
 
-        # 精准定位数字人民币账号（支持：数字/數字/数位/數位/账号/帳號/卡号 等组合）
+        # 数字人民币账号提取（在平台账号已决定的情况下，自动捕获通用“账号/卡号”）
         elif key in [
             "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
             "数字人民币账号", "數字人民幣帳號", "數位人民幣帳號", "数位人民币账号",
@@ -131,8 +147,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             "数字卡号", "數字卡號", "数位卡号", "數位卡號",
             "数字R人民币", "數字R人民幣", "数字R", "數字R",
             "数币", "數幣", "数字", "數字", "数位", "數位", "钱包", "錢包"
-        ]:
-            raw_accounts["digital"] = val
+        ] or (info.get("account") and key in ["账号", "帳號", "卡号", "卡號"]):
+            if info.get("type") == "digital_wallet":
+                raw_accounts["digital"] = val
+            elif info.get("type") == "bank":
+                raw_accounts["bank"] = val
 
         # 支行名称
         elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
@@ -148,19 +167,13 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_name"] = val
 
-        # 精准定位银行卡号/通用卡号
+        # 银行卡号提取
         elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號", "银", "銀"]:
             raw_accounts["bank"] = val
 
-    # ================= 智能容错与上下文重绑定 =================
-    # 如果整单判定为数字人民币，但未匹配到 digital 账号，却拿到了通用 key（如"卡号"）落入 bank
+    # 智能纠错与兜底：如果为数字人民币且缺失账号，转移通用“卡号/账号”
     if info.get("type") == "digital_wallet" and not raw_accounts.get("digital") and raw_accounts.get("bank"):
         raw_accounts["digital"] = raw_accounts.pop("bank")
-
-    # 如果整单判定为银行卡，但只写了“数字”或误落入 digital
-    elif info.get("type") == "bank" and not raw_accounts.get("bank") and raw_accounts.get("digital"):
-        raw_accounts["bank"] = raw_accounts.pop("digital")
-    # ==========================================================
 
     errors = []
 
@@ -243,7 +256,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
-# 3. Playwright 自动化建店与修改界面
+# 3. Playwright 自动化建店逻辑
 async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
@@ -472,7 +485,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             await browser.close()
 
 
-# 修改商城界面的专用函数
+# 修改商城界面函数
 async def update_shop_skin(account_name: str, new_skin: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -528,7 +541,7 @@ def build_main_keyboard(account: str, current_skin: str = "极速微商") -> Inl
     return InlineKeyboardMarkup(buttons)
 
 
-# 展开状态按钮：2x2 四宫格 + 收起
+# 展开状态按钮
 def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
@@ -547,7 +560,7 @@ def build_skin_options_keyboard(account: str, current_skin: str = "极速微商"
     return InlineKeyboardMarkup(buttons)
 
 
-# 4. Telegram 消息接收处理
+# 4. Telegram 消息处理
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
@@ -564,7 +577,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     trigger_keywords = [
-        "账号", "帳號", "帐号", "盖平台", "平台", "平台账号", "平台帳號",
+        "账号", "帳號", "帐号", "平台", "平台账号", "平台帳號",
         "数字人民币", "數字人民幣", "數位人民幣", "数位人民币", "数字", "數字", "数位", "數位", "支付宝", "支付寶", "银行", "銀行"
     ]
     if not any(k in user_text for k in trigger_keywords):
@@ -596,7 +609,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 
-# 后台 Task 包装
+# Worker 包装
 async def run_shop_worker(status_msg, parsed_info, task_id: str):
     try:
         initial_skin = parsed_info.get("skin", "极速微商").replace("预设", "")
@@ -674,13 +687,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"❌ 修改界面失败: {str(e)}", show_alert=True)
 
 
-# 6. 程序入口
+# 6. 入口
 def main():
     if not BOT_TOKEN:
-        print("❌ 未检测到 BOT_TOKEN 环境变量，请在环境变量中设置 BOT_TOKEN 后重试！")
+        print("❌ 未检测到 BOT_TOKEN 环境变量！")
         sys.exit(1)
 
-    print("🤖 正在启动 Telegram 建店机器人服务...")
+    print("🤖 Telegram 机器人服务运行中...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     msg_filter = filters.TEXT & (~filters.COMMAND)
 
