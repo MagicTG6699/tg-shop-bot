@@ -31,6 +31,9 @@ BASE_ADMIN_URL = match.group(0).rstrip('/') if match else raw_admin_url.rstrip('
 # 全局任务字典
 ACTIVE_TASKS = {}
 
+# 【建店专用排队锁】：同时只允许 1 个建店任务在后台运行，后续建店请求自动排队
+BUILD_SHOP_SEMAPHORE = asyncio.Semaphore(1)
+
 # 商城界面选项（与后台对应）
 SKIN_OPTIONS = {
     "jisumeishang": "极速微商",
@@ -72,13 +75,13 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     raw_accounts = {}
     raw_phone = None
-    empty_fields = []  # 记录所有冒号后为空或只有空格的字段
+    empty_fields = []
 
     base_ignore_keys = ["余额", "餘額", "状态", "狀態", "备注", "備註", "限制", "风控", "風控", "交易日"]
 
     lines = clean_text.splitlines()
 
-    # 第一阶段：优先提取明确带“平台”/“会员”标识的平台账号
+    # 第一阶段：优先提取平台账号
     for line in lines:
         line = line.strip()
         if not line or any(ik in line for ik in base_ignore_keys):
@@ -99,7 +102,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                     info["account"] = val.lower()
                     break
 
-    # 第二阶段：遍历提取各具体字段并捕获空值
+    # 第二阶段：提取各具体字段并捕获空值
     for line in lines:
         line = line.strip()
         if not line:
@@ -121,17 +124,14 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if any(ik in key for ik in base_ignore_keys):
             continue
 
-        # 如果冒号后面为空/只有空格，记录缺失的字段名
         if not val:
             if not any(ik in key for ik in ["商城", "模板", "界面"]):
                 empty_fields.append(parts[0].strip())
             continue
 
-        # 如果第一阶段未提取到 platform 账号，此处提取通用“账号”
         if "account" not in info and key in ["账号", "帳號", "帐号", "会员号", "會員號"]:
             info["account"] = val.lower()
 
-        # 姓名提取（包含支付宝户名/支付宝名）
         elif any(k in key for k in [
             "户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名",
             "支付宝户名", "支付寶戶名", "支付宝名", "支付寶名"
@@ -141,22 +141,18 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         ]:
             info["name"] = val
 
-        # 手机号提取
         elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
             raw_phone = val
 
-        # 商城界面提取
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val.replace("预设", "")
 
-        # 支付宝账号提取
         elif key in [
             "支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支",
             "支付宝卡号", "支付寶卡號"
         ] or (info.get("type") == "alipay" and info.get("account") and key in ["卡号", "卡號", "账号", "帳號"]):
             raw_accounts["alipay"] = val
 
-        # 数字人民币账号提取
         elif key in [
             "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
             "数字人民币账号", "數字人民幣帳號", "數位人民幣帳號", "数位人民币账号",
@@ -167,11 +163,9 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         ] or (info.get("type") == "digital_wallet" and info.get("account") and key in ["账号", "帳號", "卡号", "卡號"]):
             raw_accounts["digital"] = val
 
-        # 支行名称
         elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
             info["branch_name"] = val
 
-        # 银行名称
         elif any(k in key for k in ["银行名称", "銀行名稱", "开户行", "開戶行", "行名"]) or key in ["银行", "銀行"]:
             if "支行" not in key:
                 if "-" in val or " " in val:
@@ -181,18 +175,15 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_name"] = val
 
-        # 银行卡号提取
         elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "银", "銀"] or (
             info.get("type") == "bank" and info.get("account") and key in ["卡号", "卡號", "账号", "帳號"]
         ):
             raw_accounts["bank"] = val
 
-    # 优先处理空值报错
     if empty_fields:
         for ef in empty_fields:
             errors.append(f"• 【<b>{html.escape(ef)}</b>】内容为空，请检查是否有漏填或只有空格！")
 
-    # 智能纠错与兜底
     if info.get("type") == "digital_wallet" and not raw_accounts.get("digital") and raw_accounts.get("bank"):
         raw_accounts["digital"] = raw_accounts.pop("bank")
 
@@ -229,6 +220,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         raw_val = raw_accounts.get("alipay")
         if raw_val:
             if "@" in raw_val:
+                # 提取标准邮箱，自动屏蔽 @qq.com 后多余的数字/字符
                 email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', raw_val)
                 if email_match:
                     info["alipay_account"] = email_match.group(0)
@@ -436,7 +428,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("导入商品", step_items())
 
-            # 5. 移除默认填充的银行卡占位符（非银行卡建店时）
+            # 5. 移除默认填充的银行卡占位符
             if info_type != "bank":
                 async def step_remove_placeholder():
                     await search_account(final_account)
@@ -507,7 +499,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 pass
 
 
-# 修改商城界面函数
+# 修改商城界面函数（不加排队锁，直接独立并发运行）
 async def update_shop_skin(account_name: str, new_skin: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -557,7 +549,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 pass
 
 
-# 默认收起状态按钮（优化 key 避免空格及长度超限，使用冒号分割）
+# 默认主按钮键盘（使用冒号切分，长度受控）
 def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
@@ -566,7 +558,7 @@ def build_main_keyboard(account: str, current_skin: str = "极速微商") -> Inl
     return InlineKeyboardMarkup(buttons)
 
 
-# 展开状态按钮
+# 展开风格选项键盘
 def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
@@ -634,13 +626,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 
-# Worker 包装
+# 建店 Worker 包装（带建店排队锁逻辑）
 async def run_shop_worker(status_msg, parsed_info, task_id: str):
     try:
-        initial_skin = parsed_info.get("skin", "极速微商").replace("预设", "")
-        result_text, final_account = await create_and_setup_shop(parsed_info, task_id)
-        keyboard = build_main_keyboard(final_account, initial_skin)
-        await status_msg.edit_text(result_text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
+        # 如果当前有建店任务占用了排队锁，向用户提示正在排队
+        if BUILD_SHOP_SEMAPHORE.locked():
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
+            ])
+            await status_msg.edit_text(
+                "⏳ <b>前方有建店任务正在处理中，已为您自动加入排队队列，请稍候...</b>",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+
+        # 获取建店锁（等待上一个建店完成）
+        async with BUILD_SHOP_SEMAPHORE:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
+            ])
+            await status_msg.edit_text(
+                "⏳ <b>已轮到当前任务，正在自动建店中，请稍候...</b>",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+
+            initial_skin = parsed_info.get("skin", "极速微商").replace("预设", "")
+            result_text, final_account = await create_and_setup_shop(parsed_info, task_id)
+            keyboard = build_main_keyboard(final_account, initial_skin)
+            await status_msg.edit_text(result_text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
+
     except asyncio.CancelledError:
         await status_msg.edit_text("🛑 <b>已取消建店！</b>", parse_mode="HTML")
     except Exception as e:
@@ -650,11 +665,15 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str):
         ACTIVE_TASKS.pop(task_id, None)
 
 
-# 5. 回调事件处理
+# 5. 回调事件处理（点击按钮）
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     click_user_id = query.from_user.id
+
+    if data == "ignore":
+        await query.answer("⏳ 正在修改界面中，请勿重复点击...", show_alert=False)
+        return
 
     if data.startswith("cancel:"):
         task_id = data.split(":", 1)[1]
@@ -683,36 +702,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
 
     elif data.startswith("op:"):
-        # open: account, current_skin
         _, account, current_skin = data.split(":", 2)
         keyboard = build_skin_options_keyboard(account, current_skin)
         await query.edit_message_reply_markup(reply_markup=keyboard)
         await query.answer()
 
     elif data.startswith("cl:"):
-        # close: account, current_skin
         _, account, current_skin = data.split(":", 2)
         keyboard = build_main_keyboard(account, current_skin)
         await query.edit_message_reply_markup(reply_markup=keyboard)
         await query.answer()
 
     elif data.startswith("sk:"):
-        # set skin: skin_key, account
         _, skin_key, account = data.split(":", 2)
         new_skin_name = SKIN_OPTIONS.get(skin_key, "极速微商")
 
-        await query.answer(f"⏳ 正在修改界面为【{new_skin_name}】，请稍候...", show_alert=False)
+        await query.answer(f"⏳ 正在切换界面为【{new_skin_name}】...", show_alert=False)
 
+        # 1. 立即将按钮修改为临时遮罩，防止并发狂点
+        loading_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⏳ 正在切换为【{new_skin_name}】...", callback_data="ignore")]
+        ])
+        await query.edit_message_reply_markup(reply_markup=loading_keyboard)
+
+        # 2. 直接发起后台无头浏览器修改（不加入排队锁，快速响应）
         try:
             await update_shop_skin(account, new_skin_name)
             keyboard = build_main_keyboard(account, new_skin_name)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             await query.answer(f"✅ 界面已成功更改为: {new_skin_name}", show_alert=True)
         except Exception as e:
+            # 修改失败时恢复原键盘样式
+            keyboard = build_skin_options_keyboard(account)
+            await query.edit_message_reply_markup(reply_markup=keyboard)
             await query.answer(f"❌ 修改界面失败: {str(e)}", show_alert=True)
 
 
-# 6. 入口
+# 6. 主程序入口
 def main():
     if not BOT_TOKEN:
         print("❌ 未检测到 BOT_TOKEN 环境变量！")
