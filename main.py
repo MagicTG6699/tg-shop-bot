@@ -43,7 +43,7 @@ SKIN_OPTIONS = {
 }
 
 
-# 2. 文本解析与格式校验（包含空值/空格检测与支付宝优化）
+# 2. 文本解析与格式校验（全面优化简繁体兼容与格式判断）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
     errors = []
@@ -102,7 +102,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                     info["account"] = val.lower()
                     break
 
-    # 第二阶段：提取各具体字段并捕获空值
+    # 第二阶段：提取各具体字段（增强简繁体兼容）
     for line in lines:
         line = line.strip()
         if not line:
@@ -129,43 +129,47 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 empty_fields.append(parts[0].strip())
             continue
 
-        if "account" not in info and key in ["账号", "帳號", "帐号", "会员号", "會員號"]:
-            info["account"] = val.lower()
-
-        elif any(k in key for k in [
+        # 匹配户名
+        if any(k in key for k in [
             "户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名",
             "支付宝户名", "支付寶戶名", "支付宝名", "支付寶名"
         ]) or key in [
             "名", "数字名", "數字名", "数位名", "數位名",
+            "数字户名", "數字戶名", "数位户名", "數位戶名",
             "数字人民币户名", "數字人民幣戶名", "數位人民幣戶名", "数位人民币户名"
         ]:
             info["name"] = val
 
+        # 匹配手机号
         elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
             raw_phone = val
 
+        # 匹配商城界面
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val.replace("预设", "")
 
+        # 1. 优先精准匹配数字人民币账号（支持：账号/帳號/帐号/卡号/卡號/钱包/錢包等各种组合）
+        elif any(k in key for k in [
+            "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
+            "数字账号", "數字帳號", "数字帐号", "數字账号", "数位账号", "數位帳號",
+            "数字卡号", "數字卡號", "数位卡号", "數位卡號",
+            "数字R人民币", "數字R人民幣", "数字R", "數字R",
+            "数币", "數幣", "钱包", "錢包"
+        ]) or (info.get("type") == "digital_wallet" and any(k in key for k in ["账号", "帳號", "帐号", "卡号", "卡號"])):
+            raw_accounts["digital"] = val
+
+        # 2. 匹配支付宝账号
         elif key in [
             "支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支",
             "支付宝卡号", "支付寶卡號"
-        ] or (info.get("type") == "alipay" and info.get("account") and key in ["卡号", "卡號", "账号", "帳號"]):
+        ] or (info.get("type") == "alipay" and any(k in key for k in ["账号", "帳號", "帐号", "卡号", "卡號"])):
             raw_accounts["alipay"] = val
 
-        elif key in [
-            "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
-            "数字人民币账号", "數字人民幣帳號", "數位人民幣帳號", "数位人民币账号",
-            "数字账号", "數字帳號", "数位账号", "數位帳號",
-            "数字卡号", "數字卡號", "数位卡号", "數位卡號",
-            "数字R人民币", "數字R人民幣", "数字R", "數字R",
-            "数币", "數幣", "数字", "數字", "数位", "數位", "钱包", "錢包"
-        ] or (info.get("type") == "digital_wallet" and info.get("account") and key in ["账号", "帳號", "卡号", "卡號"]):
-            raw_accounts["digital"] = val
-
+        # 匹配支行
         elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
             info["branch_name"] = val
 
+        # 匹配银行名称
         elif any(k in key for k in ["银行名称", "銀行名稱", "开户行", "開戶行", "行名"]) or key in ["银行", "銀行"]:
             if "支行" not in key:
                 if "-" in val or " " in val:
@@ -175,10 +179,15 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_name"] = val
 
+        # 3. 匹配银行卡号
         elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "银", "銀"] or (
-            info.get("type") == "bank" and info.get("account") and key in ["卡号", "卡號", "账号", "帳號"]
+            info.get("type") == "bank" and any(k in key for k in ["账号", "帳號", "帐号", "卡号", "卡號"])
         ):
             raw_accounts["bank"] = val
+
+        # 4. 保底提取平台主账号
+        elif "account" not in info and key in ["账号", "帳號", "帐号", "会员号", "會員號"]:
+            info["account"] = val.lower()
 
     if empty_fields:
         for ef in empty_fields:
@@ -204,7 +213,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     if info_type == "digital_wallet":
         raw_val = raw_accounts.get("digital")
-        if not raw_val and "卡号" not in empty_fields and "账号" not in empty_fields:
+        if not raw_val and "卡号" not in empty_fields and "账号" not in empty_fields and "帳號" not in empty_fields:
             errors.append("• 未找到【数字人民币账号】！")
         elif raw_val:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
@@ -220,7 +229,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         raw_val = raw_accounts.get("alipay")
         if raw_val:
             if "@" in raw_val:
-                # 提取标准邮箱，自动屏蔽 @qq.com 后多余的数字/字符
                 email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', raw_val)
                 if email_match:
                     info["alipay_account"] = email_match.group(0)
@@ -243,7 +251,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     elif info_type == "bank":
         raw_val = raw_accounts.get("bank")
-        if not raw_val and "卡号" not in empty_fields and "账号" not in empty_fields:
+        if not raw_val and "卡号" not in empty_fields and "账号" not in empty_fields and "帳號" not in empty_fields:
             errors.append("• 未找到【银行卡号/账号】！")
         elif raw_val:
             if re.search(r'[\u4e00-\u9fa5a-zA-Z]', raw_val):
@@ -255,7 +263,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_account"] = digits
 
-        if not info.get("bank_name") and "银行" not in empty_fields:
+        if not info.get("bank_name") and "银行" not in empty_fields and "銀行" not in empty_fields:
             errors.append("• 缺少【银行名称】！")
         if not info.get("branch_name") and "支行" not in empty_fields:
             errors.append("• 缺少【支行名称】！")
@@ -499,7 +507,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 pass
 
 
-# 修改商城界面函数（不加排队锁，直接独立并发运行）
+# 修改商城界面函数（无排队锁，可并发独立运行）
 async def update_shop_skin(account_name: str, new_skin: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -549,7 +557,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 pass
 
 
-# 默认主按钮键盘（使用冒号切分，长度受控）
+# 默认主按钮键盘
 def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
@@ -626,10 +634,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 
-# 建店 Worker 包装（带建店排队锁逻辑）
+# 建店 Worker 包装（含排队锁控制）
 async def run_shop_worker(status_msg, parsed_info, task_id: str):
     try:
-        # 如果当前有建店任务占用了排队锁，向用户提示正在排队
         if BUILD_SHOP_SEMAPHORE.locked():
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
@@ -640,7 +647,6 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str):
                 parse_mode="HTML"
             )
 
-        # 获取建店锁（等待上一个建店完成）
         async with BUILD_SHOP_SEMAPHORE:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
@@ -665,7 +671,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str):
         ACTIVE_TASKS.pop(task_id, None)
 
 
-# 5. 回调事件处理（点击按钮）
+# 5. 回调事件处理
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -719,20 +725,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.answer(f"⏳ 正在切换界面为【{new_skin_name}】...", show_alert=False)
 
-        # 1. 立即将按钮修改为临时遮罩，防止并发狂点
+        # 切换按钮为防重复点击状态
         loading_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"⏳ 正在切换为【{new_skin_name}】...", callback_data="ignore")]
         ])
         await query.edit_message_reply_markup(reply_markup=loading_keyboard)
 
-        # 2. 直接发起后台无头浏览器修改（不加入排队锁，快速响应）
         try:
             await update_shop_skin(account, new_skin_name)
             keyboard = build_main_keyboard(account, new_skin_name)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             await query.answer(f"✅ 界面已成功更改为: {new_skin_name}", show_alert=True)
         except Exception as e:
-            # 修改失败时恢复原键盘样式
             keyboard = build_skin_options_keyboard(account)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             await query.answer(f"❌ 修改界面失败: {str(e)}", show_alert=True)
