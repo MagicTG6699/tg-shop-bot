@@ -292,20 +292,20 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             headless=True,
             args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
         )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-        page.set_default_timeout(20000)
-
-        if task_id in ACTIVE_TASKS:
-            ACTIVE_TASKS[task_id]["page"] = page
-
-        async def click_and_wait_element(click_locator, wait_locator, timeout=20000):
-            await click_locator.click()
-            await wait_locator.wait_for(state="visible", timeout=timeout)
-
         try:
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            page.set_default_timeout(20000)
+
+            if task_id in ACTIVE_TASKS:
+                ACTIVE_TASKS[task_id]["page"] = page
+
+            async def click_and_wait_element(click_locator, wait_locator, timeout=20000):
+                await click_locator.click()
+                await wait_locator.wait_for(state="visible", timeout=timeout)
+
             # 1. 登录后台
             await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
             user_input = page.locator(
@@ -501,7 +501,10 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
         except PlaywrightTimeoutError:
             raise Exception("建店关键流程超时，后台响应较慢，请稍后前往后台核对。")
         finally:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 # 修改商城界面函数
@@ -511,11 +514,11 @@ async def update_shop_skin(account_name: str, new_skin: str):
             headless=True,
             args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
         )
-        context = await browser.new_context()
-        page = await context.new_page()
-        page.set_default_timeout(20000)
-
         try:
+            context = await browser.new_context()
+            page = await context.new_page()
+            page.set_default_timeout(20000)
+
             await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
             user_input = page.locator(
                 "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
@@ -548,14 +551,17 @@ async def update_shop_skin(account_name: str, new_skin: str):
             await page.locator("input[name='commit'][value='送出']").first.click()
             await page.wait_for_load_state("domcontentloaded")
         finally:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
-# 默认收起状态按钮
+# 默认收起状态按钮（优化 key 避免空格及长度超限，使用冒号分割）
 def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
-        [InlineKeyboardButton(f"✨ 更改商城界面（当前{current_skin}）", callback_data=f"open_skin_{account}_{current_skin}")]
+        [InlineKeyboardButton(f"✨ 更改商城界面（当前{current_skin}）", callback_data=f"op:{account}:{current_skin}")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -565,15 +571,15 @@ def build_skin_options_keyboard(account: str, current_skin: str = "极速微商"
     current_skin = current_skin.replace("预设", "")
     buttons = [
         [
-            InlineKeyboardButton("极速微商", callback_data=f"skin_jisumeishang_{account}"),
-            InlineKeyboardButton("七喵", callback_data=f"skin_qimiao_{account}")
+            InlineKeyboardButton("极速微商", callback_data=f"sk:jisumeishang:{account}"),
+            InlineKeyboardButton("七喵", callback_data=f"sk:qimiao:{account}")
         ],
         [
-            InlineKeyboardButton("柒月", callback_data=f"skin_qiyue_{account}"),
-            InlineKeyboardButton("音你而来", callback_data=f"skin_yinnierlai_{account}")
+            InlineKeyboardButton("柒月", callback_data=f"sk:qiyue:{account}"),
+            InlineKeyboardButton("音你而来", callback_data=f"sk:yinnierlai:{account}")
         ],
         [
-            InlineKeyboardButton("⬅️ 收起", callback_data=f"close_skin_{account}_{current_skin}")
+            InlineKeyboardButton("⬅️ 收起", callback_data=f"cl:{account}:{current_skin}")
         ]
     ]
     return InlineKeyboardMarkup(buttons)
@@ -610,7 +616,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     task_id = f"{update.message.chat_id}_{update.message.message_id}"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel_{task_id}")]
+        [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
     ])
 
     status_msg = await update.message.reply_text(
@@ -647,16 +653,14 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str):
 # 5. 回调事件处理
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-
     data = query.data
     click_user_id = query.from_user.id
 
-    if data.startswith("cancel_"):
-        task_id = data.replace("cancel_", "")
+    if data.startswith("cancel:"):
+        task_id = data.split(":", 1)[1]
 
         if task_id not in ACTIVE_TASKS:
-            await query.edit_message_text("⚠️ 该任务已结束或已被取消。")
+            await query.answer("⚠️ 该任务已结束或已被取消。", show_alert=True)
             return
 
         task_info = ACTIVE_TASKS[task_id]
@@ -676,26 +680,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task = task_info.get("task")
         if task and not task.done():
             task.cancel()
+        await query.answer()
 
-    elif data.startswith("open_skin_"):
-        parts = data.split("_")
-        account = parts[2]
-        current_skin = parts[3] if len(parts) > 3 else "极速微商"
+    elif data.startswith("op:"):
+        # open: account, current_skin
+        _, account, current_skin = data.split(":", 2)
         keyboard = build_skin_options_keyboard(account, current_skin)
         await query.edit_message_reply_markup(reply_markup=keyboard)
+        await query.answer()
 
-    elif data.startswith("close_skin_"):
-        parts = data.split("_")
-        account = parts[2]
-        current_skin = parts[3] if len(parts) > 3 else "极速微商"
+    elif data.startswith("cl:"):
+        # close: account, current_skin
+        _, account, current_skin = data.split(":", 2)
         keyboard = build_main_keyboard(account, current_skin)
         await query.edit_message_reply_markup(reply_markup=keyboard)
+        await query.answer()
 
-    elif data.startswith("skin_"):
-        _, skin_key, account = data.split("_", 2)
+    elif data.startswith("sk:"):
+        # set skin: skin_key, account
+        _, skin_key, account = data.split(":", 2)
         new_skin_name = SKIN_OPTIONS.get(skin_key, "极速微商")
 
-        await query.answer(f"⏳ 正在修改界面为【{new_skin_name}】...", show_alert=False)
+        await query.answer(f"⏳ 正在修改界面为【{new_skin_name}】，请稍候...", show_alert=False)
 
         try:
             await update_shop_skin(account, new_skin_name)
