@@ -40,20 +40,21 @@ SKIN_OPTIONS = {
 }
 
 
-# 2. 文本解析与格式校验（已全面支持繁简双体识别）
+# 2. 文本解析与格式校验（全面支持繁简双体 + 智能纠错逻辑）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
 
-    # 1. 扩充数字人民币识别词（涵盖繁体：數/位/幣/錢包 等各种组合）
+    # 1. 扩充数字人民币识别词（涵盖繁简各种变体：數/位/幣/錢包/R 等组合）
     digital_keywords = [
         "数字R人民币", "數字R人民幣", "数字R", "數字R",
         "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
+        "数字名", "數字名", "数位名", "數位名", "数字户名", "數字戶名",
         "数币", "數幣", "数字", "數字", "数位", "數位",
         "钱包", "錢包", "ecny"
     ]
-    bank_keywords = ["银行", "銀行", "卡号", "卡號", "银", "銀", "卡"]
+    bank_keywords = ["银行", "銀行", "开户行", "開戶行", "支行"]
 
-    # 优先判定类型
+    # 优先判定整单类型
     if any(k in text for k in digital_keywords):
         info["type"] = "digital_wallet"
     elif any(k in text for k in bank_keywords):
@@ -103,8 +104,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             if not any(k in key for k in ["支付宝", "支付寶", "银行", "銀行", "数字", "數字", "数位", "數位", "钱包", "錢包"]):
                 info["account"] = val.lower()
 
-        # 姓名提取
-        elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名"]) or key in ["名", "数字人民币户名", "數字人民幣戶名", "數位人民幣戶名", "数位人民币户名"]:
+        # 姓名提取（扩充数字名、數位名等变体）
+        elif any(k in key for k in ["户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名"]) or key in [
+            "名", "数字名", "數字名", "数位名", "數位名",
+            "数字人民币户名", "數字人民幣戶名", "數位人民幣戶名", "数位人民币户名"
+        ]:
             info["name"] = val
 
         # 手机号提取
@@ -116,13 +120,15 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
             info["skin"] = val.replace("预设", "")
 
         # 精准定位支付宝账号
-        elif key in ["支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支付寶帳號", "支"]:
+        elif key in ["支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支"]:
             raw_accounts["alipay"] = val
 
-        # 精准定位数字人民币账号（支持：数字/數字/数位/數位/人民幣/人民币 等各种组合）
+        # 精准定位数字人民币账号（支持：数字/數字/数位/數位/账号/帳號/卡号 等组合）
         elif key in [
             "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
-            "数字人民币账号", "數字人民幣帳號", "數位人民幣帳號", "數位人民幣账号", "数位人民币账号",
+            "数字人民币账号", "數字人民幣帳號", "數位人民幣帳號", "数位人民币账号",
+            "数字账号", "數字帳號", "数位账号", "數位帳號",
+            "数字卡号", "數字卡號", "数位卡号", "數位卡號",
             "数字R人民币", "數字R人民幣", "数字R", "數字R",
             "数币", "數幣", "数字", "數字", "数位", "數位", "钱包", "錢包"
         ]:
@@ -142,9 +148,19 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_name"] = val
 
-        # 精准定位银行卡号
+        # 精准定位银行卡号/通用卡号
         elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "卡号", "卡號", "银", "銀"]:
             raw_accounts["bank"] = val
+
+    # ================= 智能容错与上下文重绑定 =================
+    # 如果整单判定为数字人民币，但未匹配到 digital 账号，却拿到了通用 key（如"卡号"）落入 bank
+    if info.get("type") == "digital_wallet" and not raw_accounts.get("digital") and raw_accounts.get("bank"):
+        raw_accounts["digital"] = raw_accounts.pop("bank")
+
+    # 如果整单判定为银行卡，但只写了“数字”或误落入 digital
+    elif info.get("type") == "bank" and not raw_accounts.get("bank") and raw_accounts.get("digital"):
+        raw_accounts["bank"] = raw_accounts.pop("digital")
+    # ==========================================================
 
     errors = []
 
@@ -395,7 +411,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                     await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
                     await page.wait_for_load_state("domcontentloaded")
                     
-                    # 准确定位“銀行帳戶”卡片块内的移除按钮
                     bank_section = page.locator(".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)").first
                     remove_btn = bank_section.locator("a.remove_fields, a:has-text('移除')").first
                     
@@ -444,7 +459,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("输入提现订单", step_withdraw())
 
-            # 冒号前后各留一个半角空格
             msg_text = (
                 "✅ <b>建店完成！</b>\n\n"
                 f"店铺网址 : <code>{html.escape(shop_url)}</code>\n"
@@ -549,7 +563,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(k in user_text for k in ignore_keywords):
         return
 
-    trigger_keywords = ["账号", "帳號", "帐号", "盖平台", "平台", "平台账号", "平台帳號", "数字人民币", "數字人民幣", "數位人民幣", "数位人民币", "数字", "數字", "数位", "數位", "支付宝", "支付寶", "银行", "銀行"]
+    trigger_keywords = [
+        "账号", "帳號", "帐号", "盖平台", "平台", "平台账号", "平台帳號",
+        "数字人民币", "數字人民幣", "數位人民幣", "数位人民币", "数字", "數字", "数位", "數位", "支付宝", "支付寶", "银行", "銀行"
+    ]
     if not any(k in user_text for k in trigger_keywords):
         return
 
