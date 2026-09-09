@@ -616,15 +616,25 @@ async def _login_generic(page, url, username, password, use_totp=False):
     await page.goto(url, wait_until="domcontentloaded")
     page.set_default_timeout(20000)
 
-    user_input = page.locator(
-        "#admin_user_email, #user_email, input[type='email'], "
-        "input[name*='email'], input[name*='login'], input[name*='username'], "
-        "input[type='text']"
-    ).first
+    # 单笔商城使用 market_manager 登录表单；全部商城/JJ 保留通用定位
+    if "market_managers/sign_in" in url:
+        user_input = page.locator(
+            "input[name='market_manager[username]'], "
+            "input[placeholder='帐号'], "
+            "input[placeholder='账号'], "
+            "input[type='text']"
+        ).first
+    else:
+        user_input = page.locator(
+            "#admin_user_email, #user_email, input[type='email'], "
+            "input[name*='email'], input[name*='login'], input[name*='username'], "
+            "input[type='text']"
+        ).first
     await user_input.wait_for(state="visible", timeout=20000)
     await user_input.fill(username)
 
     password_input = page.locator(
+        "input[name='market_manager[password]'], "
         "#admin_user_password, #user_password, input[type='password']"
     ).first
     await password_input.fill(password)
