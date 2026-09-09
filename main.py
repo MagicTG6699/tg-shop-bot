@@ -1,4 +1,5 @@
 import os
+# 修正版：已根据实际后台 DOM 定位更新\nimport os
 import sys
 import asyncio
 import re
@@ -174,7 +175,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val.replace("预设", "")
 
-        # 1. 优先精准匹配数字人民币账号
+        # 1. 优先精准匹配数字人民币账号（支持：账号/帳號/帐号/卡号/卡號/钱包/錢包等各种组合）
         elif any(k in key for k in [
             "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
             "数字账号", "數字帳號", "数字帐号", "數字账号", "数位账号", "數位帳號",
@@ -310,7 +311,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
-# 3. Playwright 自动化建店逻辑（全部商城）
+# 3. Playwright 自动化建店逻辑
 async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
@@ -556,12 +557,15 @@ def _looks_like_human_name(value: str) -> bool:
     if not value or len(value) > 40:
         return False
 
+    # 任何数字都不当作真人姓名
     if re.search(r"\d", value):
         return False
 
+    # 中文姓名：2~6 个汉字
     if re.fullmatch(r"[\u4e00-\u9fff]{2,6}", value):
         return True
 
+    # 英文姓名：允许空格、连字符、撇号
     if re.fullmatch(r"[A-Za-z][A-Za-z '\-]{1,39}", value):
         letters = re.sub(r"[^A-Za-z]", "", value)
         return len(letters) >= 2
@@ -580,6 +584,7 @@ def _random_delivery_time(created_time: datetime) -> datetime:
     day = created_time + timedelta(days=days)
     hour = random.randint(8, 17)
     minute = random.randint(0, 59)
+    # 18:00 作为边界也允许
     if random.random() < 0.08:
         hour, minute = 18, 0
     return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -608,19 +613,15 @@ async def _login_generic(page, url, username, password, use_totp=False):
     if not username or not password:
         raise Exception("后台账号或密码未配置")
 
-    # 自动修正单笔商城 URL，兼容配置为根域名或完整登录 URL 的情况
-    if "market_managers" not in url and not use_totp:
-        url = f"{url.rstrip('/')}/market_managers/sign_in"
-
     await page.goto(url, wait_until="domcontentloaded")
     page.set_default_timeout(20000)
 
     # 单笔商城使用 market_manager 登录表单；全部商城/JJ 保留通用定位
-    if "market_managers" in url:
+    if "market_managers/sign_in" in url:
         user_input = page.locator(
             "input[name='market_manager[username]'], "
-            "input[placeholder*='帐号'], "
-            "input[placeholder*='账号'], "
+            "input[placeholder='帐号'], "
+            "input[placeholder='账号'], "
             "input[type='text']"
         ).first
     else:
@@ -646,6 +647,7 @@ async def _login_generic(page, url, username, password, use_totp=False):
 
         totp_code = pyotp.TOTP(JJ_2FA_SECRET).now()
 
+        # 尽量通过 label/name/placeholder 找 Google 验证码输入框
         totp = page.locator(
             "input[name*='otp'], input[name*='2fa'], input[name*='code'], "
             "input[placeholder*='Google'], input[placeholder*='验证码'], "
@@ -653,6 +655,7 @@ async def _login_generic(page, url, username, password, use_totp=False):
         ).first
 
         if await totp.count() == 0:
+            # 兜底：密码框之后的数字/文本输入框
             candidates = page.locator("input:not([type='hidden']):not([type='password'])")
             count = await candidates.count()
             for i in range(count):
@@ -674,12 +677,7 @@ async def _login_generic(page, url, username, password, use_totp=False):
         "input[type='submit'], button[type='submit'], input[name='commit']"
     ).first
     await submit_btn.click()
-    
-    # 强制等待登录后的加载/跳转状态
-    try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_load_state("domcontentloaded")
 
 
 async def _first_visible(page, selectors, timeout=5000):
@@ -699,6 +697,7 @@ async def _fill_by_label(page, labels, value, required=False):
         value = ""
 
     for label_text in labels:
+        # label 直接关联
         label = page.locator(f"label:has-text('{label_text}')").first
         try:
             if await label.count() and await label.is_visible():
@@ -709,6 +708,7 @@ async def _fill_by_label(page, labels, value, required=False):
                         if await target.count() and await target.is_visible():
                             await target.fill(str(value))
                             return True
+                # label 后面的 input/select/textarea
                 parent = label.locator("xpath=..")
                 target = parent.locator("input, textarea, select").first
                 if await target.count() and await target.is_visible():
@@ -803,20 +803,19 @@ async def _create_single_shop(info: dict, task_id: str):
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                target_new_url = f"{SINGLE_ADMIN_ROOT}/merchants/new"
-                await page.goto(target_new_url, wait_until="domcontentloaded")
-                
-                # 检查是否由于登录失败而被跳转回登录界面
-                if "sign_in" in page.url:
-                    raise Exception("单笔商城登录凭据无效或已被退回登录页，请核对 SINGLE_ADMIN_USER 和 SINGLE_ADMIN_PASS！")
+                await page.goto(     f"{SINGLE_ADMIN_ROOT}/market_managers/merchants/new",     wait_until="networkidle" )  await page.wait_for_timeout(2000)
+                username_input = page.locator(
+    "#merchant_username, "
+    "input[name*='username'], "
+    "input[name*='account']"
+).first
 
-                username_input = page.locator("#merchant_username, input[name*='username']").first
-                try:
-                    await username_input.wait_for(state="visible", timeout=20000)
-                except Exception:
-                    raise Exception(f"无法访问单笔建店页面，当前页面地址: {page.url}")
+await username_input.wait_for(
+    state="visible",
+    timeout=30000
+)
 
-                await username_input.fill(current_account)
+await username_input.fill(current_account)
 
                 for sel in ["#merchant_password", "#merchant_password_confirmation"]:
                     loc = page.locator(sel)
@@ -952,7 +951,7 @@ async def _create_single_shop(info: dict, task_id: str):
             msg_text = (
                 "✅ <b>单笔商城流程完成！</b>\n\n"
                 f"店铺网址 : <code>{html.escape(shop_url)}</code>\n"
-                f"登入帳號 : <code>{html.escape(final_account)}</code>\n"
+                f"登入帐号 : <code>{html.escape(final_account)}</code>\n"
                 "登入密码 : <code>a12345</code>\n"
                 f"JJ订单状态 : <b>{html.escape(jj_result['status'])}</b>\n"
                 f"充值结果 : <b>{html.escape(recharge_result)}</b>"
@@ -967,6 +966,7 @@ async def _create_single_shop(info: dict, task_id: str):
 
 
 async def _jj_open_outbound(page):
+    # 用户截图显示的菜单是「出货管理」
     candidates = [
         "a:has-text('出货管理')",
         "a:has-text('出貨管理')",
@@ -981,6 +981,7 @@ async def _jj_open_outbound(page):
                 return
         except Exception:
             continue
+    # 如果首页已经是出货管理，也继续
     if "guest_payment_orders" not in page.url:
         raise Exception("JJ 后台找不到【出货管理】页面入口")
 
@@ -990,12 +991,14 @@ async def _jj_unlock_search_range(page):
     unlock = page.locator("i.fa-unlock.unlock-btn, .fa-unlock.unlock-btn, .unlock-btn").first
     lock = page.locator(".lock-btn, .fa-lock.lock-btn, .fa-lock").first
 
+    # 如果页面上已经存在 unlock-btn，说明已经解锁，不再点击
     try:
         if await unlock.count() and await unlock.is_visible():
             return
     except Exception:
         pass
 
+    # 否则点击用户截图中的锁按钮
     for loc in [lock, page.locator(".toggle-search-days-btn-placeholder").first]:
         try:
             if await loc.count() and await loc.is_visible():
@@ -1005,6 +1008,7 @@ async def _jj_unlock_search_range(page):
         except Exception:
             continue
 
+    # 最后尝试点击带 lock 图示的元素
     loc = page.locator("i.fa-lock, i.fa-unlock").first
     if await loc.count() and await loc.is_visible():
         try:
@@ -1019,6 +1023,7 @@ async def _jj_set_one_year_date(page):
     start = now - timedelta(days=365)
     end = now
 
+    # 截图中建立日期是一组 date/time 输入。优先按 name/id 中的 created_at 搜索。
     date_inputs = page.locator(
         "input[type='date'], input[name*='start'], input[name*='begin'], "
         "input[name*='created'], input[id*='start'], input[id*='begin'], input[id*='created']"
@@ -1034,6 +1039,7 @@ async def _jj_set_one_year_date(page):
             pass
 
     if len(visible) >= 2:
+        # 仅对 date 类型直接填 YYYY-MM-DD；datetime-local 则带时间
         for el, dt in [(visible[0], start), (visible[1], end)]:
             typ = await el.get_attribute("type")
             if typ == "date":
@@ -1044,6 +1050,7 @@ async def _jj_set_one_year_date(page):
                 await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
         return
 
+    # Rails/jQuery datepicker 常见 text 输入框：从「建立日期」单选旁的输入框取值
     candidates = page.locator("input[type='text']")
     vals = []
     count = await candidates.count()
@@ -1063,6 +1070,7 @@ async def _jj_set_one_year_date(page):
         await vals[1].fill(end.strftime("%Y/%m/%d 23:59"))
         return
 
+    # 兜底：截图中建立日期区域位于左上，通常是前两个可见文本框
     text_inputs = []
     for i in range(count):
         el = candidates.nth(i)
@@ -1096,6 +1104,7 @@ async def _jj_find_order_input(page, kind):
     if loc:
         return loc
 
+    # 根据 label 找输入框
     labels = ["平台订单号", "平台訂單號"] if kind == "platform" else ["其他订单号", "其他訂單號"]
     for txt in labels:
         label = page.locator(f"label:has-text('{txt}')").first
@@ -1129,6 +1138,7 @@ async def _jj_search(page, order_no, kind):
         await inp.press("Enter")
 
     await page.wait_for_timeout(800)
+    # 等表格或「没有资料」类文字出现
     try:
         await page.locator("table tbody tr").first.wait_for(state="visible", timeout=8000)
     except Exception:
@@ -1225,6 +1235,7 @@ async def _query_jj_order(single_order_no, task_id):
             is_success = "成功" in status or "成功" in "".join(cells)
             is_failed = "失败" in status or "失敗" in status or "失败" in "".join(cells)
 
+            # 读取字段：截图明确有交易金额、状态、订单号；货运/实名可能依站点字段名变化
             order_no = _cell_by_header(headers, cells, ["平台订单", "平台訂單", "订单号", "訂單號"])
             recipient = _cell_by_header(headers, cells, ["商户会员", "商戶會員", "实名", "實名", "收件人", "收件人姓名"])
             amount = _cell_by_header(headers, cells, ["交易金额", "交易金額", "金额", "金額"])
@@ -1232,6 +1243,7 @@ async def _query_jj_order(single_order_no, task_id):
             created = _cell_by_header(headers, cells, ["提交时间", "提交時間", "建立时间", "建立時間", "创建时间", "創建時間"])
             completed = _cell_by_header(headers, cells, ["完成时间", "完成時間"])
 
+            # 如果 header mapping 找不到，尝试从整行文本中保留原始内容，避免猜错
             created_dt = _parse_jj_datetime(created)
             if not created_dt:
                 created_dt = _parse_jj_datetime(completed)
@@ -1256,6 +1268,7 @@ async def _query_jj_order(single_order_no, task_id):
 
 
 async def _single_recharge(page, account, jj_result):
+    # 单笔商城充值入口：商户资料页 -> 充值管理
     await _single_search_account(page, account)
 
     recharge_link = page.locator(
@@ -1264,6 +1277,7 @@ async def _single_recharge(page, account, jj_result):
     ).first
 
     if not await recharge_link.is_visible():
+        # 如果商户行里没有直接链接，尝试菜单入口
         menu = page.locator("a:has-text('商户充值管理'), a:has-text('商戶充值管理')").first
         if await menu.count() and await menu.is_visible():
             await menu.click()
@@ -1274,6 +1288,7 @@ async def _single_recharge(page, account, jj_result):
 
     await page.wait_for_load_state("domcontentloaded")
 
+    # 商户：优先使用刚创建账号的 option
     merchant_select = await _first_visible(page, [
         "#deposit_order_merchant_id",
         "select[name*='deposit_order'][name*='merchant']",
@@ -1286,6 +1301,7 @@ async def _single_recharge(page, account, jj_result):
             try:
                 await merchant_select.select_option(value=account)
             except Exception:
+                # 如果是可搜索 select，先尝试键盘输入
                 try:
                     await merchant_select.click()
                     await merchant_select.press("ArrowDown")
@@ -1293,6 +1309,8 @@ async def _single_recharge(page, account, jj_result):
                 except Exception:
                     pass
 
+    # 银行账号：按用户规则不手填，系统自动带入
+    # 收件人资讯：随便选择一个现有选项
     recipient_info = await _first_visible(page, [
         "#deposit_order_recipient_info_id",
         "select[name*='recipient_info']",
@@ -1301,6 +1319,7 @@ async def _single_recharge(page, account, jj_result):
     if recipient_info:
         await _select_any_option(recipient_info)
 
+    # 买家留言保持空白
     buyer_comment = page.locator(
         "#deposit_order_buyer_comment, textarea[name*='buyer_comment']"
     ).first
@@ -1310,6 +1329,7 @@ async def _single_recharge(page, account, jj_result):
     except Exception:
         pass
 
+    # 运单号：成功才有
     shipment = jj_result.get("shipment", "")
     if shipment:
         await _fill_by_label(
@@ -1318,6 +1338,7 @@ async def _single_recharge(page, account, jj_result):
             shipment,
             required=False,
         )
+        # 直接 ID 兜底
         loc = page.locator(
             "#deposit_order_shipment_no, input[name*='shipment_no'], input[name*='shipment']"
         ).first
@@ -1327,6 +1348,7 @@ async def _single_recharge(page, account, jj_result):
         except Exception:
             pass
 
+    # 收件人姓名：实名空白/数字/明显非人名 -> 管理员代收
     recipient = jj_result.get("recipient") or MANAGER_RECEIVE_NAME
     await _fill_by_label(
         page,
@@ -1343,6 +1365,7 @@ async def _single_recharge(page, account, jj_result):
     except Exception:
         pass
 
+    # 金额 = JJ 交易金额
     amount = jj_result.get("amount", "")
     if amount:
         await _fill_by_label(page, ["金额", "金額", "交易金额", "交易金額"], amount, required=False)
@@ -1355,6 +1378,7 @@ async def _single_recharge(page, account, jj_result):
         except Exception:
             pass
 
+    # 配送时间：成功才生成；失败保持空白
     delivery = jj_result.get("delivery")
     if delivery:
         delivery_text = delivery.strftime("%Y/%m/%d %H:%M")
@@ -1373,6 +1397,8 @@ async def _single_recharge(page, account, jj_result):
         except Exception:
             pass
 
+    # 建立时间：充值表单截图显示为可选字段。按用户规则以 JJ 建立时间为基准，
+    # 这里填 JJ 建立时间，若后台字段是系统自动值则保留原值。
     created = jj_result.get("created")
     if created:
         loc = page.locator(
@@ -1396,7 +1422,7 @@ async def _single_recharge(page, account, jj_result):
     return "已送出"
 
 
-# 修改商城界面函数
+# 修改商城界面函数（无排队锁，可并发独立运行）
 async def update_shop_skin(account_name: str, new_skin: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -1529,6 +1555,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 
+
 # 建店 Worker 包装（含排队锁控制）
 async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False):
     try:
@@ -1578,6 +1605,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
         )
     finally:
         ACTIVE_TASKS.pop(task_id, None)
+
 
 
 # 5. 回调事件处理
@@ -1634,6 +1662,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.answer(f"⏳ 正在切换界面为【{new_skin_name}】...", show_alert=False)
 
+        # 切换按钮为防重复点击状态
         loading_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"⏳ 正在切换为【{new_skin_name}】...", callback_data="ignore")]
         ])
