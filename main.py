@@ -1,4 +1,4 @@
-import os
+# 修正版：已根据实际后台 DOM 定位更新\nimport os
 import sys
 import asyncio
 import re
@@ -793,8 +793,9 @@ async def _create_single_shop(info: dict, task_id: str):
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{SINGLE_ADMIN_ROOT}/merchants/new", wait_until="domcontentloaded")
-                await page.locator("#merchant_username").wait_for(state="visible", timeout=20000)
-                await page.locator("#merchant_username").fill(current_account)
+                username_input = page.locator("#merchant_username").first
+                await username_input.wait_for(state="visible", timeout=30000)
+                await username_input.fill(current_account)
 
                 for sel in ["#merchant_password", "#merchant_password_confirmation"]:
                     loc = page.locator(sel)
