@@ -802,13 +802,20 @@ async def _create_single_shop(info: dict, task_id: str):
             await _login_generic(page, SINGLE_ADMIN_URL, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
 
             while True:
-                current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(     f"{SINGLE_ADMIN_ROOT}/market_managers/merchants/new",     wait_until="networkidle" )  await page.wait_for_timeout(2000)
-                username_input = page.locator(
-    "#merchant_username, "
-    "input[name*='username'], "
-    "input[name*='account']"
-).first
+    current_account = ...
+
+    await page.goto(
+        f"{SINGLE_ADMIN_ROOT}/market_managers/merchants/new",
+        wait_until="networkidle"
+    )
+
+    await page.wait_for_timeout(2000)
+
+    username_input = page.locator(
+        "#merchant_username, "
+        "input[name*='username'], "
+        "input[name*='account']"
+    ).first
 
 await username_input.wait_for(
     state="visible",
