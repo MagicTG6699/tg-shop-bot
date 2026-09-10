@@ -1,19 +1,19 @@
 name: TG Shop Bot
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:      # 支持手动点击运行
   push:
-    branches: ["main"]
+    branches: [ "main" ]  # 推送代码时触发
   schedule:
-    - cron: '0 */3 * * *'
+    - cron: '0 */3 * * *' # 每 3 小时自动重新触发，无缝防断线
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 240 # 单次运行上限 4 小时，超时后自动由新的 cron 任务接替
     concurrency:
       group: tg-bot-instance
-      cancel-in-progress: true
+      cancel-in-progress: true # 触发新任务时，自动终止旧任务，防止多实例重复挂机
 
     steps:
       - name: 拉取仓库代码
@@ -29,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 安装 Playwright 浏览器
+      - name: 安装 Playwright 及其系统依赖
         run: |
           playwright install --with-deps chromium
 
@@ -40,15 +40,5 @@ jobs:
           ADMIN_URL: ${{ secrets.ADMIN_URL }}
           ADMIN_USER: ${{ secrets.ADMIN_USER }}
           ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
-
-          SINGLE_ADMIN_URL: ${{ secrets.SINGLE_ADMIN_URL }}
-          SINGLE_ADMIN_USER: ${{ secrets.SINGLE_ADMIN_USER }}
-          SINGLE_ADMIN_PASS: ${{ secrets.SINGLE_ADMIN_PASS }}
-
-          JJ_ADMIN_URL: ${{ secrets.JJ_ADMIN_URL }}
-          JJ_ADMIN_USER: ${{ secrets.JJ_ADMIN_USER }}
-          JJ_ADMIN_PASS: ${{ secrets.JJ_ADMIN_PASS }}
-          JJ_2FA_SECRET: ${{ secrets.JJ_2FA_SECRET }}
-
         run: |
           python main.py
