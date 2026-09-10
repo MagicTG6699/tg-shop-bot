@@ -5,7 +5,6 @@ import re
 import html
 import random
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
 
 try:
     import pyotp
@@ -22,7 +21,7 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Helper: 清理并规范化基础域名，解决 ERR_NAME_NOT_RESOLVED 以及路径拼接错误
+# Helper: 保留完整的传入 URL，仅做首尾空格清理与协议补全，绝不裁切路径
 def _get_clean_domain(url: str) -> str:
     if not url:
         return ""
@@ -33,9 +32,7 @@ def _get_clean_domain(url: str) -> str:
     elif not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
 
-    parsed = urlparse(url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    return base.rstrip("/")
+    return url.rstrip("/")
 
 # 1. 环境变量配置解析
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -56,8 +53,7 @@ SINGLE_ADMIN_USER = os.environ.get("SINGLE_ADMIN_USER", "").strip()
 SINGLE_ADMIN_PASS = os.environ.get("SINGLE_ADMIN_PASS", "").strip()
 
 raw_single_admin_url = os.environ.get("SINGLE_ADMIN_URL", "").strip()
-SINGLE_ADMIN_URL = raw_single_admin_url
-SINGLE_ADMIN_ROOT = _get_clean_domain(raw_single_admin_url)
+SINGLE_ADMIN_URL = _get_clean_domain(raw_single_admin_url)
 
 JJ_ADMIN_USER = os.environ.get("JJ_ADMIN_USER", "").strip()
 JJ_ADMIN_PASS = os.environ.get("JJ_ADMIN_PASS", "").strip()
@@ -83,12 +79,11 @@ SKIN_OPTIONS = {
 }
 
 
-# 2. 文本解析与格式校验（全面优化简繁体兼容与格式判断）
+# 2. 文本解析与格式校验
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
     errors = []
 
-    # 特征词定义
     digital_keywords = [
         "数字R人民币", "數字R人民幣", "数字R", "數字R",
         "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
@@ -99,7 +94,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     bank_keywords = ["银行", "銀行", "开户行", "開戶行", "支行"]
     alipay_keywords = ["支付宝", "支付寶", "支付宝户名", "支付寶戶名", "支付宝名", "支付寶名"]
 
-    # 优先判定整单类型
     if any(k in text for k in alipay_keywords):
         info["type"] = "alipay"
     elif any(k in text for k in digital_keywords):
@@ -121,7 +115,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     lines = clean_text.splitlines()
 
-    # 第一阶段：优先提取平台账号
     for line in lines:
         line = line.strip()
         if not line or any(ik in line for ik in base_ignore_keys):
@@ -142,7 +135,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                     info["account"] = val.lower()
                     break
 
-    # 第二阶段：提取各具体字段
     for line in lines:
         line = line.strip()
         if not line:
@@ -299,7 +291,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if not info.get("branch_name") and "支行" not in empty_fields:
             errors.append("• 缺少【支行名称】！")
 
-    # 单笔订单号判断
     single_order_match = re.search(r'(?im)^[\t ]*(?:单笔|單筆)[\t ]*[：:][\t ]*(.+)[\t ]*$', clean_text)
     if single_order_match:
         single_order_no = single_order_match.group(1).strip()
@@ -346,10 +337,10 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 await click_locator.click()
                 await wait_locator.wait_for(state="visible", timeout=timeout)
 
-            # 1. 登录后台
-            await page.goto(f"{BASE_ADMIN_URL}/admin/login", wait_until="domcontentloaded")
+            # 1. 登录后台 (直接访问环境变量配置的 BASE_ADMIN_URL)
+            await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
             user_input = page.locator(
-                "#admin_user_email, #user_email, input[type='email'], input[name='email'], input[name='login'], input[name='username'], input[type='text']"
+                "input[name='market_manager[username]'], #admin_user_email, #user_email, input[type='email'], input[name='email'], input[name='login'], input[name='username'], input[type='text']"
             ).first
 
             try:
@@ -364,8 +355,11 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             await submit_btn.click()
             await page.wait_for_load_state("domcontentloaded")
 
+            # 提取基础域名根路径用于页面跳转
+            domain_root = "/".join(BASE_ADMIN_URL.split("/")[:3])
+
             async def search_account(acc_name: str):
-                await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
+                await page.goto(f"{domain_root}/merchants", wait_until="domcontentloaded")
                 search_input = page.locator("input[name='account'], #search_account, input[type='search'], input[type='text']").first
                 await search_input.wait_for(state="visible", timeout=20000)
                 await search_input.fill(acc_name)
@@ -381,7 +375,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             # 2. 尝试递增后缀建店
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
+                await page.goto(f"{domain_root}/merchants/new", wait_until="domcontentloaded")
                 await page.locator("#merchant_username").wait_for(state="visible", timeout=20000)
 
                 await page.locator("#merchant_username").fill(current_account)
@@ -547,10 +541,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 pass
 
 
-# ============================================================
-# 单笔商城 + JJ 订单后台
-# ============================================================
-
+# 单笔商城 + JJ 订单后台辅助函数
 def _clean_text_value(value):
     return re.sub(r'\s+', ' ', (value or "").strip())
 
@@ -615,24 +606,19 @@ async def _login_generic(page, url, username, password, use_totp=False):
     page.set_default_timeout(20000)
 
     # 精确匹配登录表单中的账号、密码框与提交按钮
-    if "market_managers/sign_in" in url:
-        user_input = page.locator(
-            "input[name='market_manager[username]'], "
-            "input[placeholder='帐号'], "
-            "input[placeholder='账号'], "
-            "input[type='text']"
-        ).first
-    else:
-        user_input = page.locator(
-            "#admin_user_email, #user_email, input[type='email'], "
-            "input[name='email'], input[name='login'], input[name='username'], "
-            "input[type='text']"
-        ).first
+    user_input = page.locator(
+        "input[name='market_manager[username]'], "
+        "input[name='jj_manager[username]'], "
+        "#admin_user_email, #user_email, input[type='email'], "
+        "input[name='email'], input[name='login'], input[name='username'], "
+        "input[placeholder='帐号'], input[placeholder='账号'], input[type='text']"
+    ).first
     await user_input.wait_for(state="visible", timeout=20000)
     await user_input.fill(username)
 
     password_input = page.locator(
         "input[name='market_manager[password]'], "
+        "input[name='jj_manager[password]'], "
         "#admin_user_password, #user_password, input[type='password']"
     ).first
     await password_input.fill(password)
@@ -738,7 +724,8 @@ async def _select_any_option(select_loc):
 
 
 async def _single_search_account(page, account):
-    await page.goto(f"{SINGLE_ADMIN_ROOT}/merchants", wait_until="domcontentloaded")
+    domain_root = "/".join(SINGLE_ADMIN_URL.split("/")[:3])
+    await page.goto(f"{domain_root}/market_managers/merchants", wait_until="domcontentloaded")
     search_input = await _first_visible(page, [
         "input[name='account']",
         "#search_account",
@@ -775,6 +762,7 @@ async def _create_single_shop(info: dict, task_id: str):
     info_type = info.get("type", "alipay")
     suffix_num = 0
     final_account = base_account
+    domain_root = "/".join(SINGLE_ADMIN_URL.split("/")[:3])
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -796,9 +784,8 @@ async def _create_single_shop(info: dict, task_id: str):
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{SINGLE_ADMIN_ROOT}/market_managers/merchants/new", wait_until="domcontentloaded")
+                await page.goto(f"{domain_root}/market_managers/merchants/new", wait_until="domcontentloaded")
                 
-                # 应用当前页面最新的市场管理员字段 selector
                 username_input = page.locator(
                     "input[name='market_manager[username]'], "
                     "#merchant_username, "
@@ -1399,7 +1386,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
             page = await context.new_page()
             page.set_default_timeout(20000)
 
-            await page.goto(f"{BASE_ADMIN_URL}/admin/login", wait_until="domcontentloaded")
+            await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
             user_input = page.locator(
                 "#admin_user_email, #user_email, input[type='email'], input[name='email'], input[name='login'], input[name='username'], input[type='text']"
             ).first
@@ -1408,7 +1395,8 @@ async def update_shop_skin(account_name: str, new_skin: str):
             await page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first.click()
             await page.wait_for_load_state("domcontentloaded")
 
-            await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
+            domain_root = "/".join(BASE_ADMIN_URL.split("/")[:3])
+            await page.goto(f"{domain_root}/merchants", wait_until="domcontentloaded")
             search_input = page.locator("input[name='account'], #search_account, input[type='search'], input[type='text']").first
             await search_input.fill(account_name)
             search_btn = page.locator("button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary").first
