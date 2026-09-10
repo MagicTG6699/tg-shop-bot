@@ -111,7 +111,8 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     clean_text = re.sub(r'mailto', '', text, flags=re.IGNORECASE)
     clean_text = re.sub(r'https?[^\s]+', '', clean_text, flags=re.IGNORECASE)
-    clean_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5\s：:_\-\.]+', '', clean_text)
+    # 修复点：添加 @ 符号到字符白名单，防止包含邮箱的账号中的 @ 被滤除
+    clean_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5\s：:_\-\.@]+', '', clean_text)
 
     raw_accounts = {}
     raw_phone = None
