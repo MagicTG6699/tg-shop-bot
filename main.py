@@ -803,10 +803,7 @@ async def _create_single_shop(info: dict, task_id: str):
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{SINGLE_ADMIN_ROOT}/merchants/new", wait_until="domcontentloaded")
-
-                # 建店页面字段兼容不同版本 DOM：
-                # 旧版为 #merchant_username，新版可能为 username/account
+                await page.goto(f"{SINGLE_ADMIN_ROOT}/market_managers/merchants/new", wait_until="domcontentloaded")
                 username_input = page.locator(
                     "#merchant_username, "
                     "input[name='merchant[username]'], "
@@ -815,7 +812,6 @@ async def _create_single_shop(info: dict, task_id: str):
                     "input[placeholder*='帐号'], "
                     "input[placeholder*='账号']"
                 ).first
-
                 await username_input.wait_for(state="visible", timeout=30000)
                 await username_input.fill(current_account)
 
