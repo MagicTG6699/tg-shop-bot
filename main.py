@@ -111,7 +111,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
 
     clean_text = re.sub(r'mailto', '', text, flags=re.IGNORECASE)
     clean_text = re.sub(r'https?[^\s]+', '', clean_text, flags=re.IGNORECASE)
-    # 修复点：添加 @ 符号到字符白名单，防止包含邮箱的账号中的 @ 被滤除
     clean_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5\s：:_\-\.@]+', '', clean_text)
 
     raw_accounts = {}
@@ -143,7 +142,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                     info["account"] = val.lower()
                     break
 
-    # 第二阶段：提取各具体字段（增强简繁体兼容）
+    # 第二阶段：提取各具体字段
     for line in lines:
         line = line.strip()
         if not line:
@@ -170,7 +169,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 empty_fields.append(parts[0].strip())
             continue
 
-        # 匹配户名
         if any(k in key for k in [
             "户名", "戶名", "姓名", "名字", "客户姓名", "客戶姓名",
             "支付宝户名", "支付寶戶名", "支付宝名", "支付寶名"
@@ -181,15 +179,12 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         ]:
             info["name"] = val
 
-        # 匹配手机号
         elif any(k in key for k in ["手机", "手機", "电话", "電話", "联系方式"]):
             raw_phone = val
 
-        # 匹配商城界面
         elif any(k in key for k in ["商城界面", "商城模板", "界面", "模板"]):
             info["skin"] = val.replace("预设", "")
 
-        # 1. 优先精准匹配数字人民币账号
         elif any(k in key for k in [
             "数字人民币", "數字人民幣", "數位人民幣", "数位人民币",
             "数字账号", "數字帳號", "数字帐号", "數字账号", "数位账号", "數位帳號",
@@ -199,18 +194,15 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         ]) or (info.get("type") == "digital_wallet" and any(k in key for k in ["账号", "帳號", "帐号", "卡号", "卡號"])):
             raw_accounts["digital"] = val
 
-        # 2. 匹配支付宝账号
         elif key in [
             "支付宝", "支付寶", "支付宝账号", "支付寶帳號", "支付宝帐号", "支",
             "支付宝卡号", "支付寶卡號"
         ] or (info.get("type") == "alipay" and any(k in key for k in ["账号", "帳號", "帐号", "卡号", "卡號"])):
             raw_accounts["alipay"] = val
 
-        # 匹配支行
         elif any(k in key for k in ["支行", "分行", "网点", "網點", "开户支行", "開戶支行", "银行支行", "銀行支行"]):
             info["branch_name"] = val
 
-        # 匹配银行名称
         elif any(k in key for k in ["银行名称", "銀行名稱", "开户行", "開戶行", "行名"]) or key in ["银行", "銀行"]:
             if "支行" not in key:
                 if "-" in val or " " in val:
@@ -220,13 +212,11 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
                 else:
                     info["bank_name"] = val
 
-        # 3. 匹配银行卡号
         elif key in ["银行账号", "銀行帳號", "银行卡号", "銀行卡號", "银", "銀"] or (
             info.get("type") == "bank" and any(k in key for k in ["账号", "帳號", "帐号", "卡号", "卡號"])
         ):
             raw_accounts["bank"] = val
 
-        # 4. 保底提取平台主账号
         elif "account" not in info and key in ["账号", "帳號", "帐号", "会员号", "會員號"]:
             info["account"] = val.lower()
 
@@ -309,7 +299,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if not info.get("branch_name") and "支行" not in empty_fields:
             errors.append("• 缺少【支行名称】！")
 
-    # 单笔订单号：只有消息包含“单笔”字段时才走单笔商城
+    # 单笔订单号判断
     single_order_match = re.search(r'(?im)^[\t ]*(?:单笔|單筆)[\t ]*[：:][\t ]*(.+)[\t ]*$', clean_text)
     if single_order_match:
         single_order_no = single_order_match.group(1).strip()
@@ -624,6 +614,7 @@ async def _login_generic(page, url, username, password, use_totp=False):
     await page.goto(url, wait_until="domcontentloaded")
     page.set_default_timeout(20000)
 
+    # 精确匹配登录表单中的账号、密码框与提交按钮
     if "market_managers/sign_in" in url:
         user_input = page.locator(
             "input[name='market_manager[username]'], "
@@ -679,7 +670,7 @@ async def _login_generic(page, url, username, password, use_totp=False):
         await totp.fill(totp_code)
 
     submit_btn = page.locator(
-        "input[type='submit'], button[type='submit'], input[name='commit']"
+        "button[type='submit'], input[type='submit'], input[name='commit']"
     ).first
     await submit_btn.click()
     await page.wait_for_load_state("domcontentloaded")
@@ -806,7 +797,10 @@ async def _create_single_shop(info: dict, task_id: str):
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{SINGLE_ADMIN_ROOT}/market_managers/merchants/new", wait_until="domcontentloaded")
+                
+                # 应用当前页面最新的市场管理员字段 selector
                 username_input = page.locator(
+                    "input[name='market_manager[username]'], "
                     "#merchant_username, "
                     "input[name='merchant[username]'], "
                     "input[name='username'], "
@@ -817,7 +811,7 @@ async def _create_single_shop(info: dict, task_id: str):
                 await username_input.wait_for(state="visible", timeout=30000)
                 await username_input.fill(current_account)
 
-                for sel in ["#merchant_password", "#merchant_password_confirmation"]:
+                for sel in ["input[name='market_manager[password]']", "#merchant_password", "#merchant_password_confirmation"]:
                     loc = page.locator(sel)
                     if await loc.count() and await loc.is_visible():
                         await loc.fill("a12345")
@@ -889,7 +883,8 @@ async def _create_single_shop(info: dict, task_id: str):
                         except Exception:
                             pass
 
-                await page.locator("input[name='commit'][value='送出']").first.click()
+                submit_btn = page.locator("button[type='submit'], input[name='commit'][value='送出']").first
+                await submit_btn.click()
                 await page.wait_for_load_state("domcontentloaded")
 
                 body_text = await page.locator("body").inner_text()
@@ -915,7 +910,7 @@ async def _create_single_shop(info: dict, task_id: str):
             await import_btn.wait_for(state="visible", timeout=20000)
             await import_btn.click()
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
-            await page.locator("input[name='commit'], input[value='送出']").click()
+            await page.locator("button[type='submit'], input[name='commit'], input[value='送出']").first.click()
             await page.wait_for_load_state("domcontentloaded")
 
             # 非银行付款才移除默认银行占位符
@@ -935,7 +930,7 @@ async def _create_single_shop(info: dict, task_id: str):
                     ).first
                 if await remove_btn.count() and await remove_btn.is_visible():
                     await remove_btn.click()
-                    await page.locator("input[name='commit'][value='送出']").first.click()
+                    await page.locator("button[type='submit'], input[name='commit'][value='送出']").first.click()
                     await page.wait_for_load_state("domcontentloaded")
 
             # JJ 查询
@@ -1205,12 +1200,10 @@ async def _query_jj_order(single_order_no, task_id):
             await _jj_unlock_search_range(page)
             await _jj_set_one_year_date(page)
 
-            # 第一优先：平台订单号
             await _jj_search(page, single_order_no, "platform")
             headers, cells = await _extract_jj_row(page)
 
             if not cells:
-                # 第二优先：其他订单号
                 await _jj_search(page, single_order_no, "other")
                 headers, cells = await _extract_jj_row(page)
 
@@ -1383,8 +1376,8 @@ async def _single_recharge(page, account, jj_result):
             pass
 
     submit = page.locator(
-        "input[type='submit'][value='送出'], input[type='submit'], "
-        "button[type='submit'], button:has-text('送出')"
+        "button[type='submit'], input[type='submit'][value='送出'], input[type='submit'], "
+        "button:has-text('送出')"
     ).last
     if not await submit.is_visible():
         raise Exception("找不到单笔商城充值的【送出】按钮")
@@ -1394,7 +1387,7 @@ async def _single_recharge(page, account, jj_result):
     return "已送出"
 
 
-# 修改商城界面函数（无排队锁，可并发独立运行）
+# 修改商城界面函数
 async def update_shop_skin(account_name: str, new_skin: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -1435,7 +1428,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 except Exception:
                     await shop_template.select_option(label=f"预设{new_skin}")
 
-            await page.locator("input[name='commit'][value='送出']").first.click()
+            await page.locator("input[name='commit'][value='送出'], button[type='submit']").first.click()
             await page.wait_for_load_state("domcontentloaded")
         finally:
             try:
