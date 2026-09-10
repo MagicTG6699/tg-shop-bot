@@ -43,9 +43,13 @@ ACTIVE_TASKS = {}
 def _get_clean_domain(url: str) -> str:
   if not url:
     return ""
+  url = url.strip()
+  # 自动修补：如果没有 http:// 或 https://，自动补齐 https://，防止域名解析混乱
+  if not url.startswith("http://") and not url.startswith("https://"):
+    url = "https://" + url
+
   parsed = urlparse(url)
-  scheme = parsed.scheme if parsed.scheme else "https"
-  return f"{scheme}://{parsed.netloc}"
+  return f"{parsed.scheme}://{parsed.netloc}"
 
 
 async def _first_visible(page, selectors, timeout=10000):
@@ -453,7 +457,7 @@ async def _create_normal_shop(info: dict, task_id: str):
       if task_id in ACTIVE_TASKS:
         ACTIVE_TASKS[task_id]["page"] = page
 
-      # 1. 登录普通后台 (自动防错拼接)
+      # 1. 登录普通后台
       await page.goto(
           f"{domain_root}/admin/login", wait_until="domcontentloaded"
       )
