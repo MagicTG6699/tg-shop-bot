@@ -1018,22 +1018,43 @@ async def _jj_unlock_search_range(page):
 
 
 async def _jj_set_one_year_date(page):
-    """直接操作截图确认的 #q_created_at_gte / #q_created_at_lte。"""
+    """设置 JJ 建立日期范围为最近一年。兼容不同版本页面的 ID/name。"""
     from datetime import timezone
     tz8 = timezone(timedelta(hours=8))
     now = datetime.now(tz8)
     start = now - timedelta(days=365)
 
-    start_input = page.locator("#q_created_at_gte").first
-    end_input = page.locator("#q_created_at_lte").first
+    async def find_input(selectors):
+        # 先查主页面，再查 iframe；同时兼容截图中的精确 ID、name 和旧版字段。
+        contexts = [page] + list(page.frames)
+        for ctx in contexts:
+            for selector in selectors:
+                try:
+                    loc = ctx.locator(selector).first
+                    if await loc.count():
+                        return loc
+                except Exception:
+                    continue
+        return None
 
-    if await start_input.count() == 0 or await end_input.count() == 0:
-        raise Exception("JJ 找不到建立日期范围输入框：#q_created_at_gte / #q_created_at_lte")
+    start_input = await find_input([
+        "#q_created_at_gte",
+        "input[name='q[created_at_gte]']",
+        "input[id*='created_at_gte']",
+        "input[name*='created_at_gte']",
+    ])
+    end_input = await find_input([
+        "#q_created_at_lte",
+        "input[name='q[created_at_lte]']",
+        "input[id*='created_at_lte']",
+        "input[name*='created_at_lte']",
+    ])
 
-    await start_input.wait_for(state="attached", timeout=10000)
-    await end_input.wait_for(state="attached", timeout=10000)
+    if start_input is None or end_input is None:
+        # 不要因为日期控件的前端版本差异直接让整笔订单失败。
+        # 返回 False，由上层继续使用订单号查询；若控件存在则一定设置一年范围。
+        return False
 
-    # 截图中的实际 value 是 datetime 文本，例如 2026-09-15T03:00:00+08:00。
     start_value = start.strftime("%Y-%m-%dT%H:%M:%S+08:00")
     end_value = now.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
@@ -1052,6 +1073,7 @@ async def _jj_set_one_year_date(page):
     await set_value(start_input, start_value)
     await set_value(end_input, end_value)
     await page.wait_for_timeout(300)
+    return True
 
 
 async def _jj_find_order_input(page, kind):
@@ -1206,11 +1228,11 @@ async def _query_jj_order(single_order_no, task_id):
             else:
                 jj_outbound_url = jj_base + "/admin/guest_payment_orders"
             await page.goto(jj_outbound_url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(1000)
 
             # 先解锁，再把建立日期范围拉回一年。
             await _jj_unlock_search_range(page)
-            await _jj_set_one_year_date(page)
+            date_set = await _jj_set_one_year_date(page)
 
             # 先查平台订单号。
             await _jj_search(page, single_order_no, "platform")
