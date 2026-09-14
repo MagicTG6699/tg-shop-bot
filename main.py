@@ -1115,108 +1115,106 @@ async def _jj_open_outbound(page):
 
 
 async def _jj_unlock_search_range(page):
-    unlock = page.locator("i.fa-unlock.unlock-btn, .fa-unlock.unlock-btn, .unlock-btn").first
-    lock = page.locator(".lock-btn, .fa-lock.lock-btn, .fa-lock").first
+    """解开 JJ 出货管理的日期查询范围暗锁。
 
+    截图确认页面使用 toggle-order-search-days-btn-placeholder / lock-btn，
+    锁图标本身有时会带 hide，因此优先点击外层可见的占位/按钮。
+    """
+    selectors = [
+        ".toggle-order-search-days-btn-placeholder",
+        ".toggle-search-days-btn-placeholder",
+        "button.toggle-order-search-days-btn",
+        "a.toggle-order-search-days-btn",
+        ".lock-btn:not(.hide)",
+        ".fa-lock.lock-btn:not(.hide)",
+        ".unlock-btn:not(.hide)",
+    ]
+
+    # 已经解锁时直接返回。
     try:
-        if await unlock.count() and await unlock.is_visible():
+        if await page.locator(".fa-unlock.unlock-btn:not(.hide), .unlock-btn:not(.hide)").first.is_visible():
             return
     except Exception:
         pass
 
-    for loc in [lock, page.locator(".toggle-search-days-btn-placeholder").first]:
+    for selector in selectors:
+        loc = page.locator(selector).first
         try:
             if await loc.count() and await loc.is_visible():
-                await loc.click()
-                await page.wait_for_timeout(300)
+                await loc.click(timeout=5000)
+                await page.wait_for_timeout(500)
                 return
         except Exception:
             continue
 
-    loc = page.locator("i.fa-lock, i.fa-unlock").first
-    if await loc.count() and await loc.is_visible():
-        try:
-            await loc.click()
-            await page.wait_for_timeout(300)
-        except Exception:
-            pass
+    # 最后尝试找到包含 fa-lock 的可见父元素，用 JS 点击真正的可点击节点。
+    try:
+        lock_icon = page.locator("i.fa-lock").first
+        if await lock_icon.count() and await lock_icon.is_visible():
+            parent = lock_icon.locator("xpath=..")
+            if await parent.count() and await parent.is_visible():
+                await parent.click(timeout=5000)
+                await page.wait_for_timeout(500)
+                return
+            await lock_icon.evaluate("el => el.closest('button,a,div')?.click()")
+            await page.wait_for_timeout(500)
+            return
+    except Exception:
+        pass
 
 
 async def _jj_set_one_year_date(page):
-    """JJ 出货管理：建立日期固定扩大到往前 365 天。"""
-    now = datetime.now()
+    """JJ 出货管理：建立日期设为当前时间往前 1 年到当前时间。
+
+    截图确认实际字段是 Ransack 的 q[created_at_gte] / q[created_at_lte]，
+    type=text，value 使用 ISO datetime（含 +08:00）。
+    """
+    from datetime import timezone
+
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz)
     start_dt = now - timedelta(days=365)
 
-    # Rails/Ransack 页面实际字段通常为 q_created_at_gteq / q_created_at_lteq。
-    exact_pairs = [
+    pairs = [
+        ("input[name='q[created_at_gte]']", "input[name='q[created_at_lte]']"),
+        ("#q_created_at_gte", "#q_created_at_lte"),
         ("#q_created_at_gteq", "#q_created_at_lteq"),
         ("input[name='q[created_at_gteq]']", "input[name='q[created_at_lteq]']"),
-        ("#q_created_at_gteq_date", "#q_created_at_lteq_date"),
     ]
-    for a, b in exact_pairs:
-        first = page.locator(a).first
-        second = page.locator(b).first
+
+    def value_for(dt):
+        return dt.isoformat(timespec="seconds")
+
+    for start_sel, end_sel in pairs:
+        first = page.locator(start_sel).first
+        second = page.locator(end_sel).first
         try:
-            if await first.count() and await second.count() and await first.is_visible() and await second.is_visible():
-                for el, dt in [(first, start_dt), (second, now)]:
-                    typ = await el.get_attribute("type")
-                    if typ == "date":
-                        await el.fill(dt.strftime("%Y-%m-%d"))
-                    elif typ == "datetime-local":
-                        await el.fill(dt.strftime("%Y-%m-%dT%H:%M"))
-                    else:
-                        await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
+            if await first.count() and await second.count():
+                await first.wait_for(state="visible", timeout=3000)
+                await second.wait_for(state="visible", timeout=3000)
+                if await first.is_disabled() or await second.is_disabled():
+                    continue
+                await first.fill(value_for(start_dt))
+                await second.fill(value_for(now))
                 return
         except Exception:
-            pass
+            continue
 
-    # 备用：根据「建立日期」文字所在 form-group 找左右两个输入框。
-    for text in ["建立日期", "建立日期"]:
-        try:
-            label = page.get_by_text(text, exact=True).first
-            if await label.count() and await label.is_visible():
-                ancestor = label.locator("xpath=../../..")
+    # 备用：根据「建立日期」的 form-group 找两个输入框。
+    try:
+        label = page.get_by_text("建立日期", exact=True).first
+        if await label.count() and await label.is_visible():
+            for level in range(1, 5):
+                ancestor = label.locator("xpath=" + "/.." * level)
                 inputs = ancestor.locator("input:not([type='hidden']):not([type='radio'])")
                 if await inputs.count() >= 2:
-                    vals = [inputs.nth(0), inputs.nth(1)]
-                    for el, dt in [(vals[0], start_dt), (vals[1], now)]:
-                        typ = await el.get_attribute("type")
-                        if typ == "date":
-                            await el.fill(dt.strftime("%Y-%m-%d"))
-                        elif typ == "datetime-local":
-                            await el.fill(dt.strftime("%Y-%m-%dT%H:%M"))
-                        else:
-                            await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
-                    return
-        except Exception:
-            pass
-
-    # 最后兼容：从搜索表单中找日期型/带 created_at 的可见输入框。
-    form = page.locator("#guest_payment_order_search").first
-    inputs = form.locator("input") if await form.count() else page.locator("input")
-    found = []
-    for i in range(await inputs.count()):
-        el = inputs.nth(i)
-        try:
-            if not await el.is_visible() or await el.is_disabled():
-                continue
-            typ = await el.get_attribute("type") or ""
-            name = (await el.get_attribute("name") or "").lower()
-            eid = (await el.get_attribute("id") or "").lower()
-            if typ in ("date", "datetime-local") or "created_at" in name or "created_at" in eid:
-                found.append(el)
-        except Exception:
-            pass
-    if len(found) >= 2:
-        for el, dt in [(found[0], start_dt), (found[1], now)]:
-            typ = await el.get_attribute("type")
-            if typ == "date":
-                await el.fill(dt.strftime("%Y-%m-%d"))
-            elif typ == "datetime-local":
-                await el.fill(dt.strftime("%Y-%m-%dT%H:%M"))
-            else:
-                await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
-        return
+                    first, second = inputs.nth(0), inputs.nth(1)
+                    if await first.is_visible() and await second.is_visible() and not await first.is_disabled() and not await second.is_disabled():
+                        await first.fill(value_for(start_dt))
+                        await second.fill(value_for(now))
+                        return
+    except Exception:
+        pass
 
     raise Exception("JJ 找不到【建立日期】起止时间输入框")
 
@@ -1783,8 +1781,13 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel|{task_id}")]
             ])
+            task_status_text = (
+                "⏳ <b>已轮到当前单笔任务，正在自动建店中，请稍候...</b>"
+                if is_single
+                else "⏳ <b>已轮到当前任务，正在自动建店中，请稍候...</b>"
+            )
             await status_msg.edit_text(
-                "⏳ <b>已轮到当前任务，正在自动建店中，请稍候...</b>",
+                task_status_text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
