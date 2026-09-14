@@ -306,12 +306,12 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
-# 3. Playwright 自动化建店逻辑 (全部商城)
+# 3. Playwright 自动化建店逻辑
 async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
     if not ADMIN_USER or not ADMIN_PASS:
-        raise Exception("未检测到 ADMIN_USER 或 ADMIN_PASS！")
+        raise Exception("未检测到 ADMIN_USER / ADMIN_PASS！")
 
     base_account = info.get("account")
     suffix_num = 0
@@ -340,26 +340,24 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             # 1. 登录后台
             await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
             user_input = page.locator(
-                "input[name='market_manager[username]'], #admin_user_email, #user_email, input[type='email'], input[name='email'], input[name='login'], input[name='username'], input[type='text']"
+                "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
             ).first
 
             try:
                 await user_input.wait_for(state="visible", timeout=20000)
             except Exception:
-                raise Exception(f"无法找到登录框！标题 【{await page.title()}】，地址 {page.url}")
+                raise Exception(f"无法找到登录框！标题: 【{await page.title()}】，地址: {page.url}")
 
             await user_input.fill(ADMIN_USER)
             await page.locator("#admin_user_password, #user_password, input[type='password']").first.fill(ADMIN_PASS)
-
+            
             submit_btn = page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first
             await submit_btn.click()
             await page.wait_for_load_state("domcontentloaded")
 
-            domain_root = "/".join(BASE_ADMIN_URL.split("/")[:3])
-
             async def search_account(acc_name: str):
-                await page.goto(f"{domain_root}/merchants", wait_until="domcontentloaded")
-                search_input = page.locator("input[name='account'], #search_account, input[type='search'], input[type='text']").first
+                await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
+                search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
                 await search_input.wait_for(state="visible", timeout=20000)
                 await search_input.fill(acc_name)
 
@@ -371,10 +369,10 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
                 await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
-            # 2. 递增后缀建店
+            # 2. 尝试递增后缀建店
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{domain_root}/merchants/new", wait_until="domcontentloaded")
+                await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
                 await page.locator("#merchant_username").wait_for(state="visible", timeout=20000)
 
                 await page.locator("#merchant_username").fill(current_account)
@@ -451,16 +449,16 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 try:
                     await coro
                 except Exception as sub_e:
-                    print(f"⚠️ [{step_name}] 执行失败或超时: {sub_e}")
+                    print(f"⚠️ [{step_name}] 执行失败或超时（不影响建店主体）: {sub_e}")
 
             # 4. 批量商品
             async def step_items():
                 await click_and_wait_element(
-                    page.locator("tbody tr").first.locator("a[href$='items']"),
-                    page.locator("a[href='items/new'], a:has-text('導入商品')").first
+                    page.locator("tbody tr").first.locator("a[href$='/items']"),
+                    page.locator("a[href*='/items/new'], a:has-text('導入商品')").first
                 )
                 await click_and_wait_element(
-                    page.locator("a[href='items/new'], a:has-text('導入商品')").first,
+                    page.locator("a[href*='/items/new'], a:has-text('導入商品')").first,
                     page.locator("#count_of_items, input[name='count_of_items']")
                 )
                 await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
@@ -469,16 +467,16 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("导入商品", step_items())
 
-            # 5. 移除默认占位符
+            # 5. 移除默认填充的银行卡占位符
             if info_type != "bank":
                 async def step_remove_placeholder():
                     await search_account(final_account)
-                    await page.locator("tbody tr").first.locator("a[href$='edit']").click()
+                    await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
                     await page.wait_for_load_state("domcontentloaded")
-
+                    
                     bank_section = page.locator(".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)").first
                     remove_btn = bank_section.locator("a.remove_fields, a:has-text('移除')").first
-
+                    
                     if not await remove_btn.is_visible():
                         remove_btn = page.locator("a.remove_fields, a:has-text('移除')").first
 
@@ -493,11 +491,11 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             async def step_deposit():
                 await search_account(final_account)
                 await click_and_wait_element(
-                    page.locator("tbody tr").first.locator("a[href$='deposits']"),
-                    page.locator("a[href$='deposits/new'], a:has-text('輸入出貨訂單')").first
+                    page.locator("tbody tr").first.locator("a[href$='/deposits']"),
+                    page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單')").first
                 )
                 await click_and_wait_element(
-                    page.locator("a[href$='deposits/new'], a:has-text('輸入出貨訂單')").first,
+                    page.locator("a[href$='/deposits/new'], a:has-text('輸入出貨訂單')").first,
                     page.locator("#quantity, input[name='quantity']")
                 )
                 await page.locator("#quantity, input[name='quantity']").fill("6000")
@@ -510,12 +508,12 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             async def step_withdraw():
                 await search_account(final_account)
                 await click_and_wait_element(
-                    page.locator("tbody tr").first.locator("a[href$='withdraws']"),
-                    page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href='withdraws/new']").first
+                    page.locator("tbody tr").first.locator("a[href$='/withdraws']"),
+                    page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href*='/withdraws/new']").first
                 )
-                withdraw_btn = page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href='withdraws/new']").first
+                withdraw_btn = page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href*='/withdraws/new']").first
                 await withdraw_btn.click()
-
+                
                 qty_input = page.locator("#quantity, input[name='quantity']")
                 await qty_input.wait_for(state="visible", timeout=20000)
                 await qty_input.fill("6000")
@@ -526,9 +524,9 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             msg_text = (
                 "✅ <b>建店完成！</b>\n\n"
-                f"店铺网址： <code>{html.escape(shop_url)}</code>\n"
-                f"登入帳號： <code>{html.escape(final_account)}</code>\n"
-                "登入密码： <code>a12345</code>"
+                f"店铺网址 : <code>{html.escape(shop_url)}</code>\n"
+                f"登入帳號 : <code>{html.escape(final_account)}</code>\n"
+                "登入密码 : <code>a12345</code>"
             )
             return msg_text, final_account
         except PlaywrightTimeoutError:
@@ -1005,65 +1003,75 @@ async def _jj_open_outbound(page):
 
 
 async def _jj_unlock_search_range(page):
-    # 截图确认的解暗锁区域：.toggle-order-search-days-btn-placeholder
-    # 锁住时日期输入框会被页面锁定；先点击外层，再确认输入框可用。
-    placeholder = page.locator(
-        ".toggle-order-search-days-btn-placeholder"
-    ).first
-    lock_icon = page.locator(
-        ".toggle-order-search-days-btn-placeholder .fa-lock, "
-        ".toggle-order-search-days-btn-placeholder i.fa-lock, "
-        ".lock-btn"
-    ).first
-
-    for loc in [placeholder, lock_icon]:
-        try:
-            if await loc.count() and await loc.is_visible():
-                await loc.click(force=True)
-                await page.wait_for_timeout(500)
-                break
-        except Exception:
-            continue
-
-    start_input = page.locator("#q_created_at_gte").first
+    # JJ 出货管理页面的日期范围有“暗锁”。截图确认按钮容器为
+    # .toggle-order-search-days-btn-placeholder；锁图标本身可能带 hide，
+    # 所以优先点击容器，不依赖图标是否可见。
     try:
-        await start_input.wait_for(state="attached", timeout=5000)
+        placeholder = page.locator(".toggle-order-search-days-btn-placeholder").first
+        if await placeholder.count():
+            try:
+                await placeholder.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            try:
+                await placeholder.click(force=True, timeout=5000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
     except Exception:
-        raise Exception("JJ 找不到【建立日期】起始时间输入框")
+        pass
 
-    # 如果仍为 disabled，再点一次解锁区域。
+    # 实际字段以 DevTools 确认的 id 为主，同时保留 name 作为兼容。
+    start_input = page.locator("#q_created_at_gte, input[name='q[created_at_gte]']").first
+    end_input = page.locator("#q_created_at_lte, input[name='q[created_at_lte]']").first
+
     try:
-        if await start_input.is_disabled():
-            for loc in [placeholder, lock_icon]:
-                try:
-                    if await loc.count() and await loc.is_visible():
-                        await loc.click(force=True)
-                        await page.wait_for_timeout(500)
-                        break
-                except Exception:
-                    continue
+        await start_input.wait_for(state="attached", timeout=10000)
+        await end_input.wait_for(state="attached", timeout=10000)
+    except Exception:
+        # 如果这里仍失败，把当前页面实际 input 的 id/name 一并报出来，方便下一次定位，
+        # 不再只报一个猜测 selector。
+        try:
+            inputs = await page.locator("input").evaluate_all(
+                "els => els.map(e => ({id:e.id, name:e.name, type:e.type})).filter(x => x.id || x.name)"
+            )
+            relevant = [x for x in inputs if "created" in (x.get("id", "") + " " + x.get("name", "")).lower()]
+        except Exception:
+            relevant = []
+        raise Exception(f"JJ 找不到【建立日期】输入框；当前URL：{page.url}；相关字段：{relevant}")
+
+    # 暗锁如果仍然让输入框 disabled，再点一次容器。
+    try:
+        if await start_input.is_disabled() or await end_input.is_disabled():
+            placeholder = page.locator(".toggle-order-search-days-btn-placeholder").first
+            if await placeholder.count():
+                await placeholder.click(force=True, timeout=5000)
+                await page.wait_for_timeout(500)
     except Exception:
         pass
 
 
 async def _jj_set_one_year_date(page):
-    # 截图确认实际字段：#q_created_at_gte / #q_created_at_lte。
-    start_input = page.locator("#q_created_at_gte").first
-    end_input = page.locator("#q_created_at_lte").first
+    # DevTools 已确认：
+    #   开始：#q_created_at_gte
+    #   结束：#q_created_at_lte
+    start_input = page.locator("#q_created_at_gte, input[name='q[created_at_gte]']").first
+    end_input = page.locator("#q_created_at_lte, input[name='q[created_at_lte]']").first
 
     await start_input.wait_for(state="visible", timeout=10000)
     await end_input.wait_for(state="visible", timeout=10000)
 
     now = datetime.now()
     start = now - timedelta(days=365)
-    # JJ 页面实际 value 带 +08:00。
     start_value = start.strftime("%Y-%m-%dT%H:%M:%S+08:00")
     end_value = now.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
     async def set_value(loc, value):
         await loc.evaluate(
             """(el, value) => {
-                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                ).set;
                 setter.call(el, value);
                 el.dispatchEvent(new Event('input', {bubbles:true}));
                 el.dispatchEvent(new Event('change', {bubbles:true}));
@@ -1074,19 +1082,20 @@ async def _jj_set_one_year_date(page):
 
     try:
         if await start_input.is_disabled() or await end_input.is_disabled():
-            raise Exception("日期输入框仍处于锁定状态")
+            raise Exception("JJ【建立日期】仍处于暗锁状态")
     except Exception as e:
-        if "锁定" in str(e):
+        if "暗锁" in str(e):
             raise
 
     await set_value(start_input, start_value)
     await set_value(end_input, end_value)
 
-    # 验证页面实际 value，避免日期插件吞掉 fill。
     actual_start = await start_input.input_value()
     actual_end = await end_input.input_value()
     if not actual_start or not actual_end:
-        raise Exception("JJ【建立日期】无法写入查询时间")
+        raise Exception(
+            f"JJ【建立日期】写入失败：开始={actual_start!r}，结束={actual_end!r}"
+        )
 
 
 async def _jj_find_order_input(page, kind):
