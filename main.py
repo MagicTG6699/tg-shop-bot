@@ -1188,7 +1188,7 @@ async def _jj_search(page, order_no, kind):
 
     # 搜索后等待真正的结果行出现；截图确认结果行 id 为 guest_payment_order_<UUID>。
     try:
-        await page.locator(f"tr#guest_payment_order_{order_no}").wait_for(state="attached", timeout=8000)
+        await page.locator(f"xpath=//tr[@id='guest_payment_order_{order_no}']").wait_for(state="attached", timeout=15000)
     except Exception:
         try:
             await page.locator("span.short-uuid[data-origin-uuid]").first.wait_for(state="attached", timeout=5000)
@@ -1263,11 +1263,18 @@ async def _extract_jj_row(page, order_no=""):
     # 且 span.short-uuid 的 data-origin-uuid 也保存完整 UUID。
     # 因此先用“结果行 id”精确定位，再用 data-origin-uuid 双重确认。
     try:
-        exact_row = page.locator(f"tr#guest_payment_order_{order_no}").first
+        exact_row = page.locator(f"xpath=//tr[@id='guest_payment_order_{order_no}']").first
         if await exact_row.count():
             h, c = await row_to_data(exact_row)
             if c:
                 return h, c
+            # 即使 td 解析异常，也保留整行文字，后面的固定列解析可以继续处理。
+            try:
+                text = _clean_text_value(await exact_row.inner_text())
+                if text:
+                    return [], [text]
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -1497,7 +1504,7 @@ async def _query_jj_order(single_order_no, task_id):
             row_html = ""
             try:
                 exact_status_row = page.locator(
-                    f"tr#guest_payment_order_{single_order_no}"
+                    f"xpath=//tr[@id='guest_payment_order_{single_order_no}']"
                 ).first
                 if await exact_status_row.count():
                     row_status_text = _clean_text_value(await exact_status_row.inner_text())
