@@ -1444,18 +1444,49 @@ async def _query_jj_order(single_order_no, task_id):
             if not cells:
                 raise Exception(f"JJ 找不到订单：{single_order_no}")
 
+            # JJ 的状态实际位于目标订单这一行最右侧，页面显示类似：
+            # 「成功（已補單）」/「成功（已补单）」或「失败（失敗）」。
+            # 不能只依赖 thead 的「状态」表头，因为该后台部分版本的表头
+            # 并不放在标准 <thead>，导致之前 status_text 为空。
             status_text = _cell_by_header(headers, cells, ["状态", "狀態"])
             full_row = " | ".join(cells)
-            if not status_text:
-                status_text = full_row
 
-            is_failed = "失败" in status_text or "失敗" in status_text
-            is_success = "成功" in status_text and not is_failed
+            # 第一优先：直接读取“精确订单行”的完整 inner_text，再从该行识别状态。
+            # 这样不会把页面上方统计卡片的「成功订单数」误认为订单状态。
+            row_status_text = ""
+            try:
+                exact_status_row = page.locator(f"tr#guest_payment_order_{single_order_no}").first
+                if await exact_status_row.count():
+                    row_status_text = _clean_text_value(await exact_status_row.inner_text())
+            except Exception:
+                pass
+
+            combined_status_source = row_status_text or status_text or full_row
+            # 成功状态允许「成功」「成功（已補單）」「成功（已补单）」等版本。
+            # 失败同理；失败订单没有貨運/配送时间是正常情况。
+            success_match = re.search(r"成功(?:\s*[（(][^）)]*(?:補單|补单)[^）)]*[）)])?", combined_status_source, re.I)
+            failed_match = re.search(r"(?:失败|失敗)(?:\s*[（(][^）)]*[^）)]*[）)])?", combined_status_source, re.I)
+
+            is_failed = bool(failed_match) and not bool(success_match)
+            is_success = bool(success_match)
+
+            # 如果精确行没有抓到状态，再扫描当前结果表格中“状态”相关的单元格，
+            # 但只接受包含成功/失败字样的单元格，避免被其他字段干扰。
             if not is_success and not is_failed:
-                # 有些页面把 100% 放在状态栏。
-                is_success = "100%" in full_row
-                if not is_success:
-                    raise Exception(f"JJ 订单状态无法判断：{full_row[:500]}")
+                for cell in cells:
+                    nc = _clean_text_value(cell)
+                    if re.search(r"(?:成功|成功（已補單）|成功（已补单）)", nc, re.I):
+                        is_success = True
+                        status_text = nc
+                        break
+                    if re.search(r"(?:失败|失敗)", nc, re.I):
+                        is_failed = True
+                        status_text = nc
+                        break
+
+            if not is_success and not is_failed:
+                # 只有在确实无法从目标订单行判断时才报错。
+                raise Exception(f"JJ 订单状态无法判断：{combined_status_source[:800]}")
 
             order_no = _cell_by_header(headers, cells, ["平台订单", "平台訂單", "订单号", "訂單號"])
             recipient_raw = _cell_by_header(headers, cells, ["商户会员", "商戶會員", "实名", "實名", "收件人", "收件人姓名"])
