@@ -591,9 +591,49 @@ def _random_delivery_time(created_time: datetime) -> datetime:
 
 
 def _parse_jj_datetime(value: str):
+    """解析 JJ 时间；兼容完整日期、中文日期，以及截图中的“01月19日 08:30”。
+
+    JJ 当前结果表的第一列实际显示的是“提交时间”，例如：
+    01月19日 08:30\n    东京都东京\n    页面没有显示年份，因此这里使用当前北京时间年份，并在日期落在未来时回退一年。
+    这样不会因为“建立时间”列不存在而把一个已经找到的订单误判为查询失败。
+    """
     value = _clean_text_value(value)
     if not value:
         return None
+
+    # 先从整段文字里抓出日期时间，避免“东京都东京”等地点文字干扰。
+    m = re.search(
+        r"(\d{4})[年./-](\d{1,2})[月./-](\d{1,2})(?:日)?[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?",
+        value,
+    )
+    if m:
+        try:
+            return datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), int(m.group(6) or 0)
+            )
+        except ValueError:
+            pass
+
+    # JJ 截图目前实际格式：01月19日 08:30（没有年份）。
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?", value)
+    if m:
+        try:
+            from datetime import timezone
+            tz8 = timezone(timedelta(hours=8))
+            now = datetime.now(tz8).replace(tzinfo=None)
+            candidate = datetime(
+                now.year, int(m.group(1)), int(m.group(2)),
+                int(m.group(3)), int(m.group(4)), int(m.group(5) or 0)
+            )
+            # 如果无年份的日期明显落在当前时间之后，按上一年处理。
+            if candidate > now + timedelta(days=1):
+                candidate = candidate.replace(year=candidate.year - 1)
+            return candidate
+        except ValueError:
+            pass
+
+    # 最后兼容普通纯日期字符串。
     formats = [
         "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M",
         "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
@@ -1186,10 +1226,10 @@ async def _extract_jj_row(page, order_no=""):
         """把各种可能的行容器转换成 headers/cells。"""
         try:
             # 标准 table 行
-            cells = row.locator("td")
+            cells = row.locator(":scope > td")
             if await cells.count():
                 table = row.locator("xpath=ancestor::table[1]").first
-                headers = table.locator("thead th") if await table.count() else page.locator("thead th")
+                headers = table.locator(":scope > thead > tr > th") if await table.count() else page.locator("thead > tr > th")
                 header_count = await headers.count()
                 header_texts = [
                     _normalize_header(await headers.nth(i).inner_text())
@@ -1310,13 +1350,13 @@ async def _extract_jj_row(page, order_no=""):
         try:
             if not await table.is_visible():
                 continue
-            rows = table.locator("tbody tr")
+            rows = table.locator("tbody > tr")
             row_count = await rows.count()
             if row_count == 0:
-                rows = table.locator("tr")
+                rows = table.locator(":scope > tr")
                 row_count = await rows.count()
 
-            headers = table.locator("thead th")
+            headers = table.locator("thead > tr > th")
             header_count = await headers.count()
             header_texts = [
                 _normalize_header(await headers.nth(i).inner_text())
@@ -1352,13 +1392,13 @@ async def _extract_jj_row(page, order_no=""):
                         pass
 
                 if matched:
-                    cells = row.locator("td")
+                    cells = row.locator(":scope > td")
                     cell_texts = [_clean_text_value(await cells.nth(i).inner_text())
                                   for i in range(await cells.count())]
                     return header_texts, cell_texts
 
                 if row_count == 1:
-                    cells = row.locator("td")
+                    cells = row.locator(":scope > td")
                     cell_texts = [_clean_text_value(await cells.nth(i).inner_text())
                                   for i in range(await cells.count())]
                     if cell_texts:
@@ -1543,6 +1583,16 @@ async def _query_jj_order(single_order_no, task_id):
                 is_success = bool(success_match)
                 is_failed = bool(failed_match) and not is_success
 
+            # 最后的 cells 兜底：优先检查 JJ 当前页面确认的第 14 个外层栏位（索引 13）。
+            if not is_success and not is_failed and len(cells) > 13:
+                direct_status = _clean_text_value(cells[13])
+                if re.search(r"成功", direct_status, re.I):
+                    is_success = True
+                    status_text = direct_status
+                elif re.search(r"(?:失败|失敗)", direct_status, re.I):
+                    is_failed = True
+                    status_text = direct_status
+
             # 最后的 cells 兜底：只扫描当前目标订单行，不扫描页面其它区域。
             if not is_success and not is_failed:
                 for cell in cells:
@@ -1562,14 +1612,41 @@ async def _query_jj_order(single_order_no, task_id):
             order_no = _cell_by_header(headers, cells, ["平台订单", "平台訂單", "订单号", "訂單號"])
             recipient_raw = _cell_by_header(headers, cells, ["商户会员", "商戶會員", "实名", "實名", "收件人", "收件人姓名"])
             amount = _cell_by_header(headers, cells, ["交易金额", "交易金額", "金额", "金額"])
+            created = _cell_by_header(headers, cells, [
+                "建立时间", "建立時間", "创建时间", "創建時間",
+                "提交时间", "提交時間"
+            ])
+            completed = _cell_by_header(headers, cells, ["完成时间", "完成時間"])
+
+            # JJ 当前截图确认的外层表格固定顺序：
+            # 0 提交时间、1 完成时间、2 订单号、3 平台会员、4 採購方、
+            # 5 商户会员、6 出货平台、7 交易金额、8 金流、9 图片、10 等待时长、
+            # 11 到期时间、12 异常回报、13 状态、14 操作。
+            # 如果某个版本没有标准 thead，直接使用这些外层 td 的位置。
+            if len(cells) >= 8:
+                if not recipient_raw and len(cells) > 5:
+                    recipient_raw = cells[5]
+                if not amount and len(cells) > 7:
+                    amount = cells[7]
+                if not created and len(cells) > 0:
+                    created = cells[0]
+                if not completed and len(cells) > 1:
+                    completed = cells[1]
+                if not status_text and len(cells) > 13:
+                    status_text = cells[13]
+
             # JJ 后台目前显示为「貨運」；同时兼容未来改成简体「货运」、
             # 「运单号/運單號」等字段名称。失败订单没有貨運是正常状态。
             shipment = _cell_by_header(headers, cells, [
                 "运单号", "運單號", "货运", "貨運",
                 "物流单号", "物流單號", "货号", "貨號"
             ])
-            created = _cell_by_header(headers, cells, ["建立时间", "建立時間", "创建时间", "創建時間", "提交时间", "提交時間"])
-            completed = _cell_by_header(headers, cells, ["完成时间", "完成時間"])
+            # 如果表头定位不到（某些 JJ 版本没有标准 thead），
+            # 当前页面的第一列就是提交时间，直接使用第一格。
+            if not created and cells:
+                first_cell = _clean_text_value(cells[0])
+                if re.search(r"\d{1,2}\s*月\s*\d{1,2}\s*日|\d{4}[年./-]\d{1,2}[月./-]\d{1,2}", first_cell):
+                    created = first_cell
 
             # 没有 header 时，从整行文本中提取金额/日期。
             if not amount:
