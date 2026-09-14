@@ -379,7 +379,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
                 await page.locator("#merchant_username").wait_for(state="visible", timeout=20000)
 
-                await page.locator("#merchant_username").fill(current_account)
+                await merchant_username.fill(current_account)
                 if await page.locator("#merchant_password").is_visible():
                     await page.locator("#merchant_password").fill("a12345")
                 if await page.locator("#merchant_password_confirmation").is_visible():
@@ -400,7 +400,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 default_num = "6226220809397366"
 
                 bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']").first
-                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
+                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_branch_name, #merchant_bank_accounts_attributes_0_branch_name, input[id$='_bank_branch_name'], input[id$='_branch_name']").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']").first
 
                 if info_type == "bank":
@@ -603,14 +603,7 @@ def _parse_jj_datetime(value: str):
             return datetime.strptime(value, fmt)
         except ValueError:
             pass
-    try:
-        v = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(v)
-        if dt.tzinfo is not None:
-            dt = dt.replace(tzinfo=None)
-        return dt
-    except Exception:
-        return None
+    return None
 
 
 async def _login_generic(page, url, username, password, use_totp=False):
@@ -799,9 +792,20 @@ async def _create_single_shop(info: dict, task_id: str):
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{SINGLE_ADMIN_ROOT}/merchants/new", wait_until="domcontentloaded")
-                await page.locator("#merchant_username").wait_for(state="visible", timeout=20000)
-                await page.locator("#merchant_username").fill(current_account)
+                await page.goto(f"{SINGLE_ADMIN_ROOT}/market_manager/merchants/new", wait_until="domcontentloaded")
+                merchant_username = page.locator("#merchant_username").first
+                try:
+                    await merchant_username.wait_for(state="visible", timeout=20000)
+                except Exception:
+                    current_url = page.url
+                    title = await page.title()
+                    body_preview = ""
+                    try:
+                        body_preview = (await page.locator("body").inner_text())[:500].replace("\n", " ")
+                    except Exception:
+                        pass
+                    raise Exception(f"单笔商城未进入【新增商户】页面；当前地址：{current_url}；标题：{title}；页面内容：{body_preview}")
+                await merchant_username.fill(current_account)
 
                 for sel in ["#merchant_password", "#merchant_password_confirmation"]:
                     loc = page.locator(sel)
@@ -811,16 +815,12 @@ async def _create_single_shop(info: dict, task_id: str):
                 sprite = page.locator("#merchant_sprite_platform")
                 if await sprite.count() and await sprite.is_visible():
                     try:
-                        if await sprite.is_enabled():
-                            try:
-                                await sprite.select_option(label="jj")
-                            except Exception:
-                                try:
-                                    await sprite.select_option(value="jj")
-                                except Exception:
-                                    pass
+                        await sprite.select_option(label="jj")
                     except Exception:
-                        pass
+                        try:
+                            await sprite.select_option(value="jj")
+                        except Exception:
+                            pass
 
                 for sel, val in [
                     ("#merchant_account_name", info.get("name", "")),
@@ -835,7 +835,7 @@ async def _create_single_shop(info: dict, task_id: str):
                     "#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']"
                 ).first
                 branch_name_input = page.locator(
-                    "#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']"
+                    "#merchant_bank_accounts_attributes_0_bank_branch_name, #merchant_bank_accounts_attributes_0_branch_name, input[id$='_bank_branch_name'], input[id$='_branch_name']"
                 ).first
                 card_no_input = page.locator(
                     "#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']"
@@ -989,7 +989,7 @@ async def _jj_unlock_search_range(page):
         pass
 
     # 否则点击用户截图中的锁按钮
-    for loc in [lock, page.locator(".toggle-order-search-days-btn-placeholder, .toggle-search-days-btn-placeholder").first]:
+    for loc in [lock, page.locator(".toggle-search-days-btn-placeholder").first]:
         try:
             if await loc.count() and await loc.is_visible():
                 await loc.click()
@@ -1009,58 +1009,74 @@ async def _jj_unlock_search_range(page):
 
 
 async def _jj_set_one_year_date(page):
-    """把 JJ 的「建立日期」查询范围固定为最近一年。截图已确认真实 ID。"""
     now = datetime.now()
-    start_dt = now - timedelta(days=365)
+    start = now - timedelta(days=365)
+    end = now
 
-    start_input = page.locator("#q_created_at_gte").first
-    end_input = page.locator("#q_created_at_lte").first
-
-    if await start_input.count() == 0:
-        start_input = page.locator("input[name='q[created_at_gte]']").first
-    if await end_input.count() == 0:
-        end_input = page.locator("input[name='q[created_at_lte]']").first
-
-    if await start_input.count() == 0 or await end_input.count() == 0:
-        raise Exception("JJ 找不到建立日期范围输入框（q_created_at_gte / q_created_at_lte）")
-
-    # 页面是 datetime 文本框/日期选择器，直接设置 value 并触发 input/change，
-    # 比点击日期选择器逐月回退可靠很多。
-    start_value = start_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    end_value = now.strftime("%Y-%m-%dT%H:%M:%S+08:00")
-
-    async def set_value(loc, value):
-        await loc.scroll_into_view_if_needed()
+    # 截图中建立日期是一组 date/time 输入。优先按 name/id 中的 created_at 搜索。
+    date_inputs = page.locator(
+        "input[type='date'], input[name*='start'], input[name*='begin'], "
+        "input[name*='created'], input[id*='start'], input[id*='begin'], input[id*='created']"
+    )
+    visible = []
+    count = await date_inputs.count()
+    for i in range(count):
+        el = date_inputs.nth(i)
         try:
-            await loc.fill(value)
+            if await el.is_visible():
+                visible.append(el)
         except Exception:
-            await loc.evaluate(
-                """(el, value) => {
-                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                    setter.call(el, value);
-                    el.dispatchEvent(new Event('input', {bubbles:true}));
-                    el.dispatchEvent(new Event('change', {bubbles:true}));
-                    el.dispatchEvent(new Event('blur', {bubbles:true}));
-                }""",
-                value,
-            )
+            pass
 
-    await set_value(start_input, start_value)
-    await set_value(end_input, end_value)
+    if len(visible) >= 2:
+        # 仅对 date 类型直接填 YYYY-MM-DD；datetime-local 则带时间
+        for el, dt in [(visible[0], start), (visible[1], end)]:
+            typ = await el.get_attribute("type")
+            if typ == "date":
+                await el.fill(dt.strftime("%Y-%m-%d"))
+            elif typ == "datetime-local":
+                await el.fill(dt.strftime("%Y-%m-%dT%H:%M"))
+            else:
+                await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
+        return
 
-    # 某些版本会把值格式化成带空格的形式，再检查一次；若为空则用备用格式。
-    sv = await start_input.input_value()
-    ev = await end_input.input_value()
-    if not sv or not ev:
-        await set_value(start_input, start_dt.strftime("%Y/%m/%d %H:%M"))
-        await set_value(end_input, now.strftime("%Y/%m/%d %H:%M"))
+    # Rails/jQuery datepicker 常见 text 输入框：从「建立日期」单选旁的输入框取值
+    candidates = page.locator("input[type='text']")
+    vals = []
+    count = await candidates.count()
+    for i in range(count):
+        el = candidates.nth(i)
+        try:
+            if await el.is_visible():
+                ph = (await el.get_attribute("placeholder") or "").lower()
+                nm = (await el.get_attribute("name") or "").lower()
+                if any(k in (ph + " " + nm) for k in ["date", "日期", "日期"]):
+                    vals.append(el)
+        except Exception:
+            pass
+
+    if len(vals) >= 2:
+        await vals[0].fill(start.strftime("%Y/%m/%d 00:00"))
+        await vals[1].fill(end.strftime("%Y/%m/%d 23:59"))
+        return
+
+    # 兜底：截图中建立日期区域位于左上，通常是前两个可见文本框
+    text_inputs = []
+    for i in range(count):
+        el = candidates.nth(i)
+        try:
+            if await el.is_visible():
+                text_inputs.append(el)
+        except Exception:
+            pass
+    if len(text_inputs) >= 2:
+        await text_inputs[0].fill(start.strftime("%Y/%m/%d 00:00"))
+        await text_inputs[1].fill(end.strftime("%Y/%m/%d 23:59"))
 
 
 async def _jj_find_order_input(page, kind):
     if kind == "platform":
         selectors = [
-            "#q_id",
-            "input[name='q[id]']",
             "input[name*='platform_order']",
             "input[id*='platform_order']",
             "input[placeholder*='平台订单']",
@@ -1068,9 +1084,6 @@ async def _jj_find_order_input(page, kind):
         ]
     else:
         selectors = [
-            "#q_merchant_order_id_or_order_trade_id",
-            "input[name='q[merchant_order_id_or_order_trade_id]']",
-            "input[name*='merchant_order_id_or_order_trade_id']",
             "input[name*='other_order']",
             "input[id*='other_order']",
             "input[placeholder*='其他订单']",
@@ -1245,19 +1258,17 @@ async def _query_jj_order(single_order_no, task_id):
 
 
 async def _single_recharge(page, account, jj_result):
-    """单笔商城：进入充值页并按 JJ 订单结果真实提交新增充值。"""
+    # 单笔商城充值入口：商户资料页 -> 充值管理
     await _single_search_account(page, account)
 
     recharge_link = page.locator(
         "a:has-text('充值管理'), a:has-text('商户充值管理'), "
-        "a:has-text('商戶充值管理'), a[href*='/deposits/new'], a[href*='/deposit']"
+        "a[href*='/deposits/new'], a[href*='/deposit']"
     ).first
 
-    if await recharge_link.count() == 0 or not await recharge_link.is_visible():
-        menu = page.locator(
-            "a:has-text('商户充值管理'), a:has-text('商戶充值管理'), "
-            "a[href*='/deposits/new'], a[href*='/deposit']"
-        ).first
+    if not await recharge_link.is_visible():
+        # 如果商户行里没有直接链接，尝试菜单入口
+        menu = page.locator("a:has-text('商户充值管理'), a:has-text('商戶充值管理')").first
         if await menu.count() and await menu.is_visible():
             await menu.click()
         else:
@@ -1267,158 +1278,138 @@ async def _single_recharge(page, account, jj_result):
 
     await page.wait_for_load_state("domcontentloaded")
 
-    # 1. 商户：真实字段 deposit_order[merchant_id]
+    # 商户：优先使用刚创建账号的 option
     merchant_select = await _first_visible(page, [
         "#deposit_order_merchant_id",
         "select[name='deposit_order[merchant_id]']",
-    ], timeout=10000)
-    if not merchant_select:
-        raise Exception("充值页面找不到【商户】下拉框")
-
-    # 先确认刚建立的账号确实存在于 option 中
-    options = await merchant_select.locator("option").evaluate_all(
-        "els => els.map(e => ({value:e.value, text:(e.textContent||'').trim()}))"
-    )
-    matched = next((o for o in options if o["text"] == account), None)
-    if not matched:
-        matched = next((o for o in options if account in o["text"]), None)
-    if not matched:
-        raise Exception(f"充值页面找不到刚建立的商户：{account}")
-
-    await merchant_select.select_option(value=matched["value"])
-    await page.wait_for_timeout(500)
-
-    # 2. 银行账号：按规则不手填。商户选择后由后台自动带出。
-    bank_select = page.locator(
-        "#deposit_order_bank_account_id, select[name='deposit_order[bank_account_id]']"
-    ).first
-    if await bank_select.count():
+        "select[name*='deposit_order'][name*='merchant']",
+        "select[name*='merchant_id']",
+    ], timeout=5000)
+    if merchant_select:
         try:
-            if await bank_select.is_visible() and await bank_select.is_disabled():
-                pass
+            await merchant_select.select_option(label=account)
         except Exception:
-            pass
+            try:
+                await merchant_select.select_option(value=account)
+            except Exception:
+                # 如果是可搜索 select，先尝试键盘输入
+                try:
+                    await merchant_select.click()
+                    await merchant_select.press("ArrowDown")
+                    await merchant_select.press("Enter")
+                except Exception:
+                    pass
 
-    # 3. 收件人资讯：真实字段是 deposit_order[shipment_info_id]
-    shipment_info = await _first_visible(page, [
+    # 银行账号：按用户规则不手填，系统自动带入
+    # 收件人资讯：随便选择一个现有选项
+    recipient_info = await _first_visible(page, [
         "#deposit_order_shipment_info_id",
         "select[name='deposit_order[shipment_info_id]']",
-    ], timeout=10000)
-    if not shipment_info:
-        raise Exception("充值页面找不到【收件人资讯】下拉框")
+        "select[name*='shipment_info_id']",
+    ], timeout=3000)
+    if recipient_info:
+        await _select_any_option(recipient_info)
 
-    # 选择第一个真正可用的既有收件人资讯
-    usable = await shipment_info.locator("option").evaluate_all(
-        "els => els.map(e => ({value:e.value, text:(e.textContent||'').trim(), disabled:e.disabled}))"
-    )
-    usable = [o for o in usable if o["value"] not in ("", None) and not o["disabled"]]
-    if not usable:
-        raise Exception("充值页面没有可选择的【收件人资讯】")
-    await shipment_info.select_option(value=usable[0]["value"])
-    await page.wait_for_timeout(300)
-
-    # 4. 买家留言保持空白
+    # 买家留言保持空白
     buyer_comment = page.locator(
-        "#deposit_order_buyer_comment, textarea[name='deposit_order[buyer_comment]']"
+        "#deposit_order_buyer_comment, textarea[name*='buyer_comment']"
     ).first
-    if await buyer_comment.count():
-        try:
+    try:
+        if await buyer_comment.is_visible():
             await buyer_comment.fill("")
+    except Exception:
+        pass
+
+    # 运单号：成功才有
+    shipment = jj_result.get("shipment", "")
+    if shipment:
+        await _fill_by_label(
+            page,
+            ["运单号", "運單號", "货运", "貨運"],
+            shipment,
+            required=False,
+        )
+        # 直接 ID 兜底
+        loc = page.locator(
+            "#deposit_order_shipment_no, input[name*='shipment_no'], input[name*='shipment']"
+        ).first
+        try:
+            if await loc.is_visible():
+                await loc.fill(shipment)
         except Exception:
             pass
 
-    # 5. 运单号：JJ 成功才填写
-    shipment = _clean_text_value(jj_result.get("shipment", ""))
-    shipment_no = page.locator(
-        "#deposit_order_shipment_no, input[name='deposit_order[shipment_no]']"
+    # 收件人姓名：实名空白/数字/明显非人名 -> 管理员代收
+    recipient = jj_result.get("recipient") or MANAGER_RECEIVE_NAME
+    await _fill_by_label(
+        page,
+        ["收件人姓名", "收件人姓名", "收件人", "实名", "實名"],
+        recipient,
+        required=False,
+    )
+    loc = page.locator(
+        "#deposit_order_recipient_name, input[name*='recipient_name']"
     ).first
-    if shipment and await shipment_no.count():
-        await shipment_no.fill(shipment)
+    try:
+        if await loc.is_visible():
+            await loc.fill(recipient)
+    except Exception:
+        pass
 
-    # 6. 收件人姓名：无有效实名则管理员代收
-    recipient = _safe_manager_name(jj_result.get("recipient", ""))
-    recipient_name = page.locator(
-        "#deposit_order_recipient_name, input[name='deposit_order[recipient_name]']"
-    ).first
-    if await recipient_name.count():
-        await recipient_name.fill(recipient)
+    # 金额 = JJ 交易金额
+    amount = jj_result.get("amount", "")
+    if amount:
+        await _fill_by_label(page, ["金额", "金額", "交易金额", "交易金額"], amount, required=False)
+        loc = page.locator(
+            "#deposit_order_total_amount, input[name*='total_amount'], input[name*='amount']"
+        ).first
+        try:
+            if await loc.is_visible():
+                await loc.fill(re.sub(r"[^\d.]", "", amount))
+        except Exception:
+            pass
 
-    # 7. 金额：JJ 交易金额
-    amount_raw = _clean_text_value(jj_result.get("amount", ""))
-    amount = re.sub(r"[^0-9.]", "", amount_raw)
-    if not amount:
-        raise Exception("JJ 订单没有取得有效交易金额，停止提交充值")
-    amount_input = page.locator(
-        "#deposit_order_total_amount, input[name='deposit_order[total_amount]']"
-    ).first
-    if not await amount_input.count():
-        raise Exception("充值页面找不到【金额】输入框")
-    await amount_input.fill(amount)
-
-    # 8. 配送时间：真实字段是 completed_at；成功才填写
+    # 配送时间：成功才生成；失败保持空白
     delivery = jj_result.get("delivery")
     if delivery:
         delivery_text = delivery.strftime("%Y/%m/%d %H:%M")
-        completed_input = page.locator(
-            "#deposit_order_completed_at, input[name='deposit_order[completed_at]']"
+        await _fill_by_label(
+            page,
+            ["配送时间", "配送時間"],
+            delivery_text,
+            required=False,
+        )
+        loc = page.locator(
+            "#deposit_order_completed_at, input[name='deposit_order[completed_at]'], input[name*='completed_at']"
         ).first
-        if not await completed_input.count():
-            raise Exception("充值页面找不到【配送时间】字段 completed_at")
-        await completed_input.fill(delivery_text)
+        try:
+            if await loc.is_visible():
+                await loc.fill(delivery_text)
+        except Exception:
+            pass
 
-    # 9. 建立时间：真实字段 created_at，填 JJ 建立时间
-    created = _clean_text_value(jj_result.get("created", ""))
+    # 建立时间：充值表单截图显示为可选字段。按用户规则以 JJ 建立时间为基准，
+    # 这里填 JJ 建立时间，若后台字段是系统自动值则保留原值。
+    created = jj_result.get("created")
     if created:
-        created_input = page.locator(
-            "#deposit_order_created_at, input[name='deposit_order[created_at]']"
+        loc = page.locator(
+            "#deposit_order_created_at, input[name='deposit_order[created_at]'], input[name*='created_at']"
         ).first
-        if await created_input.count():
-            await created_input.fill(created)
-
-    # 10. 提交前强制检查，避免出现「显示已送出但后台其实没新增」
-    selected_merchant = await merchant_select.input_value()
-    selected_shipment_info = await shipment_info.input_value()
-    if not selected_merchant:
-        raise Exception("提交前检查失败：商户尚未选择")
-    if not selected_shipment_info:
-        raise Exception("提交前检查失败：收件人资讯尚未选择")
-    if not await amount_input.input_value():
-        raise Exception("提交前检查失败：金额为空")
+        try:
+            if await loc.is_visible() and not await loc.input_value():
+                await loc.fill(created)
+        except Exception:
+            pass
 
     submit = page.locator(
-        "input[type='submit'][name='commit'][value='送出']"
-    ).first
-    if not await submit.count() or not await submit.is_visible():
+        "input[type='submit'][value='送出'], input[type='submit'], "
+        "button[type='submit'], button:has-text('送出')"
+    ).last
+    if not await submit.is_visible():
         raise Exception("找不到单笔商城充值的【送出】按钮")
 
     await submit.click()
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=15000)
-    except Exception:
-        pass
-    await page.wait_for_timeout(800)
-
-    # 后台若有验证错误，必须回报错误，不假报成功
-    body = await page.locator("body").inner_text()
-    error_loc = page.locator(
-        ".field_with_errors, .has-error, .alert-danger, .alert-error, .error, .errors"
-    )
-    if await error_loc.count():
-        try:
-            err_text = _clean_text_value(await error_loc.first.inner_text())
-            if err_text:
-                raise Exception(f"充值提交失败：{err_text[:500]}")
-        except Exception as e:
-            if str(e).startswith("充值提交失败："):
-                raise
-
-    error_words = ["不能为空", "不能為空", "必須", "必须", "無效", "无效", "失败", "失敗"]
-    for word in error_words:
-        if word in body:
-            # 只在页面明显出现错误提示时阻止成功
-            if any(k in body for k in ["错误", "錯誤", "失败", "失敗", "不能", "不能为空", "不能為空"]):
-                raise Exception(f"充值提交失败：后台返回【{word}】")
-
+    await page.wait_for_load_state("domcontentloaded")
     return "已送出"
 
 
@@ -1574,7 +1565,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                 [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
             ])
             await status_msg.edit_text(
-                "⏳ <b>已轮到当前单笔任务，正在自动建店中，请稍候...</b>" if is_single else "⏳ <b>已轮到当前任务，正在自动建店中，请稍候...</b>",
+                "⏳ <b>已轮到当前任务，正在自动建店中，请稍候...</b>",
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
