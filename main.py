@@ -718,7 +718,8 @@ async def _select_any_option(select_loc):
 
 async def _single_search_account(page, account):
     domain_root = "/".join(SINGLE_ADMIN_URL.split("/")[:3])
-    await page.goto(f"{domain_root}/market_managers/merchants", wait_until="domcontentloaded")
+    # 修正单数 market_manager 路径
+    await page.goto(f"{domain_root}/market_manager/merchants", wait_until="domcontentloaded")
     search_input = await _first_visible(page, [
         "input[name='account']",
         "#search_account",
@@ -744,7 +745,7 @@ async def _single_search_account(page, account):
     await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
 
-# 适应单笔商城 /market_managers 路由结构的建店函数
+# 适应单笔商城 /market_manager 路由结构的建店函数
 async def _create_single_shop(info: dict, task_id: str):
     if not SINGLE_ADMIN_URL:
         raise Exception("未检测到环境变量 SINGLE_ADMIN_URL！")
@@ -775,14 +776,14 @@ async def _create_single_shop(info: dict, task_id: str):
                 ACTIVE_TASKS[task_id]["page"] = page
 
             # 1. 执行登录 (如果配置没带/sign_in，补全访问)
-            login_target = SINGLE_ADMIN_URL if "sign_in" in SINGLE_ADMIN_URL else f"{domain_root}/market_managers/sign_in"
+            login_target = SINGLE_ADMIN_URL if "sign_in" in SINGLE_ADMIN_URL else f"{domain_root}/market_manager/sign_in"
             await _login_generic(page, login_target, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
 
-                # 2. 跳转至单笔商城的 market_managers/merchants/new 建店路径
-                target_url = f"{domain_root}/market_managers/merchants/new"
+                # 2. 跳转至单笔商城的单数 market_manager/merchants/new 建店路径
+                target_url = f"{domain_root}/market_manager/merchants/new"
                 await page.goto(target_url, wait_until="domcontentloaded")
 
                 # 检查页面是否处于登录状态
