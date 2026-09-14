@@ -823,8 +823,10 @@ async def _create_single_shop(info: dict, task_id: str):
             if "sign_in" in page.url.lower() or "login" in page.url.lower():
                 raise Exception(f"登录状态失效，当前页面：{page.url}")
 
-            # 2. 建店。最多尝试 20 个递增帐号，避免后台验证失败时无限循环。
-            for suffix_num in range(20):
+            # 2. 建店。帐号重复时持续递增，直到真正创建成功。
+            # 不设置 20 次上限：只要后台返回“帐号已存在”，就继续尝试下一个递增帐号。
+            suffix_num = 0
+            while True:
                 current_account = (
                     base_account
                     if suffix_num == 0
@@ -1003,6 +1005,7 @@ async def _create_single_shop(info: dict, task_id: str):
                 )
 
                 if duplicate:
+                    suffix_num += 1
                     continue
 
                 # 如果仍停留在建店表单，说明提交没有成功；不要无限循环。
@@ -1016,8 +1019,7 @@ async def _create_single_shop(info: dict, task_id: str):
 
                 final_account = current_account
                 break
-            else:
-                raise Exception("连续尝试 20 个递增帐号仍无法完成建店，已停止避免无限循环。")
+            # 只有真正离开 /merchants/new 建店页面，才认定本次帐号创建成功。
 
             # 3. 找到刚创建的商户
             await _single_search_account(page, final_account)
@@ -1141,131 +1143,242 @@ async def _jj_unlock_search_range(page):
 
 
 async def _jj_set_one_year_date(page):
+    """JJ 出货管理：建立日期固定扩大到往前 365 天。"""
     now = datetime.now()
-    start = now - timedelta(days=365)
-    end = now
+    start_dt = now - timedelta(days=365)
 
-    date_inputs = page.locator(
-        "input[type='date'], input[name='start'], input[name='begin'], "
-        "input[name='created'], input[id='start'], input[id='begin'], input[id='created']"
-    )
-    visible = []
-    count = await date_inputs.count()
-    for i in range(count):
-        el = date_inputs.nth(i)
+    # Rails/Ransack 页面实际字段通常为 q_created_at_gteq / q_created_at_lteq。
+    exact_pairs = [
+        ("#q_created_at_gteq", "#q_created_at_lteq"),
+        ("input[name='q[created_at_gteq]']", "input[name='q[created_at_lteq]']"),
+        ("#q_created_at_gteq_date", "#q_created_at_lteq_date"),
+    ]
+    for a, b in exact_pairs:
+        first = page.locator(a).first
+        second = page.locator(b).first
         try:
-            if await el.is_visible():
-                visible.append(el)
+            if await first.count() and await second.count() and await first.is_visible() and await second.is_visible():
+                for el, dt in [(first, start_dt), (second, now)]:
+                    typ = await el.get_attribute("type")
+                    if typ == "date":
+                        await el.fill(dt.strftime("%Y-%m-%d"))
+                    elif typ == "datetime-local":
+                        await el.fill(dt.strftime("%Y-%m-%dT%H:%M"))
+                    else:
+                        await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
+                return
         except Exception:
             pass
 
-    if len(visible) >= 2:
-        for el, dt in [(visible[0], start), (visible[1], end)]:
+    # 备用：根据「建立日期」文字所在 form-group 找左右两个输入框。
+    for text in ["建立日期", "建立日期"]:
+        try:
+            label = page.get_by_text(text, exact=True).first
+            if await label.count() and await label.is_visible():
+                ancestor = label.locator("xpath=../../..")
+                inputs = ancestor.locator("input:not([type='hidden']):not([type='radio'])")
+                if await inputs.count() >= 2:
+                    vals = [inputs.nth(0), inputs.nth(1)]
+                    for el, dt in [(vals[0], start_dt), (vals[1], now)]:
+                        typ = await el.get_attribute("type")
+                        if typ == "date":
+                            await el.fill(dt.strftime("%Y-%m-%d"))
+                        elif typ == "datetime-local":
+                            await el.fill(dt.strftime("%Y-%m-%dT%H:%M"))
+                        else:
+                            await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
+                    return
+        except Exception:
+            pass
+
+    # 最后兼容：从搜索表单中找日期型/带 created_at 的可见输入框。
+    form = page.locator("#guest_payment_order_search").first
+    inputs = form.locator("input") if await form.count() else page.locator("input")
+    found = []
+    for i in range(await inputs.count()):
+        el = inputs.nth(i)
+        try:
+            if not await el.is_visible() or await el.is_disabled():
+                continue
+            typ = await el.get_attribute("type") or ""
+            name = (await el.get_attribute("name") or "").lower()
+            eid = (await el.get_attribute("id") or "").lower()
+            if typ in ("date", "datetime-local") or "created_at" in name or "created_at" in eid:
+                found.append(el)
+        except Exception:
+            pass
+    if len(found) >= 2:
+        for el, dt in [(found[0], start_dt), (found[1], now)]:
             typ = await el.get_attribute("type")
             if typ == "date":
                 await el.fill(dt.strftime("%Y-%m-%d"))
             elif typ == "datetime-local":
                 await el.fill(dt.strftime("%Y-%m-%dT%H:%M"))
             else:
-                await el.fill(dt.strftime("%Y%m%d %H%M"))
+                await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
         return
 
-    candidates = page.locator("input[type='text']")
-    vals = []
-    count = await candidates.count()
-    for i in range(count):
-        el = candidates.nth(i)
-        try:
-            if await el.is_visible():
-                ph = (await el.get_attribute("placeholder") or "").lower()
-                nm = (await el.get_attribute("name") or "").lower()
-                if any(k in (ph + " " + nm) for k in ["date", "日期", "日點"]):
-                    vals.append(el)
-        except Exception:
-            pass
-
-    if len(vals) >= 2:
-        await vals[0].fill(start.strftime("%Y%m%d 0000"))
-        await vals[1].fill(end.strftime("%Y%m%d 2359"))
-        return
-
-    text_inputs = []
-    for i in range(count):
-        el = candidates.nth(i)
-        try:
-            if await el.is_visible():
-                text_inputs.append(el)
-        except Exception:
-            pass
-    if len(text_inputs) >= 2:
-        await text_inputs[0].fill(start.strftime("%Y%m%d 0000"))
-        await text_inputs[1].fill(end.strftime("%Y%m%d 2359"))
+    raise Exception("JJ 找不到【建立日期】起止时间输入框")
 
 
 async def _jj_find_order_input(page, kind):
+    """尽量兼容 JJ 后台实际页面的输入框写法。
+
+    JJ 页面不同版本可能没有固定的 name/id，不能只靠猜测的选择器。
+    优先使用 id/name/placeholder，其次根据「平台订单号/其他订单号」附近的文字寻找输入框。
+    """
     if kind == "platform":
+        labels = ["平台订单号", "平台訂單號", "平台订单", "平台訂單"]
         selectors = [
+            "#q_id",
+            "input[name='q[id]']",
+            "input[name='q_id']",
+            "#platform_order",
+            "#platform_order_no",
+            "#platform_order_number",
             "input[name='platform_order']",
-            "input[id='platform_order']",
-            "input[placeholder='平台订单']",
-            "input[placeholder='平台訂單']",
+            "input[name='platform_order_no']",
+            "input[name='platform_order_number']",
+            "input[placeholder*='平台订单号']",
+            "input[placeholder*='平台訂單號']",
         ]
     else:
+        labels = ["其他订单号", "其他訂單號", "其他订单", "其他訂單"]
         selectors = [
+            "#q_merchant_order_id_or_order_trade_id",
+            "input[name='q[merchant_order_id_or_order_trade_id]']",
+            "input[name='q_merchant_order_id_or_order_trade_id']",
+            "#other_order",
+            "#other_order_no",
+            "#other_order_number",
             "input[name='other_order']",
-            "input[id='other_order']",
-            "input[placeholder='其他订单']",
-            "input[placeholder='其他訂單']",
+            "input[name='other_order_no']",
+            "input[name='other_order_number']",
+            "input[placeholder*='其他订单号']",
+            "input[placeholder*='其他訂單號']",
         ]
 
-    loc = await _first_visible(page, selectors, timeout=3000)
+    loc = await _first_visible(page, selectors, timeout=1500)
     if loc:
         return loc
 
-    labels = ["平台订单号", "平台訂單號"] if kind == "platform" else ["其他订单号", "其他訂單號"]
+    # 通过 label 的 for / 同级 input 寻找。
     for txt in labels:
-        label = page.locator(f"label:has-text('{txt}')").first
         try:
+            label = page.locator("label").filter(has_text=txt).first
             if await label.count() and await label.is_visible():
                 target_id = await label.get_attribute("for")
                 if target_id:
-                    loc = page.locator(f"#{target_id}").first
-                    if await loc.is_visible():
-                        return loc
-                target = label.locator("xpath=..").locator("input").first
-                if await target.is_visible():
+                    target = page.locator(f"#{target_id}").first
+                    if await target.count() and await target.is_visible():
+                        return target
+                parent = label.locator("xpath=..")
+                target = parent.locator("input:not([type='hidden'])").first
+                if await target.count() and await target.is_visible():
+                    return target
+                target = parent.locator("textarea").first
+                if await target.count() and await target.is_visible():
                     return target
         except Exception:
             pass
 
-    raise Exception(f"JJ 找不到【{labels[0]}】输入框")
+    # 有些 JJ 版本把标题放在 div/span，而不是 label。
+    # 找到包含目标文字的元素后，在它的父/祖先容器内寻找第一个可见输入框。
+    for txt in labels:
+        try:
+            text_node = page.get_by_text(txt, exact=False).first
+            if await text_node.count() and await text_node.is_visible():
+                for level in range(1, 5):
+                    ancestor = text_node.locator("xpath=" + "/.." * level)
+                    inp = ancestor.locator(
+                        "input:not([type='hidden']):not([type='checkbox']):not([type='radio']), textarea"
+                    ).first
+                    if await inp.count() and await inp.is_visible():
+                        return inp
+        except Exception:
+            pass
+
+    # 最后按「输入框所在容器文字」做启发式匹配。
+    inputs = page.locator(
+        "input:not([type='hidden']):not([type='checkbox']):not([type='radio']):not([type='submit']), textarea"
+    )
+    count = await inputs.count()
+    for i in range(count):
+        inp = inputs.nth(i)
+        try:
+            if not await inp.is_visible() or await inp.is_disabled():
+                continue
+            bits = []
+            for level in range(1, 4):
+                ancestor = inp.locator("xpath=" + "/.." * level)
+                try:
+                    bits.append(await ancestor.inner_text(timeout=500))
+                except Exception:
+                    pass
+            context_text = " ".join(bits)
+            if any(txt in context_text for txt in labels):
+                return inp
+        except Exception:
+            continue
+
+    # 把当前页面实际存在的可见输入框信息放进错误，方便下一次直接定位，而不是卡住。
+    available = []
+    for i in range(min(count, 30)):
+        inp = inputs.nth(i)
+        try:
+            if not await inp.is_visible():
+                continue
+            available.append({
+                "id": await inp.get_attribute("id"),
+                "name": await inp.get_attribute("name"),
+                "placeholder": await inp.get_attribute("placeholder"),
+            })
+        except Exception:
+            pass
+
+    raise Exception(f"JJ 找不到【{labels[0]}】输入框；当前可见输入框：{available}")
 
 
 async def _jj_search(page, order_no, kind):
     inp = await _jj_find_order_input(page, kind)
-    await inp.fill(order_no)
+    await inp.fill(str(order_no).strip())
 
-    search_btn = page.locator(
-        "button:has-text('搜尋'), button:has-text('搜索'), "
-        "input[value='搜索'], input[value='搜尋'], .btn-primary"
-    ).last
+    # 截图已确认搜索表单 id=guest_payment_order_search。
+    form = page.locator("#guest_payment_order_search").first
+    if await form.count():
+        search_btn = form.locator(
+            "input[type='submit'], button[type='submit'], "
+            "input[value='搜尋'], input[value='搜索'], "
+            "button:has-text('搜尋'), button:has-text('搜索')"
+        ).first
+    else:
+        search_btn = page.locator(
+            "input[type='submit'][value='搜尋'], input[type='submit'][value='搜索'], "
+            "button[type='submit']"
+        ).first
+
     try:
-        await search_btn.click()
+        if await search_btn.count() and await search_btn.is_visible():
+            await search_btn.click(timeout=10000)
+        else:
+            await inp.press("Enter")
     except Exception:
         await inp.press("Enter")
 
-    await page.wait_for_timeout(800)
     try:
-        await page.locator("table tbody tr").first.wait_for(state="visible", timeout=8000)
+        await page.wait_for_load_state("domcontentloaded", timeout=10000)
     except Exception:
         pass
+    await page.wait_for_timeout(1000)
+
 
 
 def _normalize_header(text):
     return re.sub(r'\s+', '', text or "").lower()
 
 
-async def _extract_jj_row(page):
+async def _extract_jj_row(page, order_no=""):
+    """只返回真正包含目标订单号的结果，避免读取到旧表格第一行。"""
     tables = page.locator("table")
     table_count = await tables.count()
     for ti in range(table_count):
@@ -1274,34 +1387,33 @@ async def _extract_jj_row(page):
             if not await table.is_visible():
                 continue
             rows = table.locator("tbody tr")
-            if await rows.count() == 0:
+            row_count = await rows.count()
+            if row_count == 0:
                 continue
-            row = rows.first
-            cells = row.locator("td")
-            if await cells.count() == 0:
-                continue
-
             headers = table.locator("thead th")
             header_count = await headers.count()
             header_texts = [
                 _normalize_header(await headers.nth(i).inner_text())
                 for i in range(header_count)
             ]
-            cell_texts = [
-                _clean_text_value(await cells.nth(i).inner_text())
-                for i in range(await cells.count())
-            ]
-            return header_texts, cell_texts
+            for ri in range(row_count):
+                row = rows.nth(ri)
+                cells = row.locator("td")
+                if await cells.count() == 0:
+                    continue
+                row_text = _clean_text_value(await row.inner_text())
+                compact_row = re.sub(r"\s+", "", row_text)
+                compact_order = re.sub(r"\s+", "", str(order_no or ""))
+                if order_no and compact_order not in compact_row:
+                    continue
+                cell_texts = [
+                    _clean_text_value(await cells.nth(i).inner_text())
+                    for i in range(await cells.count())
+                ]
+                return header_texts, cell_texts
         except Exception:
             continue
     return [], []
-
-
-def _cell_by_header(headers, cells, keywords):
-    for i, h in enumerate(headers):
-        if any(k in h for k in keywords) and i < len(cells):
-            return cells[i]
-    return ""
 
 
 async def _query_jj_order(single_order_no, task_id):
@@ -1334,11 +1446,11 @@ async def _query_jj_order(single_order_no, task_id):
             await _jj_set_one_year_date(page)
 
             await _jj_search(page, single_order_no, "platform")
-            headers, cells = await _extract_jj_row(page)
+            headers, cells = await _extract_jj_row(page, single_order_no)
 
             if not cells:
                 await _jj_search(page, single_order_no, "other")
-                headers, cells = await _extract_jj_row(page)
+                headers, cells = await _extract_jj_row(page, single_order_no)
 
             if not cells:
                 raise Exception(f"JJ 找不到订单：{single_order_no}")
