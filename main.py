@@ -307,26 +307,80 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
+
+async def _goto_first_working(page, candidates, *, timeout=30000):
+    """按顺序尝试后台入口；404 时换下一个，不会把正常入口误判成登录失败。"""
+    last_status = None
+    last_url = None
+    last_error = None
+    for url in candidates:
+        try:
+            response = await page.goto(url, wait_until="commit", timeout=timeout)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            last_url = page.url
+            last_status = response.status if response else None
+            # 404/410 明确表示入口不存在，继续尝试备用入口。
+            if last_status in (404, 410):
+                continue
+            return response
+        except Exception as e:
+            last_error = e
+            last_url = page.url
+            continue
+    raise Exception(
+        f"全部商城后台入口都无法打开：最后地址={last_url}，HTTP={last_status}，错误={last_error}"
+    )
+
+
 async def _login_all_shop(page):
-    """全部商城专用登录流程。保持原本可运行版本的登录方式，不使用单笔/JJ的登录逻辑。"""
+    """全部商城专用登录。保留旧版 /admin 流程，并仅在 /admin 返回 404 时尝试登录页备用路径。"""
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
     if not ADMIN_USER or not ADMIN_PASS:
         raise Exception("未检测到 ADMIN_USER / ADMIN_PASS！")
 
-    # 全部商城原始入口就是 ADMIN_URL（目前为 https://asdtvheq.com/admin）。
-    await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded", timeout=30000)
+    page.set_default_timeout(20000)
+    page.set_default_navigation_timeout(30000)
+
+    domain_root = "/".join(BASE_ADMIN_URL.split("/")[:3])
+    candidates = []
+    for u in [
+        BASE_ADMIN_URL,
+        BASE_ADMIN_URL.rstrip("/") + "/",
+        domain_root + "/admin/sign_in",
+        domain_root + "/admin/login",
+        domain_root + "/admin/users/sign_in",
+    ]:
+        if u not in candidates:
+            candidates.append(u)
+
+    response = await _goto_first_working(page, candidates)
+
     user_input = page.locator(
         "#admin_user_email, #user_email, input[type='email'], "
-        "input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
+        "input[name*='email'], input[name*='login'], input[name*='username'], "
+        "input[placeholder='帐号'], input[placeholder='账号'], input[type='text']"
     ).first
     try:
-        await user_input.wait_for(state="visible", timeout=20000)
+        await user_input.wait_for(state="visible", timeout=15000)
     except Exception:
-        raise Exception(f"无法找到登录框！标题: 【{await page.title()}】，地址: {page.url}")
+        body = ""
+        try:
+            body = (await page.locator("body").inner_text())[:300]
+        except Exception:
+            pass
+        status = response.status if response else "unknown"
+        raise Exception(
+            f"无法找到全部商城登录框！HTTP={status}，标题=[{await page.title()}]，地址={page.url}，页面={body}"
+        )
 
     await user_input.fill(ADMIN_USER)
-    password_input = page.locator("#admin_user_password, #user_password, input[type='password']").first
+    password_input = page.locator(
+        "#admin_user_password, #user_password, input[type='password']"
+    ).first
     await password_input.wait_for(state="visible", timeout=10000)
     await password_input.fill(ADMIN_PASS)
 
@@ -339,11 +393,12 @@ async def _login_all_shop(page):
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
     except Exception:
         pass
+    await page.wait_for_timeout(500)
 
-    # 登录后如果仍然停在登录页，立即报错，避免任务无提示卡住。
-    if "sign_in" in page.url or "/login" in page.url:
-        raise Exception(f"全部商城登录失败！当前地址：{page.url}")
-
+    # 如果仍在登录页，说明账号/入口没有真正完成登录。
+    current = page.url.lower()
+    if any(x in current for x in ["sign_in", "/login"]):
+        raise Exception(f"全部商城登录未成功，当前地址：{page.url}")
 
 async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
     if not BASE_ADMIN_URL:
@@ -379,7 +434,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             await _login_all_shop(page)
 
             async def search_account(acc_name: str):
-                await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
+                await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded", timeout=30000)
                 search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
                 await search_input.wait_for(state="visible", timeout=20000)
                 await search_input.fill(acc_name)
@@ -395,7 +450,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             # 2. 尝试递增后缀建店
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
+                await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded", timeout=30000)
                 await page.locator("#merchant_username").wait_for(state="visible", timeout=20000)
 
                 await page.locator("#merchant_username").fill(current_account)
@@ -455,7 +510,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                         await shop_template.select_option(index=1)
 
                 await page.locator("input[name='commit'][value='送出']").first.click()
-                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
                 is_used = await page.locator("body").evaluate("el => el.innerText.includes('已经被使用') || el.innerText.includes('已經被使用')")
                 if is_used:
@@ -486,7 +541,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 )
                 await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
                 await page.locator("input[name='commit'], input[value='送出']").click()
-                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
             await run_sub_step("导入商品", step_items())
 
@@ -495,7 +550,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 async def step_remove_placeholder():
                     await search_account(final_account)
                     await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
-                    await page.wait_for_load_state("domcontentloaded")
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
                     
                     bank_section = page.locator(".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)").first
                     remove_btn = bank_section.locator("a.remove_fields, a:has-text('移除')").first
@@ -506,7 +561,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                     if await remove_btn.is_visible():
                         await remove_btn.click()
                         await page.locator("input[name='commit'][value='送出']").first.click()
-                        await page.wait_for_load_state("domcontentloaded")
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
                 await run_sub_step("移除占位符", step_remove_placeholder())
 
@@ -523,7 +578,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 )
                 await page.locator("#quantity, input[name='quantity']").fill("6000")
                 await page.locator("input[name='commit'], input[value='送出']").click()
-                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
             await run_sub_step("输入出货订单", step_deposit())
 
@@ -541,7 +596,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 await qty_input.wait_for(state="visible", timeout=20000)
                 await qty_input.fill("6000")
                 await page.locator("input[name='commit'], input[value='送出']").click()
-                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
             await run_sub_step("输入提现订单", step_withdraw())
 
@@ -810,7 +865,7 @@ async def _create_single_shop(info: dict, task_id: str):
 
                 # 2. 跳转至单笔商城的单数 market_manager/merchants/new 建店路径
                 target_url = f"{domain_root}/market_manager/merchants/new"
-                await page.goto(target_url, wait_until="domcontentloaded")
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
 
                 # 检查页面是否处于登录状态
                 if "sign_in" in page.url or "login" in page.url:
@@ -911,7 +966,7 @@ async def _create_single_shop(info: dict, task_id: str):
 
                 submit_btn = page.locator("button[type='submit'], input[name='commit'][value='送出']").first
                 await submit_btn.click()
-                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
                 body_text = await page.locator("body").inner_text()
                 is_used = any(x in body_text for x in ["已经被使用", "已經被使用"])
@@ -931,19 +986,19 @@ async def _create_single_shop(info: dict, task_id: str):
 
             # 商品 60
             await page.locator("tbody tr").first.locator("a[href$='items']").click()
-            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
             import_btn = page.locator("a[href='items/new'], a:has-text('導入商品'), a:has-text('导入商品')").first
             await import_btn.wait_for(state="visible", timeout=20000)
             await import_btn.click()
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
             await page.locator("button[type='submit'], input[name='commit'], input[value='送出']").first.click()
-            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
             # 移除银行卡占位符
             if info_type != "bank":
                 await _single_search_account(page, final_account)
                 await page.locator("tbody tr").first.locator("a[href$='edit']").click()
-                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
                 bank_section = page.locator(
                     ".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)"
                 ).first
@@ -957,7 +1012,7 @@ async def _create_single_shop(info: dict, task_id: str):
                 if await remove_btn.count() and await remove_btn.is_visible():
                     await remove_btn.click()
                     await page.locator("button[type='submit'], input[name='commit'][value='送出']").first.click()
-                    await page.wait_for_load_state("domcontentloaded")
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
             # JJ 查询
             jj_result = await _query_jj_order(info["single_order_no"], task_id)
@@ -1299,7 +1354,7 @@ async def _single_recharge(page, account, jj_result):
     else:
         await recharge_link.click()
 
-    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
     merchant_select = await _first_visible(page, [
         "#deposit_order_merchant_id",
@@ -1419,7 +1474,7 @@ async def _single_recharge(page, account, jj_result):
         raise Exception("找不到单笔商城充值的【送出】按钮")
 
     await submit.click()
-    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_load_state("domcontentloaded", timeout=15000)
     return "已送出"
 
 
@@ -1436,7 +1491,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
 
             await _login_all_shop(page)
 
-            await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
+            await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded", timeout=30000)
             search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
             await search_input.fill(account_name)
             search_btn = page.locator("button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary").first
@@ -1447,7 +1502,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
             await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
             await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
-            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
             shop_template = page.locator("#merchant_store_skin_type")
             if await shop_template.is_visible():
@@ -1457,7 +1512,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
                     await shop_template.select_option(label=f"预设{new_skin}")
 
             await page.locator("input[name='commit'][value='送出']").first.click()
-            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
         finally:
             try:
                 await browser.close()
@@ -1541,7 +1596,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ACTIVE_TASKS[task_id] = {
         "task": task,
         "page": None,
-        "user_id": user_id
+        "user_id": user_id,
+        "status_msg": status_msg,
     }
 
 
@@ -1680,7 +1736,3 @@ def main():
     app.run_polling()
 
 
-
-
-if __name__ == "__main__":
-    main()
