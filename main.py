@@ -80,6 +80,7 @@ SKIN_OPTIONS = {
 
 
 # 2. 文本解析与格式校验
+
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
     errors = []
@@ -306,7 +307,6 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
-# 3. Playwright 自动化建店逻辑
 async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
@@ -337,23 +337,8 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 await click_locator.click()
                 await wait_locator.wait_for(state="visible", timeout=timeout)
 
-            # 1. 登录后台
-            await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
-            user_input = page.locator(
-                "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
-            ).first
-
-            try:
-                await user_input.wait_for(state="visible", timeout=20000)
-            except Exception:
-                raise Exception(f"无法找到登录框！标题: 【{await page.title()}】，地址: {page.url}")
-
-            await user_input.fill(ADMIN_USER)
-            await page.locator("#admin_user_password, #user_password, input[type='password']").first.fill(ADMIN_PASS)
-            
-            submit_btn = page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first
-            await submit_btn.click()
-            await page.wait_for_load_state("domcontentloaded")
+            # 1. 登录后台（全部商城专用，不影响单笔/JJ）
+            await _login_all_shop(page)
 
             async def search_account(acc_name: str):
                 await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
@@ -538,7 +523,6 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 pass
 
 
-# 单笔商城辅助函数
 def _clean_text_value(value):
     return re.sub(r'\s+', ' ', (value or "").strip())
 
@@ -750,7 +734,6 @@ async def _single_search_account(page, account):
     await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
 
-# 适应单笔商城 /market_manager 路由结构的建店函数
 async def _create_single_shop(info: dict, task_id: str):
     if not SINGLE_ADMIN_URL:
         raise Exception("未检测到环境变量 SINGLE_ADMIN_URL！")
@@ -1402,7 +1385,6 @@ async def _single_recharge(page, account, jj_result):
     return "已送出"
 
 
-# 修改商城界面函数
 async def update_shop_skin(account_name: str, new_skin: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -1414,18 +1396,10 @@ async def update_shop_skin(account_name: str, new_skin: str):
             page = await context.new_page()
             page.set_default_timeout(20000)
 
-            await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
-            user_input = page.locator(
-                "#admin_user_email, #user_email, input[type='email'], input[name='email'], input[name='login'], input[name='username'], input[type='text']"
-            ).first
-            await user_input.fill(ADMIN_USER)
-            await page.locator("#admin_user_password, #user_password, input[type='password']").first.fill(ADMIN_PASS)
-            await page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first.click()
-            await page.wait_for_load_state("domcontentloaded")
+            await _login_all_shop(page)
 
-            domain_root = "/".join(BASE_ADMIN_URL.split("/")[:3])
-            await page.goto(f"{domain_root}/merchants", wait_until="domcontentloaded")
-            search_input = page.locator("input[name='account'], #search_account, input[type='search'], input[type='text']").first
+            await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
+            search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
             await search_input.fill(account_name)
             search_btn = page.locator("button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary").first
             if await search_btn.is_visible():
@@ -1434,7 +1408,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 await search_input.press("Enter")
             await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
-            await page.locator("tbody tr").first.locator("a[href$='edit']").click()
+            await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
             await page.wait_for_load_state("domcontentloaded")
 
             shop_template = page.locator("#merchant_store_skin_type")
@@ -1444,7 +1418,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 except Exception:
                     await shop_template.select_option(label=f"预设{new_skin}")
 
-            await page.locator("input[name='commit'][value='送出'], button[type='submit']").first.click()
+            await page.locator("input[name='commit'][value='送出']").first.click()
             await page.wait_for_load_state("domcontentloaded")
         finally:
             try:
@@ -1453,35 +1427,32 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 pass
 
 
-# 主按钮键盘
 def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
-        [InlineKeyboardButton(f"✨ 更改商城界面（当前：{current_skin}）", callback_data=f"op|{account}|{current_skin}")]
+        [InlineKeyboardButton(f"✨ 更改商城界面（当前{current_skin}）", callback_data=f"op:{account}:{current_skin}")]
     ]
     return InlineKeyboardMarkup(buttons)
 
 
-# 风格键盘
 def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
         [
-            InlineKeyboardButton("极速微商", callback_data=f"sk|jisumeishang|{account}"),
-            InlineKeyboardButton("七喵", callback_data=f"sk|qimiao|{account}")
+            InlineKeyboardButton("极速微商", callback_data=f"sk:jisumeishang:{account}"),
+            InlineKeyboardButton("七喵", callback_data=f"sk:qimiao:{account}")
         ],
         [
-            InlineKeyboardButton("柒月", callback_data=f"sk|qiyue|{account}"),
-            InlineKeyboardButton("音你而来", callback_data=f"sk|yinnierlai|{account}")
+            InlineKeyboardButton("柒月", callback_data=f"sk:qiyue:{account}"),
+            InlineKeyboardButton("音你而来", callback_data=f"sk:yinnierlai:{account}")
         ],
         [
-            InlineKeyboardButton("⬅️ 收起", callback_data=f"cl|{account}|{current_skin}")
+            InlineKeyboardButton("⬅️ 收起", callback_data=f"cl:{account}:{current_skin}")
         ]
     ]
     return InlineKeyboardMarkup(buttons)
 
 
-# 4. Telegram 消息处理
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
@@ -1536,7 +1507,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 
-# Worker 包装
 async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False):
     try:
         if BUILD_SHOP_SEMAPHORE.locked():
@@ -1588,7 +1558,6 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
         ACTIVE_TASKS.pop(task_id, None)
 
 
-# 5. 回调事件处理
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -1658,7 +1627,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"❌ 修改界面失败：{str(e)}", show_alert=True)
 
 
-# 6. 主程序入口
 def main():
     if not BOT_TOKEN:
         print("❌ 未检测到 BOT_TOKEN 环境变量！")
@@ -1674,5 +1642,3 @@ def main():
     app.run_polling()
 
 
-if __name__ == "__main__":
-    main()
