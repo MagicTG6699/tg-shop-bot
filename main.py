@@ -1164,78 +1164,89 @@ async def _jj_unlock_search_range(page):
 
 
 async def _jj_set_one_year_date(page):
-    """JJ 出货管理：把「建立日期」设为当前时间往前 1 年到当前时间。"""
+    """JJ 出货管理：建立日期设为当前时间往前 1 年到当前时间。
+
+    根据实际 DevTools 已确认：
+      开始时间：#q_created_at_gte / name="q[created_at_gte]"
+      结束时间：#q_created_at_lte / name="q[created_at_lte]"
+    页面实际 value 使用 ISO 格式，例如：2026-09-15T03:00:00+08:00。
+    """
     from datetime import timezone
 
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz)
     start_dt = now - timedelta(days=365)
 
-    # 你截图里建立日期两个输入框实际带有 startdatetime / enddatetime class。
-    # 先直接用 class 定位，避免再依赖容易变化的 name/id。
-    pairs = [
-        ("input.startdatetime", "input.enddatetime"),
-        (".input-daterange input.startdatetime", ".input-daterange input.enddatetime"),
-        ("input[name='q[created_at_gte]']", "input[name='q[created_at_lte]']"),
-        ("#q_created_at_gte", "#q_created_at_lte"),
-        ("#q_created_at_gteq", "#q_created_at_lteq"),
-        ("input[name='q[created_at_gteq]']", "input[name='q[created_at_lteq]']"),
-    ]
+    start_value = start_dt.isoformat(timespec="seconds")
+    end_value = now.isoformat(timespec="seconds")
 
-    # 页面显示格式是 2026/09/15 03:00；直接写这个格式最稳。
-    start_value = start_dt.strftime("%Y/%m/%d %H:%M")
-    end_value = now.strftime("%Y/%m/%d %H:%M")
+    start = page.locator("#q_created_at_gte")
+    end = page.locator("#q_created_at_lte")
 
-    async def set_value(locator, value):
-        # 某些 datetimepicker 会拦截 Playwright.fill，因此直接写 DOM value
-        # 并触发 input/change 事件，让后台表单能收到新值。
+    # 等待实际 DOM 出现。不能先用 count()，因为日期插件可能稍后才渲染。
+    try:
+        await start.wait_for(state="attached", timeout=10000)
+        await end.wait_for(state="attached", timeout=10000)
+    except Exception:
+        # name 是同一个实际字段，再给一次明确的备用定位。
+        start = page.locator("input[name='q[created_at_gte]']")
+        end = page.locator("input[name='q[created_at_lte]']")
+        await start.wait_for(state="attached", timeout=10000)
+        await end.wait_for(state="attached", timeout=10000)
+
+    async def set_datetime(locator, value):
+        # JJ 使用 datetimepicker，普通 fill 有时会被插件拦截。
+        # 直接设置 value，再触发 input/change/blur，让表单与插件同步。
         await locator.evaluate(
             """(el, value) => {
-                el.removeAttribute('readonly');
-                el.disabled = false;
-                el.value = value;
-                el.dispatchEvent(new Event('input', {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new Event('blur', {bubbles:true}));
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
             }""",
             value,
         )
 
-    for start_sel, end_sel in pairs:
-        first = page.locator(start_sel).first
-        second = page.locator(end_sel).first
+    # 解锁后日期栏应该可以操作；如果仍 disabled，重新点击暗锁一次。
+    for _ in range(2):
         try:
-            if await first.count() and await second.count():
-                await first.wait_for(state="attached", timeout=3000)
-                await second.wait_for(state="attached", timeout=3000)
-                await set_value(first, start_value)
-                await set_value(second, end_value)
-                return
+            if await start.is_disabled() or await end.is_disabled():
+                await _jj_unlock_search_range(page)
+                await page.wait_for_timeout(500)
+                continue
+            break
         except Exception:
-            continue
+            break
 
-    # 最后一层备用：直接从建立日期那一列的 input-daterange 抓前两个文字输入框。
     try:
-        daterange = page.locator(".input-daterange").first
-        if await daterange.count():
-            inputs = daterange.locator("input[type='text']")
-            if await inputs.count() >= 2:
-                await set_value(inputs.nth(0), start_value)
-                await set_value(inputs.nth(1), end_value)
-                return
+        await start.scroll_into_view_if_needed(timeout=3000)
+        await end.scroll_into_view_if_needed(timeout=3000)
     except Exception:
         pass
 
-    # 报错时把页面实际找到的日期类输入框资讯一起带回来，方便下一次直接定位。
-    try:
-        info = await page.locator("input").evaluate_all(
-            """els => els.map(e => ({id:e.id,name:e.name,cls:e.className,type:e.type,value:e.value}))
-                        .filter(x => String(x.cls).includes('datetime') || String(x.value).match(/^\d{4}[\/-]\d{2}/))
-                        .slice(0,12)"""
+    # 不依赖 visible；截图确认这两个 input 就是实际提交字段。
+    await set_datetime(start, start_value)
+    await set_datetime(end, end_value)
+
+    # 验证实际 DOM value，避免“代码执行了但日期没写进去”。
+    actual_start = await start.input_value()
+    actual_end = await end.input_value()
+    if actual_start != start_value or actual_end != end_value:
+        # 再用 JS property setter 强制写一次。
+        await set_datetime(start, start_value)
+        await set_datetime(end, end_value)
+        actual_start = await start.input_value()
+        actual_end = await end.input_value()
+
+    if actual_start != start_value or actual_end != end_value:
+        raise Exception(
+            f"JJ 建立日期写入失败：开始={actual_start}，结束={actual_end}"
         )
-    except Exception:
-        info = []
-    raise Exception(f"JJ 找不到【建立日期】起止时间输入框；实际日期输入框：{info}")
+
+    return start_value, end_value
 
 
 async def _jj_find_order_input(page, kind):
