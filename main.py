@@ -436,7 +436,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                         await shop_template.select_option(index=1)
 
                 await page.locator("input[name='commit'][value='送出']").first.click()
-                await _wait_dom_bounded(page, timeout=5000)
+                await page.wait_for_load_state("domcontentloaded")
 
                 is_used = await page.locator("body").evaluate("el => el.innerText.includes('已经被使用') || el.innerText.includes('已經被使用')")
                 if is_used:
@@ -606,34 +606,13 @@ def _parse_jj_datetime(value: str):
     return None
 
 
-async def _goto_bounded(page, url, timeout=15000):
-    """有限时间导航：避免后台某个页面的 load 事件卡住整个 Telegram 任务。"""
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-    except PlaywrightTimeoutError:
-        # 页面可能已经实际打开，只是某些外部资源没有完成加载。
-        try:
-            if page.url and page.url != "about:blank":
-                return
-        except Exception:
-            pass
-        raise Exception(f"页面打开超时：{url}")
-
-
-async def _wait_dom_bounded(page, timeout=5000):
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=timeout)
-    except Exception:
-        pass
-
-
 async def _login_generic(page, url, username, password, use_totp=False):
     if not url:
         raise Exception("后台 URL 未配置")
     if not username or not password:
         raise Exception("后台账号或密码未配置")
 
-    await _goto_bounded(page, url, timeout=15000)
+    await page.goto(url, wait_until="domcontentloaded")
     page.set_default_timeout(20000)
 
     user_input = page.locator(
@@ -687,7 +666,7 @@ async def _login_generic(page, url, username, password, use_totp=False):
         "input[type='submit'], button[type='submit'], input[name='commit']"
     ).first
     await submit_btn.click()
-    await _wait_dom_bounded(page, timeout=5000)
+    await page.wait_for_load_state("domcontentloaded")
 
 
 async def _first_visible(page, selectors, timeout=5000):
@@ -755,7 +734,7 @@ async def _select_any_option(select_loc):
 
 
 async def _single_search_account(page, account):
-    await _goto_bounded(page, f"{SINGLE_ADMIN_ROOT}/merchants", timeout=15000)
+    await page.goto(f"{SINGLE_ADMIN_ROOT}/merchants", wait_until="domcontentloaded")
     search_input = await _first_visible(page, [
         "input[name*='account']",
         "#search_account",
@@ -809,22 +788,11 @@ async def _create_single_shop(info: dict, task_id: str):
             if task_id in ACTIVE_TASKS:
                 ACTIVE_TASKS[task_id]["page"] = page
 
-            if task_id in ACTIVE_TASKS and ACTIVE_TASKS[task_id].get("status_msg"):
-                try:
-                    await ACTIVE_TASKS[task_id]["status_msg"].edit_text("⏳ <b>正在登入单笔商城后台...</b>", parse_mode="HTML")
-                except Exception:
-                    pass
             await _login_generic(page, SINGLE_ADMIN_URL, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
-
-            if task_id in ACTIVE_TASKS and ACTIVE_TASKS[task_id].get("status_msg"):
-                try:
-                    await ACTIVE_TASKS[task_id]["status_msg"].edit_text("⏳ <b>已进入单笔商城，正在打开新增商户页面...</b>", parse_mode="HTML")
-                except Exception:
-                    pass
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await _goto_bounded(page, f"{SINGLE_ADMIN_ROOT}/market_manager/merchants/new", timeout=15000)
+                await page.goto(f"{SINGLE_ADMIN_ROOT}/market_manager/merchants/new", wait_until="domcontentloaded")
                 merchant_username = page.locator("#merchant_username").first
                 try:
                     await merchant_username.wait_for(state="visible", timeout=20000)
@@ -912,7 +880,7 @@ async def _create_single_shop(info: dict, task_id: str):
                             pass
 
                 await page.locator("input[name='commit'][value='送出']").first.click()
-                await _wait_dom_bounded(page, timeout=5000)
+                await page.wait_for_load_state("domcontentloaded")
 
                 body_text = await page.locator("body").inner_text()
                 is_used = any(x in body_text for x in ["已经被使用", "已經被使用"])
@@ -932,19 +900,19 @@ async def _create_single_shop(info: dict, task_id: str):
 
             # 商品 60
             await page.locator("tbody tr").first.locator("a[href$='/items']").click()
-            await _wait_dom_bounded(page, timeout=5000)
+            await page.wait_for_load_state("domcontentloaded")
             import_btn = page.locator("a[href*='/items/new'], a:has-text('導入商品'), a:has-text('导入商品')").first
             await import_btn.wait_for(state="visible", timeout=20000)
             await import_btn.click()
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
             await page.locator("input[name='commit'], input[value='送出']").click()
-            await _wait_dom_bounded(page, timeout=5000)
+            await page.wait_for_load_state("domcontentloaded")
 
             # 非银行付款才移除默认银行占位符
             if info_type != "bank":
                 await _single_search_account(page, final_account)
                 await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
-                await _wait_dom_bounded(page, timeout=5000)
+                await page.wait_for_load_state("domcontentloaded")
                 bank_section = page.locator(
                     ".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)"
                 ).first
@@ -958,7 +926,7 @@ async def _create_single_shop(info: dict, task_id: str):
                 if await remove_btn.count() and await remove_btn.is_visible():
                     await remove_btn.click()
                     await page.locator("input[name='commit'][value='送出']").first.click()
-                    await _wait_dom_bounded(page, timeout=5000)
+                    await page.wait_for_load_state("domcontentloaded")
 
             # JJ 查询
             jj_result = await _query_jj_order(info["single_order_no"], task_id)
@@ -999,7 +967,7 @@ async def _jj_open_outbound(page):
         try:
             if await loc.is_visible():
                 await loc.click()
-                await _wait_dom_bounded(page, timeout=5000)
+                await page.wait_for_load_state("domcontentloaded")
                 return
         except Exception:
             continue
@@ -1561,9 +1529,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
     ])
 
-    route_name = "单笔商城" if is_single else "全部商城"
+    status_text = (
+        "⏳ <b>已轮到当前单笔任务，正在自动建店中，请稍候...</b>"
+        if is_single
+        else
+        "⏳ <b>已轮到当前任务，正在自动建店中，请稍候...</b>"
+    )
     status_msg = await update.message.reply_text(
-        f"⏳ <b>正在自动建店中，请稍候...</b>\n\n流程：{html.escape(route_name)}",
+        status_text,
         reply_markup=keyboard,
         parse_mode="HTML"
     )
@@ -1574,8 +1547,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ACTIVE_TASKS[task_id] = {
         "task": task,
         "page": None,
-        "user_id": user_id,
-        "status_msg": status_msg
+        "user_id": user_id
     }
 
 
@@ -1583,26 +1555,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 建店 Worker 包装（含排队锁控制）
 async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False):
     try:
-        if BUILD_SHOP_SEMAPHORE.locked():
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
-            ])
-            await status_msg.edit_text(
-                "⏳ <b>前方有建店任务正在处理中，已为您自动加入排队队列，请稍候...</b>",
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-
         async with BUILD_SHOP_SEMAPHORE:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ 取消建店", callback_data=f"cancel:{task_id}")]
-            ])
-            await status_msg.edit_text(
-                "⏳ <b>已轮到当前任务，正在自动建店中，请稍候...</b>",
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-
+            # 建店过程保持同一条“已轮到当前任务”状态，不再发送/编辑任何中间执行提示。
             initial_skin = parsed_info.get("skin", "极速微商").replace("预设", "")
 
             if is_single:
