@@ -56,6 +56,16 @@ SINGLE_ADMIN_ROOT = re.sub(
     SINGLE_ADMIN_URL,
     flags=re.IGNORECASE,
 ).rstrip('/')
+# 单笔商城固定使用当前站点根域名，避免把 sign_in 路径误拼到功能页。
+_SINGLE_ORIGIN_MATCH = re.match(r'^(https?://[^/]+)', SINGLE_ADMIN_URL, flags=re.IGNORECASE)
+SINGLE_ADMIN_ORIGIN = (
+    _SINGLE_ORIGIN_MATCH.group(1).rstrip('/')
+    if _SINGLE_ORIGIN_MATCH
+    else SINGLE_ADMIN_ROOT
+)
+SINGLE_LOGIN_URL = SINGLE_ADMIN_URL if '/sign_in' in SINGLE_ADMIN_URL.lower() else f"{SINGLE_ADMIN_ORIGIN}/market_managers/sign_in"
+SINGLE_CREATE_URL = f"{SINGLE_ADMIN_ORIGIN}/market_manager/merchants/new"
+SINGLE_MERCHANTS_URL = f"{SINGLE_ADMIN_ORIGIN}/market_managers/merchants"
 
 JJ_ADMIN_USER = os.environ.get("JJ_ADMIN_USER", "").strip()
 JJ_ADMIN_PASS = os.environ.get("JJ_ADMIN_PASS", "").strip()
@@ -755,7 +765,7 @@ async def _select_any_option(select_loc):
 
 
 async def _single_search_account(page, account):
-    await page.goto(f"{SINGLE_ADMIN_ROOT}/merchants", wait_until="domcontentloaded")
+    await page.goto(SINGLE_MERCHANTS_URL, wait_until="domcontentloaded", timeout=60000)
     search_input = await _first_visible(page, [
         "input[name*='account']",
         "#search_account",
@@ -805,16 +815,36 @@ async def _create_single_shop(info: dict, task_id: str):
         try:
             context = await browser.new_context()
             page = await context.new_page()
-            page.set_default_timeout(20000)
+            page.set_default_timeout(60000)
             if task_id in ACTIVE_TASKS:
                 ACTIVE_TASKS[task_id]["page"] = page
 
-            await _login_generic(page, SINGLE_ADMIN_URL, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
+            await _login_generic(page, SINGLE_LOGIN_URL, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{SINGLE_ADMIN_ROOT}/merchants/new", wait_until="domcontentloaded")
-                await page.locator("#merchant_username").wait_for(state="visible", timeout=20000)
+                try:
+                    await page.goto(SINGLE_CREATE_URL, wait_until="domcontentloaded", timeout=60000)
+                except Exception as nav_e:
+                    raise Exception(
+                        f"单笔商城打开建店页面失败：{type(nav_e).__name__}: {nav_e}；地址：{page.url}"
+                    )
+
+                # 先确认实际页面，不要把 404/登录页误报成「找不到 merchant_username」。
+                try:
+                    await page.locator("#merchant_username").wait_for(state="visible", timeout=60000)
+                except Exception:
+                    title = await page.title()
+                    current_url = page.url
+                    body = ""
+                    try:
+                        body = (await page.locator("body").inner_text())[:500].replace("\n", " ")
+                    except Exception:
+                        pass
+                    raise Exception(
+                        f"单笔商城建店页面异常：找不到 merchant_username；标题：{title}；地址：{current_url}；页面内容：{body}"
+                    )
+
                 await page.locator("#merchant_username").fill(current_account)
 
                 for sel in ["#merchant_password", "#merchant_password_confirmation"]:
@@ -894,7 +924,11 @@ async def _create_single_shop(info: dict, task_id: str):
                             pass
 
                 await page.locator("input[name='commit'][value='送出']").first.click()
-                await page.wait_for_load_state("domcontentloaded")
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=60000)
+                except PlaywrightTimeoutError:
+                    # 提交后部分后台会持续处理但页面已更新；继续检查页面内容。
+                    pass
 
                 body_text = await page.locator("body").inner_text()
                 is_used = any(x in body_text for x in ["已经被使用", "已經被使用"])
