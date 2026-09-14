@@ -398,7 +398,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 default_num = "6226220809397366"
 
                 bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']").first
-                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
+                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_branch_name, #merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']").first
 
                 if info_type == "bank":
@@ -718,8 +718,8 @@ async def _select_any_option(select_loc):
 
 async def _single_search_account(page, account):
     domain_root = "/".join(SINGLE_ADMIN_URL.split("/")[:3])
-    # 修正单数 market_manager 路径
-    await page.goto(f"{domain_root}/market_manager/merchants", wait_until="domcontentloaded")
+    # 单笔商城使用 /market_managers 命名空间
+    await page.goto(f"{domain_root}/market_managers/merchants", wait_until="domcontentloaded")
     search_input = await _first_visible(page, [
         "input[name='account']",
         "#search_account",
@@ -745,7 +745,7 @@ async def _single_search_account(page, account):
     await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
 
-# 适应单笔商城 /market_manager 路由结构的建店函数
+# 单笔商城 /market_managers 路由结构的建店函数
 async def _create_single_shop(info: dict, task_id: str):
     if not SINGLE_ADMIN_URL:
         raise Exception("未检测到环境变量 SINGLE_ADMIN_URL！")
@@ -776,14 +776,14 @@ async def _create_single_shop(info: dict, task_id: str):
                 ACTIVE_TASKS[task_id]["page"] = page
 
             # 1. 执行登录 (如果配置没带/sign_in，补全访问)
-            login_target = SINGLE_ADMIN_URL if "sign_in" in SINGLE_ADMIN_URL else f"{domain_root}/market_manager/sign_in"
+            login_target = SINGLE_ADMIN_URL if "sign_in" in SINGLE_ADMIN_URL else f"{domain_root}/market_managers/sign_in"
             await _login_generic(page, login_target, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
 
-                # 2. 跳转至单笔商城的单数 market_manager/merchants/new 建店路径
-                target_url = f"{domain_root}/market_manager/merchants/new"
+                # 2. 跳转至单笔商城 /market_managers/merchants/new 建店路径
+                target_url = f"{domain_root}/market_managers/merchants/new"
                 await page.goto(target_url, wait_until="domcontentloaded")
 
                 # 检查页面是否处于登录状态
@@ -839,7 +839,7 @@ async def _create_single_shop(info: dict, task_id: str):
                     "#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']"
                 ).first
                 branch_name_input = page.locator(
-                    "#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']"
+                    "#merchant_bank_accounts_attributes_0_bank_branch_name, #merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']"
                 ).first
                 card_no_input = page.locator(
                     "#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']"
