@@ -1154,23 +1154,34 @@ def _normalize_header(text):
     return re.sub(r"\s+", "", text or "").lower()
 
 
-async def _extract_jj_row(page):
+async def _extract_jj_row(page, order_no=""):
+    """从 JJ 搜索结果中找真正对应订单的一行。
+
+    JJ 表格的订单号在页面上可能被 CSS 截断成 acd8c604...，
+    因此不能要求整串 UUID 必须出现在 inner_text() 里；优先使用
+    完整订单号，其次使用 UUID 前 8~12 个字符进行唯一匹配。
+    """
+    wanted = re.sub(r"\s+", "", order_no or "").lower()
+    prefixes = []
+    if wanted:
+        prefixes.append(wanted)
+        if len(wanted) >= 12:
+            prefixes.append(wanted[:12])
+        if len(wanted) >= 8:
+            prefixes.append(wanted[:8])
+
     tables = page.locator("table")
     table_count = await tables.count()
+    fallback = None
+
     for ti in range(table_count):
         table = tables.nth(ti)
         try:
             if not await table.is_visible():
                 continue
             rows = table.locator("tbody tr")
-            if await rows.count() == 0:
-                continue
-            row = rows.first
-            cells = row.locator("td")
-            if await cells.count() == 0:
-                continue
-            row_preview = _clean_text_value(await row.inner_text())
-            if not row_preview or any(x in row_preview for x in ["没有资料", "沒有資料", "无数据", "無資料"]):
+            row_count = await rows.count()
+            if row_count == 0:
                 continue
 
             headers = table.locator("thead th")
@@ -1179,14 +1190,55 @@ async def _extract_jj_row(page):
                 _normalize_header(await headers.nth(i).inner_text())
                 for i in range(header_count)
             ]
-            cell_texts = [
-                _clean_text_value(await cells.nth(i).inner_text())
-                for i in range(await cells.count())
-            ]
-            return header_texts, cell_texts
+
+            for ri in range(row_count):
+                row = rows.nth(ri)
+                cells = row.locator("td")
+                if await cells.count() == 0:
+                    continue
+                row_preview = _clean_text_value(await row.inner_text())
+                if not row_preview or any(x in row_preview for x in ["没有资料", "沒有資料", "无数据", "無資料"]):
+                    continue
+
+                cell_texts = [
+                    _clean_text_value(await cells.nth(i).inner_text())
+                    for i in range(await cells.count())
+                ]
+                normalized_row = re.sub(r"\s+", "", row_preview).lower()
+
+                # 最可靠：完整订单号存在于 row / title / data 属性。
+                matched = bool(wanted and wanted in normalized_row)
+                if not matched and prefixes:
+                    matched = any(prefix in normalized_row for prefix in prefixes[1:])
+
+                # 页面常把 UUID 显示成 acd8c604...；检查该行所有元素的 title/data-*。
+                if not matched and prefixes:
+                    try:
+                        attrs = row.locator("[title], [data-original-title], [data-id], [data-value]")
+                        for ai in range(await attrs.count()):
+                            el = attrs.nth(ai)
+                            vals = []
+                            for attr in ["title", "data-original-title", "data-id", "data-value"]:
+                                v = await el.get_attribute(attr)
+                                if v:
+                                    vals.append(re.sub(r"\s+", "", v).lower())
+                            if any(prefix in v for v in vals for prefix in prefixes):
+                                matched = True
+                                break
+                    except Exception:
+                        pass
+
+                if matched:
+                    return header_texts, cell_texts
+
+                # 如果只有一行结果，保留为兜底。搜索动作本身已经带订单号，
+                # 所以单结果表通常就是目标订单。
+                if row_count == 1:
+                    fallback = (header_texts, cell_texts)
         except Exception:
             continue
-    return [], []
+
+    return fallback if fallback else ([], [])
 
 
 def _cell_by_header(headers, cells, keywords):
@@ -1236,12 +1288,12 @@ async def _query_jj_order(single_order_no, task_id):
 
             # 先查平台订单号。
             await _jj_search(page, single_order_no, "platform")
-            headers, cells = await _extract_jj_row(page)
+            headers, cells = await _extract_jj_row(page, single_order_no)
 
             # 如果平台订单号没有结果，再查其他订单号。
             if not cells:
                 await _jj_search(page, single_order_no, "other")
-                headers, cells = await _extract_jj_row(page)
+                headers, cells = await _extract_jj_row(page, single_order_no)
 
             if not cells:
                 raise Exception(f"JJ 找不到订单：{single_order_no}")
