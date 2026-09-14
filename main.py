@@ -1204,65 +1204,188 @@ async def _jj_dump_inputs(page):
 
 
 async def _jj_unlock_search_range(page):
-    """自动解除 JJ 查询日期的暗锁，兼容主 document / iframe。"""
+    """解锁 JJ 出货管理的日期范围。
+
+    JJ 的日期筛选默认可能被“暗锁”限制，锁图标本身有时隐藏，
+    因此优先点击外层 placeholder，再尝试按钮/图标，并用 JS 强制触发点击。
+    """
     selectors = [
         ".toggle-order-search-days-btn-placeholder",
         ".toggle-search-days-btn-placeholder",
-        ".lock-btn",
-        "i.fa-lock.lock-btn",
-        "i.fa-lock",
+        "button.toggle-order-search-days-btn",
+        "a.toggle-order-search-days-btn",
+        ".lock-btn:not(.hide)",
+        ".fa-lock.lock-btn:not(.hide)",
+        ".unlock-btn:not(.hide)",
+    ]
+
+    # 如果已经是解锁状态，就不要再点击一次。
+    for ctx in await _jj_all_contexts(page):
+        try:
+            unlocked = ctx.locator(
+                ".fa-unlock:not(.hide), .unlock-btn:not(.hide), "
+                "[class*='unlock']:not(.hide)"
+            ).first
+            if await unlocked.count() and await unlocked.is_visible():
+                return True
+        except Exception:
+            pass
+
+    for ctx in await _jj_all_contexts(page):
+        for selector in selectors:
+            try:
+                loc = ctx.locator(selector).first
+                if await loc.count():
+                    try:
+                        if await loc.is_visible():
+                            await loc.click(timeout=5000, force=True)
+                        else:
+                            await loc.evaluate("el => el.click()")
+                    except Exception:
+                        try:
+                            await loc.evaluate(
+                                "el => (el.closest('button,a,.form-control,.input-group,div') || el).click()"
+                            )
+                        except Exception:
+                            continue
+                    await page.wait_for_timeout(800)
+                    return True
+            except Exception:
+                continue
+
+    # 最后直接寻找锁图标及其最近的可点击祖先。
+    for ctx in await _jj_all_contexts(page):
+        try:
+            locks = ctx.locator("i.fa-lock, .fa-lock")
+            count = await locks.count()
+            for i in range(min(count, 10)):
+                lock = locks.nth(i)
+                try:
+                    if not await lock.is_visible():
+                        continue
+                    await lock.evaluate("""el => {
+                        const target = el.closest('button,a,[role="button"],.input-group-addon,div') || el;
+                        target.click();
+                    }""")
+                    await page.wait_for_timeout(800)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    return False
+
+
+async def _jj_select_created_at(page):
+    """明确选择 JJ 的“建立日期”筛选类型。"""
+    selectors = [
+        "#date_type_selection_created_at",
+        "input[name='date_type_selection'][value='created_at']",
+        "input[name='date_type_selection'][value='created_at_gte']",
     ]
     for ctx in await _jj_all_contexts(page):
         for selector in selectors:
             try:
                 loc = ctx.locator(selector).first
-                if await loc.count() and await loc.is_visible():
-                    await loc.click()
+                if await loc.count():
+                    try:
+                        await loc.check(force=True)
+                    except Exception:
+                        await loc.evaluate("el => { el.checked = true; el.dispatchEvent(new Event('change',{bubbles:true})); }")
                     await page.wait_for_timeout(500)
-                    return
+                    return True
             except Exception:
                 continue
+    return False
 
 
 async def _jj_set_one_year_date(page):
-    now = datetime.now().astimezone()
+    """JJ 出货管理：建立日期严格设置为最近一年，并验证实际 value。"""
+    from datetime import timezone
+
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz)
     start_dt = now - timedelta(days=365)
 
-    def iso_value(dt):
-        offset = dt.strftime("%z")
-        offset = offset[:3] + ":" + offset[3:] if len(offset) == 5 else offset
-        return dt.strftime("%Y-%m-%dT%H:%M:%S") + offset
+    # JJ 实际输入框是 text；提交给 Rails 的值使用带时区的 ISO 格式。
+    start_value = start_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    end_value = now.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
-    start_value = iso_value(start_dt)
-    end_value = iso_value(now)
+    # 先明确选择“建立日期”，再解除暗锁。
+    await _jj_select_created_at(page)
+    await _jj_unlock_search_range(page)
 
-    # 日期欄位在 JJ 有時要解鎖/動態載入後才會出現；找不到時不要阻斷訂單號查詢。
     pairs = [
-        (["#q_created_at_gte", "input[name='q[created_at_gte]']"], start_value, "建立時間開始"),
-        (["#q_created_at_lte", "input[name='q[created_at_lte]']"], end_value, "建立時間結束"),
+        ("#q_created_at_gte", "#q_created_at_lte"),
+        ("input[name='q[created_at_gte]']", "input[name='q[created_at_lte]']"),
+        ("input.startdatetime", "input.enddatetime"),
+        (".input-daterange input.startdatetime", ".input-daterange input.enddatetime"),
     ]
-    for selectors, value, label in pairs:
+
+    async def set_value(locator, value):
+        await locator.evaluate("""(el, value) => {
+            el.removeAttribute('readonly');
+            el.removeAttribute('disabled');
+            el.disabled = false;
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+            setter.call(el, value);
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new Event('blur', {bubbles:true}));
+        }""", value)
+        # 某些 datetimepicker 会把 value 转成显示格式；如果没有保存，尝试 fill。
         try:
-            loc = await _jj_find_locator(page, selectors, timeout=15000, visible_only=False)
+            actual = await locator.input_value()
+            if actual != value:
+                await locator.fill(value)
         except Exception:
-            print(f"⚠️ JJ {label}欄位目前未找到，先略過日期設定")
-            continue
-        try:
-            await loc.evaluate("""(el, value) => {
-                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                setter.call(el, value);
-                el.dispatchEvent(new Event('input', {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new Event('blur', {bubbles:true}));
-            }""", value)
-        except Exception:
+            pass
+
+    for start_sel, end_sel in pairs:
+        for ctx in await _jj_all_contexts(page):
             try:
-                await loc.fill(value)
+                first = ctx.locator(start_sel).first
+                second = ctx.locator(end_sel).first
+                if await first.count() and await second.count():
+                    await first.wait_for(state="attached", timeout=5000)
+                    await second.wait_for(state="attached", timeout=5000)
+                    await set_value(first, start_value)
+                    await set_value(second, end_value)
+                    actual_start = await first.input_value()
+                    actual_end = await second.input_value()
+                    # 只要两个值都不是空的，就认为日期控件已经吃到范围。
+                    if actual_start.strip() and actual_end.strip():
+                        print(f"JJ 建立日期已设置：{actual_start} ~ {actual_end}")
+                        return True
             except Exception:
+                continue
+
+    # 备用：直接找所有 datetime/date-range 相关文字输入框。
+    for ctx in await _jj_all_contexts(page):
+        try:
+            inputs = ctx.locator("input[type='text']")
+            count = await inputs.count()
+            candidates = []
+            for i in range(count):
+                loc = inputs.nth(i)
                 try:
-                    await loc.fill(value[:16])
+                    iid = (await loc.get_attribute("id") or "").lower()
+                    name = (await loc.get_attribute("name") or "").lower()
+                    cls = (await loc.get_attribute("class") or "").lower()
+                    if "created_at" in iid or "created_at" in name or "datetime" in cls:
+                        candidates.append(loc)
                 except Exception:
-                    pass
+                    continue
+            if len(candidates) >= 2:
+                await set_value(candidates[0], start_value)
+                await set_value(candidates[1], end_value)
+                print("JJ 建立日期已通过备用定位设置")
+                return True
+        except Exception:
+            continue
+
+    raise Exception("JJ 找不到【建立日期】起止时间输入框，无法把查询范围拉回一年")
 
 async def _jj_find_order_input(page, kind):
     if kind == "platform":
@@ -1409,8 +1532,9 @@ async def _query_jj_order(single_order_no, task_id):
 
             await _login_generic(page, JJ_ADMIN_URL, JJ_ADMIN_USER, JJ_ADMIN_PASS, use_totp=True)
             await _jj_open_outbound(page)
-            await _jj_unlock_search_range(page)
-            await _jj_set_one_year_date(page)
+            date_ok = await _jj_set_one_year_date(page)
+            if not date_ok:
+                raise Exception("JJ 建立日期范围设置失败")
 
             # 第一优先：平台订单号
             await _jj_search(page, single_order_no, "platform")
