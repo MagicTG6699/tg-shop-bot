@@ -765,30 +765,140 @@ async def _select_any_option(select_loc):
 
 
 async def _single_search_account(page, account):
-    await page.goto(SINGLE_MERCHANTS_URL, wait_until="domcontentloaded", timeout=60000)
-    search_input = await _first_visible(page, [
-        "input[name*='account']",
-        "#search_account",
-        "input[type='search']",
-        "input[type='text']",
-    ])
-    if not search_input:
-        raise Exception("单笔商城找不到商户搜索框")
-    await search_input.fill(account)
+    """单笔商城查找商户。
 
-    search_btn = page.locator(
-        "button:has-text('搜尋'), button:has-text('搜索'), "
-        "input[type='submit'], .btn-primary"
-    ).first
-    try:
-        if await search_btn.is_visible():
-            await search_btn.click()
-        else:
-            await search_input.press("Enter")
-    except Exception:
-        await search_input.press("Enter")
+    不假设后台一定有固定的搜索框：优先使用搜索框；如果当前版本后台没有搜索框，
+    则直接扫描商户列表中的行/链接，避免因为 DOM 小改动导致整笔任务失败。
+    """
+    merchant_urls = [
+        SINGLE_MERCHANTS_URL,
+        f"{SINGLE_ADMIN_ORIGIN}/market_manager/merchants",
+        f"{SINGLE_ADMIN_ORIGIN}/market_managers/merchants",
+    ]
+    # 去重并保持顺序
+    merchant_urls = list(dict.fromkeys(merchant_urls))
 
-    await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
+    last_error = None
+    for merchants_url in merchant_urls:
+        try:
+            await page.goto(merchants_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(800)
+
+            # 如果后台把我们重新送回登录页，直接换下一个候选地址没有意义，
+            # 但给出明确错误会比「找不到搜索框」有用。
+            if "/sign_in" in page.url.lower():
+                last_error = f"页面被导回登录页：{page.url}"
+                continue
+
+            # 1) 优先寻找常见商户账号搜索框。
+            search_selectors = [
+                # DevTools 已确认单笔商城的帐号搜索框
+                "#q_username_eq",
+                "input[name=\"q[username_eq]\"]",
+                "#search_account",
+                "input[name*='account']",
+                "input[name*='username']",
+                "input[name*='merchant']",
+                "input[placeholder*='账号']",
+                "input[placeholder*='帳號']",
+                "input[placeholder*='帳户']",
+                "input[placeholder*='搜尋']",
+                "input[placeholder*='搜索']",
+                "input[type='search']",
+            ]
+            search_input = None
+            for selector in search_selectors:
+                loc = page.locator(selector).first
+                try:
+                    if await loc.count() and await loc.is_visible():
+                        search_input = loc
+                        break
+                except Exception:
+                    continue
+
+            if search_input:
+                await search_input.fill(account)
+                search_btn = page.locator(
+                    "#merchant_search button[type='submit'], "
+                    "#merchant_search input[type='submit'], "
+                    "#merchant_search .btn-primary, "
+                    "button:has-text('搜尋'), button:has-text('搜索'), "
+                    "button:has-text('查詢'), button:has-text('查询'), "
+                    "input[type='submit'], .btn-primary"
+                ).first
+                try:
+                    if await search_btn.count() and await search_btn.is_visible():
+                        await search_btn.click()
+                    else:
+                        await search_input.press("Enter")
+                except Exception:
+                    await search_input.press("Enter")
+                await page.wait_for_timeout(1000)
+
+                # 有结果即可返回；没有结果则继续下面的行扫描。
+                rows = page.locator("tbody tr")
+                try:
+                    await rows.first.wait_for(state="visible", timeout=10000)
+                except Exception:
+                    pass
+
+            # 2) 不依赖搜索框，扫描当前列表中包含账号的行。
+            rows = page.locator("tbody tr")
+            row_count = await rows.count()
+            for i in range(row_count):
+                row = rows.nth(i)
+                try:
+                    text = (await row.inner_text()).strip()
+                except Exception:
+                    continue
+                if account.lower() in text.lower():
+                    # 后续商品/充值步骤都从这一行取得入口。
+                    page._single_target_row = row
+                    return
+
+            # 3) 有些后台不是标准 tbody，直接找账号文字所在链接/元素，再向上找行。
+            exact_candidates = [
+                f"a:has-text('{account}')",
+                f"td:has-text('{account}')",
+                f"span:has-text('{account}')",
+                f"div:has-text('{account}')",
+            ]
+            for selector in exact_candidates:
+                locs = page.locator(selector)
+                count = await locs.count()
+                for i in range(min(count, 20)):
+                    loc = locs.nth(i)
+                    try:
+                        if not await loc.is_visible():
+                            continue
+                        # 优先回到 tr；如果没有，就使用元素自身的父层。
+                        row = loc.locator("xpath=ancestor::tr[1]")
+                        if await row.count():
+                            page._single_target_row = row.first
+                            return
+                        page._single_target_row = loc
+                        return
+                    except Exception:
+                        continue
+
+            last_error = f"{merchants_url} 页面找不到商户：{account}"
+        except Exception as e:
+            last_error = f"{merchants_url}: {type(e).__name__}: {e}"
+
+    raise Exception(f"单笔商城找不到商户【{account}】；已尝试列表页面。最后状态：{last_error}")
+
+
+async def _single_target_row(page):
+    row = getattr(page, "_single_target_row", None)
+    if row is not None:
+        try:
+            if await row.count():
+                return row
+        except Exception:
+            pass
+    row = page.locator("tbody tr").first
+    await row.wait_for(state="visible", timeout=30000)
+    return row
 
 
 async def _create_single_shop(info: dict, task_id: str):
@@ -942,12 +1052,16 @@ async def _create_single_shop(info: dict, task_id: str):
             await _single_search_account(page, final_account)
             shop_url = ""
             try:
-                shop_url = (await page.locator("tbody tr").first.locator("td").nth(3).inner_text()).strip()
+                shop_row = await _single_target_row(page)
+                try:
+                    shop_url = (await shop_row.locator("td").nth(3).inner_text()).strip()
+                except Exception:
+                    shop_url = ""
             except Exception:
                 shop_url = ""
 
             # 商品 60
-            await page.locator("tbody tr").first.locator("a[href$='/items']").click()
+            await _single_target_row(page).locator("a[href$='/items']").click()
             await page.wait_for_load_state("domcontentloaded")
             import_btn = page.locator("a[href*='/items/new'], a:has-text('導入商品'), a:has-text('导入商品')").first
             await import_btn.wait_for(state="visible", timeout=20000)
@@ -959,7 +1073,7 @@ async def _create_single_shop(info: dict, task_id: str):
             # 非银行付款才移除默认银行占位符
             if info_type != "bank":
                 await _single_search_account(page, final_account)
-                await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
+                await _single_target_row(page).locator("a[href$='/edit']").click()
                 await page.wait_for_load_state("domcontentloaded")
                 bank_section = page.locator(
                     ".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)"
@@ -1505,7 +1619,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 await search_input.press("Enter")
             await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
-            await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
+            await _single_target_row(page).locator("a[href$='/edit']").click()
             await page.wait_for_load_state("domcontentloaded")
 
             shop_template = page.locator("#merchant_store_skin_type")
