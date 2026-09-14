@@ -1096,22 +1096,47 @@ async def _create_single_shop(info: dict, task_id: str):
 
 
 async def _jj_open_outbound(page):
+    # JJ 实际页面的出货管理入口可能是 /admin/guest_payment_orders，
+    # 点击菜单后要等待查询表单真正出现在 DOM，不能只等 domcontentloaded。
     candidates = [
         "a:has-text('出货管理')",
         "a:has-text('出貨管理')",
-        "a[href='guest_payment_orders']",
+        "a[href*='guest_payment_orders']",
     ]
     for selector in candidates:
         loc = page.locator(selector).first
         try:
-            if await loc.is_visible():
-                await loc.click()
-                await page.wait_for_load_state("domcontentloaded")
-                return
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=10000)
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                # 关键：等待实际的 JJ 查询表单，而不是猜页面已经加载完成。
+                try:
+                    await page.locator("#guest_payment_order_search").wait_for(
+                        state="visible", timeout=20000
+                    )
+                    return
+                except Exception:
+                    # 如果点击没有真正切页，继续尝试下一个入口。
+                    continue
         except Exception:
             continue
-    if "guest_payment_orders" not in page.url:
-        raise Exception("JJ 后台找不到【出货管理】页面入口")
+
+    # 最后直接打开截图中确认的 guest_payment_orders 路由。
+    try:
+        from urllib.parse import urljoin
+        target = urljoin(page.url, "/admin/guest_payment_orders")
+        await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+        await page.locator("#guest_payment_order_search").wait_for(
+            state="visible", timeout=20000
+        )
+        return
+    except Exception as e:
+        raise Exception(
+            f"JJ 后台无法打开【出货管理】查询页面；当前网址：{page.url}；原因：{e}"
+        )
 
 
 async def _jj_unlock_search_range(page):
@@ -1180,19 +1205,36 @@ async def _jj_set_one_year_date(page):
     start_value = start_dt.isoformat(timespec="seconds")
     end_value = now.isoformat(timespec="seconds")
 
-    start = page.locator("#q_created_at_gte")
-    end = page.locator("#q_created_at_lte")
-
-    # 等待实际 DOM 出现。不能先用 count()，因为日期插件可能稍后才渲染。
+    # DevTools 已确认的实际字段：
+    #   <input ... name="q[created_at_gte]" id="q_created_at_gte">
+    #   <input ... name="q[created_at_lte]" id="q_created_at_lte">
+    # 优先按 id，备用按 name；同时先确认 JJ 查询表单已经加载。
     try:
-        await start.wait_for(state="attached", timeout=10000)
-        await end.wait_for(state="attached", timeout=10000)
+        await page.locator("#guest_payment_order_search").wait_for(
+            state="visible", timeout=20000
+        )
     except Exception:
-        # name 是同一个实际字段，再给一次明确的备用定位。
-        start = page.locator("input[name='q[created_at_gte]']")
-        end = page.locator("input[name='q[created_at_lte]']")
-        await start.wait_for(state="attached", timeout=10000)
-        await end.wait_for(state="attached", timeout=10000)
+        raise Exception(
+            f"JJ 出货管理查询表单尚未加载；当前网址：{page.url}"
+        )
+
+    start = page.locator("#q_created_at_gte").first
+    end = page.locator("#q_created_at_lte").first
+
+    try:
+        await start.wait_for(state="attached", timeout=20000)
+        await end.wait_for(state="attached", timeout=20000)
+    except Exception:
+        # 实际 name 是 q[created_at_gte] / q[created_at_lte]。
+        start = page.locator("input[name=\"q[created_at_gte]\"]").first
+        end = page.locator("input[name=\"q[created_at_lte]\"]").first
+        try:
+            await start.wait_for(state="attached", timeout=10000)
+            await end.wait_for(state="attached", timeout=10000)
+        except Exception as e:
+            raise Exception(
+                f"JJ 找不到建立日期输入框；当前网址：{page.url}；原因：{e}"
+            )
 
     async def set_datetime(locator, value):
         # JJ 使用 datetimepicker，普通 fill 有时会被插件拦截。
