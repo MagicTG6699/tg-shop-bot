@@ -377,7 +377,8 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{BASE_ADMIN_URL}/merchants/new", wait_until="domcontentloaded")
-                await page.locator("#merchant_username").wait_for(state="visible", timeout=20000)
+                merchant_username = page.locator("#merchant_username").first
+                await merchant_username.wait_for(state="visible", timeout=20000)
 
                 await merchant_username.fill(current_account)
                 if await page.locator("#merchant_password").is_visible():
@@ -734,15 +735,22 @@ async def _select_any_option(select_loc):
 
 
 async def _single_search_account(page, account):
-    await page.goto(f"{SINGLE_ADMIN_ROOT}/merchants", wait_until="domcontentloaded")
+    # 单笔商城实际商户列表是 /market_manager/merchants，搜索框实际为 q_username_eq。
+    await page.goto(f"{SINGLE_ADMIN_ROOT}/market_manager/merchants", wait_until="domcontentloaded")
+
+    # 优先使用截图/DevTools 已确认的真实字段，再做旧版兼容。
     search_input = await _first_visible(page, [
+        "#q_username_eq",
+        "input[name='q[username_eq]']",
+        "#q_username",
+        "input[name='q[username]']",
         "input[name*='account']",
         "#search_account",
         "input[type='search']",
         "input[type='text']",
     ], timeout=8000)
     if not search_input:
-        raise Exception("单笔商城找不到商户搜索框")
+        raise Exception(f"单笔商城找不到商户搜索框；当前地址：{page.url}；标题：{await page.title()}")
     await search_input.fill(account)
 
     search_btn = await _first_visible(page, [
@@ -1049,6 +1057,8 @@ async def _jj_set_one_year_date(page):
 async def _jj_find_order_input(page, kind):
     if kind == "platform":
         selectors = [
+            "#q_id_eq",
+            "input[name='q[id_eq]']",
             "#q_id",
             "input[name='q[id]']",
             "input[placeholder*='平台订单']",
@@ -1057,6 +1067,8 @@ async def _jj_find_order_input(page, kind):
         label = "平台订单号"
     else:
         selectors = [
+            "#q_merchant_order_id_or_order_trade_id_eq",
+            "input[name='q[merchant_order_id_or_order_trade_id_eq]']",
             "#q_merchant_order_id_or_order_trade_id",
             "input[name='q[merchant_order_id_or_order_trade_id]']",
             "input[placeholder*='其他订单']",
