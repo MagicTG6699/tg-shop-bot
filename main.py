@@ -1757,8 +1757,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     click_user_id = query.from_user.id
 
+    # Telegram 的 callback query 必须尽快 answer。若先做网页操作再 answer，
+    # 网页操作稍慢时 Telegram 会返回：Query is too old and response timeout expired。
+    # 因此所有普通按钮在进入分支前先立即确认一次，后面不再重复 answer。
+    if data != "ignore":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
     if data == "ignore":
-        await query.answer("⏳ 正在修改界面中，请勿重复点击...", show_alert=False)
+        try:
+            await query.answer("⏳ 正在修改界面中，请勿重复点击...", show_alert=False)
+        except Exception:
+            pass
         return
 
     if data.startswith("cancel:"):
@@ -1791,19 +1803,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, account, current_skin = data.split(":", 2)
         keyboard = build_skin_options_keyboard(account, current_skin)
         await query.edit_message_reply_markup(reply_markup=keyboard)
-        await query.answer()
 
     elif data.startswith("cl:"):
         _, account, current_skin = data.split(":", 2)
         keyboard = build_main_keyboard(account, current_skin)
         await query.edit_message_reply_markup(reply_markup=keyboard)
-        await query.answer()
 
     elif data.startswith("sk:"):
         _, skin_key, account = data.split(":", 2)
         new_skin_name = SKIN_OPTIONS.get(skin_key, "极速微商")
 
-        await query.answer(f"⏳ 正在切换界面为【{new_skin_name}】...", show_alert=False)
+        # callback query 已在函数开头立即 answer，这里不再重复 answer。
 
         # 切换按钮为防重复点击状态
         loading_keyboard = InlineKeyboardMarkup([
@@ -1815,11 +1825,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_shop_skin(account, new_skin_name)
             keyboard = build_main_keyboard(account, new_skin_name)
             await query.edit_message_reply_markup(reply_markup=keyboard)
-            await query.answer(f"✅ 界面已成功更改为: {new_skin_name}", show_alert=True)
         except Exception as e:
             keyboard = build_skin_options_keyboard(account)
             await query.edit_message_reply_markup(reply_markup=keyboard)
-            await query.answer(f"❌ 修改界面失败: {str(e)}", show_alert=True)
 
 
 # 6. 主程序入口
