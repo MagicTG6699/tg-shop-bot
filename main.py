@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Helper: 保留完整的传入 URL，仅做首尾空格清理与协议补全，绝不裁切路径
+# Helper: 保留完整的传入 URL，仅做首尾空格清理与协议补全
 def _get_clean_domain(url: str) -> str:
     if not url:
         return ""
@@ -67,10 +67,10 @@ MANAGER_RECEIVE_NAME = "管理员代收"
 # 全局任务字典
 ACTIVE_TASKS = {}
 
-# 【建店专用排队锁】：同时只允许 1 个建店任务在后台运行，后续建店请求自动排队
+# 排队锁：同时只允许 1 个建店任务在后台运行
 BUILD_SHOP_SEMAPHORE = asyncio.Semaphore(1)
 
-# 商城界面选项（与后台对应）
+# 商城界面选项
 SKIN_OPTIONS = {
     "jisumeishang": "极速微商",
     "qimiao": "七喵",
@@ -306,7 +306,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
-# 3. Playwright 自动化建店逻辑
+# 3. Playwright 自动化建店逻辑 (全部商城)
 async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
@@ -337,7 +337,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 await click_locator.click()
                 await wait_locator.wait_for(state="visible", timeout=timeout)
 
-            # 1. 登录后台 (直接访问环境变量配置的 BASE_ADMIN_URL)
+            # 1. 登录后台
             await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
             user_input = page.locator(
                 "input[name='market_manager[username]'], #admin_user_email, #user_email, input[type='email'], input[name='email'], input[name='login'], input[name='username'], input[type='text']"
@@ -350,12 +350,11 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await user_input.fill(ADMIN_USER)
             await page.locator("#admin_user_password, #user_password, input[type='password']").first.fill(ADMIN_PASS)
-            
+
             submit_btn = page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first
             await submit_btn.click()
             await page.wait_for_load_state("domcontentloaded")
 
-            # 提取基础域名根路径用于页面跳转
             domain_root = "/".join(BASE_ADMIN_URL.split("/")[:3])
 
             async def search_account(acc_name: str):
@@ -372,7 +371,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
                 await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
-            # 2. 尝试递增后缀建店
+            # 2. 递增后缀建店
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
                 await page.goto(f"{domain_root}/merchants/new", wait_until="domcontentloaded")
@@ -452,7 +451,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 try:
                     await coro
                 except Exception as sub_e:
-                    print(f"⚠️ [{step_name}] 执行失败或超时（不影响建店主体）: {sub_e}")
+                    print(f"⚠️ [{step_name}] 执行失败或超时: {sub_e}")
 
             # 4. 批量商品
             async def step_items():
@@ -470,16 +469,16 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
 
             await run_sub_step("导入商品", step_items())
 
-            # 5. 移除默认填充的银行卡占位符
+            # 5. 移除默认占位符
             if info_type != "bank":
                 async def step_remove_placeholder():
                     await search_account(final_account)
                     await page.locator("tbody tr").first.locator("a[href$='edit']").click()
                     await page.wait_for_load_state("domcontentloaded")
-                    
+
                     bank_section = page.locator(".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)").first
                     remove_btn = bank_section.locator("a.remove_fields, a:has-text('移除')").first
-                    
+
                     if not await remove_btn.is_visible():
                         remove_btn = page.locator("a.remove_fields, a:has-text('移除')").first
 
@@ -516,7 +515,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 )
                 withdraw_btn = page.locator("a:has-text('輸入拼多多訂單'), a:has-text('輸入提現訂單'), a[href='withdraws/new']").first
                 await withdraw_btn.click()
-                
+
                 qty_input = page.locator("#quantity, input[name='quantity']")
                 await qty_input.wait_for(state="visible", timeout=20000)
                 await qty_input.fill("6000")
@@ -541,7 +540,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 pass
 
 
-# 单笔商城 + JJ 订单后台辅助函数
+# 单笔商城辅助函数
 def _clean_text_value(value):
     return re.sub(r'\s+', ' ', (value or "").strip())
 
@@ -550,17 +549,13 @@ def _looks_like_human_name(value: str) -> bool:
     value = _clean_text_value(value)
     if not value or len(value) > 40:
         return False
-
     if re.search(r'\d', value):
         return False
-
     if re.fullmatch(r'[\u4e00-\u9fff]{2,6}', value):
         return True
-
     if re.fullmatch(r"[A-Za-z][A-Za-z '-]{1,39}", value):
         letters = re.sub(r'[^A-Za-z]', '', value)
         return len(letters) >= 2
-
     return False
 
 
@@ -605,7 +600,6 @@ async def _login_generic(page, url, username, password, use_totp=False):
     await page.goto(url, wait_until="domcontentloaded")
     page.set_default_timeout(20000)
 
-    # 精确匹配登录表单中的账号、密码框与提交按钮
     user_input = page.locator(
         "input[name='market_manager[username]'], "
         "input[name='jj_manager[username]'], "
@@ -630,7 +624,6 @@ async def _login_generic(page, url, username, password, use_totp=False):
             raise Exception("缺少 pyotp，请在 requirements.txt 加入 pyotp")
 
         totp_code = pyotp.TOTP(JJ_2FA_SECRET).now()
-
         totp = page.locator(
             "input[name='otp'], input[name='2fa'], input[name='code'], "
             "input[placeholder='Google'], input[placeholder='验证码'], "
@@ -751,7 +744,7 @@ async def _single_search_account(page, account):
     await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
 
-# 重构强化版的 _create_single_shop 函数，包含精确定位与重定向拦截检测
+# 适应单笔商城 /market_managers 路由结构的建店函数
 async def _create_single_shop(info: dict, task_id: str):
     if not SINGLE_ADMIN_URL:
         raise Exception("未检测到环境变量 SINGLE_ADMIN_URL！")
@@ -781,21 +774,22 @@ async def _create_single_shop(info: dict, task_id: str):
             if task_id in ACTIVE_TASKS:
                 ACTIVE_TASKS[task_id]["page"] = page
 
-            # 1. 执行登录
-            await _login_generic(page, SINGLE_ADMIN_URL, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
+            # 1. 执行登录 (如果配置没带/sign_in，补全访问)
+            login_target = SINGLE_ADMIN_URL if "sign_in" in SINGLE_ADMIN_URL else f"{domain_root}/market_managers/sign_in"
+            await _login_generic(page, login_target, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                
-                # 2. 打开建店页面
+
+                # 2. 跳转至单笔商城的 market_managers/merchants/new 建店路径
                 target_url = f"{domain_root}/market_managers/merchants/new"
                 await page.goto(target_url, wait_until="domcontentloaded")
-                
-                # 检查页面是否被重新定向到了登录页
-                if "login" in page.url or "sign_in" in page.url:
-                    raise Exception(f"登录失效或未成功登录，页面被拦截重定向至: {page.url}")
 
-                # 3. 增强选择器：寻找多可能性的账号输入框
+                # 检查页面是否处于登录状态
+                if "sign_in" in page.url or "login" in page.url:
+                    raise Exception(f"登录失效，重新被引导至登录页: {page.url}")
+
+                # 3. 元素定位
                 username_input = page.locator(
                     "#merchant_username, "
                     "input[name='market_manager[username]'], "
@@ -812,7 +806,7 @@ async def _create_single_shop(info: dict, task_id: str):
                 except Exception:
                     curr_url = page.url
                     curr_title = await page.title()
-                    raise Exception(f"无法定位到建店账号框！页面标题: [{curr_title}] | URL: {curr_url}")
+                    raise Exception(f"无法定位输入框！当前标题: [{curr_title}] | URL: {curr_url}")
 
                 await username_input.fill(current_account)
 
@@ -918,7 +912,7 @@ async def _create_single_shop(info: dict, task_id: str):
             await page.locator("button[type='submit'], input[name='commit'], input[value='送出']").first.click()
             await page.wait_for_load_state("domcontentloaded")
 
-            # 非银行付款才移除默认银行占位符
+            # 移除银行卡占位符
             if info_type != "bank":
                 await _single_search_account(page, final_account)
                 await page.locator("tbody tr").first.locator("a[href$='edit']").click()
@@ -941,7 +935,7 @@ async def _create_single_shop(info: dict, task_id: str):
             # JJ 查询
             jj_result = await _query_jj_order(info["single_order_no"], task_id)
 
-            # 回单笔商城充值
+            # 单笔商城充值
             recharge_result = await _single_recharge(
                 page=page,
                 account=final_account,
@@ -1443,7 +1437,7 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 pass
 
 
-# 默认主按钮键盘
+# 主按钮键盘
 def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
@@ -1452,7 +1446,7 @@ def build_main_keyboard(account: str, current_skin: str = "极速微商") -> Inl
     return InlineKeyboardMarkup(buttons)
 
 
-# 展开风格选项键盘
+# 风格键盘
 def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
     buttons = [
@@ -1526,7 +1520,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 
-# 建店 Worker 包装（含排队锁控制）
+# Worker 包装
 async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False):
     try:
         if BUILD_SHOP_SEMAPHORE.locked():
