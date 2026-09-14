@@ -1164,59 +1164,78 @@ async def _jj_unlock_search_range(page):
 
 
 async def _jj_set_one_year_date(page):
-    """JJ 出货管理：建立日期设为当前时间往前 1 年到当前时间。
-
-    截图确认实际字段是 Ransack 的 q[created_at_gte] / q[created_at_lte]，
-    type=text，value 使用 ISO datetime（含 +08:00）。
-    """
+    """JJ 出货管理：把「建立日期」设为当前时间往前 1 年到当前时间。"""
     from datetime import timezone
 
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz)
     start_dt = now - timedelta(days=365)
 
+    # 你截图里建立日期两个输入框实际带有 startdatetime / enddatetime class。
+    # 先直接用 class 定位，避免再依赖容易变化的 name/id。
     pairs = [
+        ("input.startdatetime", "input.enddatetime"),
+        (".input-daterange input.startdatetime", ".input-daterange input.enddatetime"),
         ("input[name='q[created_at_gte]']", "input[name='q[created_at_lte]']"),
         ("#q_created_at_gte", "#q_created_at_lte"),
         ("#q_created_at_gteq", "#q_created_at_lteq"),
         ("input[name='q[created_at_gteq]']", "input[name='q[created_at_lteq]']"),
     ]
 
-    def value_for(dt):
-        return dt.isoformat(timespec="seconds")
+    # 页面显示格式是 2026/09/15 03:00；直接写这个格式最稳。
+    start_value = start_dt.strftime("%Y/%m/%d %H:%M")
+    end_value = now.strftime("%Y/%m/%d %H:%M")
+
+    async def set_value(locator, value):
+        # 某些 datetimepicker 会拦截 Playwright.fill，因此直接写 DOM value
+        # 并触发 input/change 事件，让后台表单能收到新值。
+        await locator.evaluate(
+            """(el, value) => {
+                el.removeAttribute('readonly');
+                el.disabled = false;
+                el.value = value;
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur', {bubbles:true}));
+            }""",
+            value,
+        )
 
     for start_sel, end_sel in pairs:
         first = page.locator(start_sel).first
         second = page.locator(end_sel).first
         try:
             if await first.count() and await second.count():
-                await first.wait_for(state="visible", timeout=3000)
-                await second.wait_for(state="visible", timeout=3000)
-                if await first.is_disabled() or await second.is_disabled():
-                    continue
-                await first.fill(value_for(start_dt))
-                await second.fill(value_for(now))
+                await first.wait_for(state="attached", timeout=3000)
+                await second.wait_for(state="attached", timeout=3000)
+                await set_value(first, start_value)
+                await set_value(second, end_value)
                 return
         except Exception:
             continue
 
-    # 备用：根据「建立日期」的 form-group 找两个输入框。
+    # 最后一层备用：直接从建立日期那一列的 input-daterange 抓前两个文字输入框。
     try:
-        label = page.get_by_text("建立日期", exact=True).first
-        if await label.count() and await label.is_visible():
-            for level in range(1, 5):
-                ancestor = label.locator("xpath=" + "/.." * level)
-                inputs = ancestor.locator("input:not([type='hidden']):not([type='radio'])")
-                if await inputs.count() >= 2:
-                    first, second = inputs.nth(0), inputs.nth(1)
-                    if await first.is_visible() and await second.is_visible() and not await first.is_disabled() and not await second.is_disabled():
-                        await first.fill(value_for(start_dt))
-                        await second.fill(value_for(now))
-                        return
+        daterange = page.locator(".input-daterange").first
+        if await daterange.count():
+            inputs = daterange.locator("input[type='text']")
+            if await inputs.count() >= 2:
+                await set_value(inputs.nth(0), start_value)
+                await set_value(inputs.nth(1), end_value)
+                return
     except Exception:
         pass
 
-    raise Exception("JJ 找不到【建立日期】起止时间输入框")
+    # 报错时把页面实际找到的日期类输入框资讯一起带回来，方便下一次直接定位。
+    try:
+        info = await page.locator("input").evaluate_all(
+            """els => els.map(e => ({id:e.id,name:e.name,cls:e.className,type:e.type,value:e.value}))
+                        .filter(x => String(x.cls).includes('datetime') || String(x.value).match(/^\d{4}[\/-]\d{2}/))
+                        .slice(0,12)"""
+        )
+    except Exception:
+        info = []
+    raise Exception(f"JJ 找不到【建立日期】起止时间输入框；实际日期输入框：{info}")
 
 
 async def _jj_find_order_input(page, kind):
