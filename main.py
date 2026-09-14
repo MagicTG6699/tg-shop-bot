@@ -719,7 +719,7 @@ async def _select_any_option(select_loc):
 async def _single_search_account(page, account):
     domain_root = "/".join(SINGLE_ADMIN_URL.split("/")[:3])
     # 单笔商城使用 /market_managers 命名空间
-    await page.goto(f"{domain_root}/market_managers/merchants", wait_until="domcontentloaded")
+    await page.goto(f"{domain_root}/market_manager/merchants", wait_until="domcontentloaded")
     search_input = await _first_visible(page, [
         "input[name='account']",
         "#search_account",
@@ -782,8 +782,8 @@ async def _create_single_shop(info: dict, task_id: str):
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
 
-                # 2. 跳转至单笔商城 /market_managers/merchants/new 建店路径
-                target_url = f"{domain_root}/market_managers/merchants/new"
+                # 2. 跳转至单笔商城 /market_manager/merchants/new 建店路径
+                target_url = f"{domain_root}/market_manager/merchants/new"
                 await page.goto(target_url, wait_until="domcontentloaded")
 
                 # 检查页面是否处于登录状态
