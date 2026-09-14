@@ -1444,38 +1444,110 @@ async def _query_jj_order(single_order_no, task_id):
             if not cells:
                 raise Exception(f"JJ 找不到订单：{single_order_no}")
 
-            # JJ 的状态实际位于目标订单这一行最右侧，页面显示类似：
-            # 「成功（已補單）」/「成功（已补单）」或「失败（失敗）」。
-            # 不能只依赖 thead 的「状态」表头，因为该后台部分版本的表头
-            # 并不放在标准 <thead>，导致之前 status_text 为空。
+            # ===== JJ 状态判断：必须只从“目标订单那一行”读取 =====
+            # 你提供的 DevTools 已确认：目标结果是
+            # <tr id="guest_payment_order_<完整UUID>"> ... </tr>
+            # 页面右侧状态栏显示“成功（已補單）”等文字。
+            # 这里不再依赖 thead，也不再依赖列顺序。
             status_text = _cell_by_header(headers, cells, ["状态", "狀態"])
             full_row = " | ".join(cells)
 
-            # 第一优先：直接读取“精确订单行”的完整 inner_text，再从该行识别状态。
-            # 这样不会把页面上方统计卡片的「成功订单数」误认为订单状态。
+            exact_status_row = None
             row_status_text = ""
+            row_html = ""
             try:
-                exact_status_row = page.locator(f"tr#guest_payment_order_{single_order_no}").first
+                exact_status_row = page.locator(
+                    f"tr#guest_payment_order_{single_order_no}"
+                ).first
                 if await exact_status_row.count():
                     row_status_text = _clean_text_value(await exact_status_row.inner_text())
+                    try:
+                        row_html = await exact_status_row.inner_html()
+                    except Exception:
+                        row_html = ""
             except Exception:
-                pass
+                exact_status_row = None
 
-            combined_status_source = row_status_text or status_text or full_row
-            # 成功状态允许「成功」「成功（已補單）」「成功（已补单）」等版本。
-            # 失败同理；失败订单没有貨運/配送时间是正常情况。
-            success_match = re.search(r"成功(?:\s*[（(][^）)]*(?:補單|补单)[^）)]*[）)])?", combined_status_source, re.I)
-            failed_match = re.search(r"(?:失败|失敗)(?:\s*[（(][^）)]*[^）)]*[）)])?", combined_status_source, re.I)
+            # 有些 JJ 版本会把状态放在 badge/span 的 title、data-* 或 class 中，
+            # 因此同时扫描目标订单行的文字 + HTML 属性。
+            status_sources = [row_status_text, status_text, full_row, row_html]
+            if exact_status_row is not None:
+                try:
+                    status_nodes = exact_status_row.locator(
+                        "[title], [data-original-title], [data-status], "
+                        "[data-value], .label, .badge, .status, [class*='status'], "
+                        "[class*='success'], [class*='danger'], [class*='failed']"
+                    )
+                    for si in range(await status_nodes.count()):
+                        node = status_nodes.nth(si)
+                        try:
+                            txt = _clean_text_value(await node.inner_text())
+                            if txt:
+                                status_sources.append(txt)
+                        except Exception:
+                            pass
+                        for attr in ["title", "data-original-title", "data-status", "data-value", "class"]:
+                            try:
+                                val = await node.get_attribute(attr)
+                                if val:
+                                    status_sources.append(val)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
-            is_failed = bool(failed_match) and not bool(success_match)
-            is_success = bool(success_match)
+            combined_status_source = " | ".join(x for x in status_sources if x)
 
-            # 如果精确行没有抓到状态，再扫描当前结果表格中“状态”相关的单元格，
-            # 但只接受包含成功/失败字样的单元格，避免被其他字段干扰。
+            # 只接受明确的成功/失败关键词。
+            # 成功订单：有“成功”即可，不要求一定出现“已補單”。
+            # 失败订单：允许繁简体。
+            success_match = re.search(r"成功", combined_status_source, re.I)
+            failed_match = re.search(r"(?:失败|失敗)", combined_status_source, re.I)
+
+            # 如果页面同时出现“成功订单数”等统计文字，绝不能拿它判断。
+            # 此处优先使用目标 tr；只有目标 tr 完全无法定位时才使用 cells。
+            if exact_status_row is not None and await exact_status_row.count():
+                target_sources = [row_status_text, row_html]
+                if exact_status_row is not None:
+                    try:
+                        target_nodes = exact_status_row.locator(
+                            ".label, .badge, .status, [class*='status'], "
+                            "[class*='success'], [class*='danger'], [class*='failed'], "
+                            "[title], [data-original-title], [data-status]"
+                        )
+                        for ti in range(await target_nodes.count()):
+                            node = target_nodes.nth(ti)
+                            try:
+                                target_sources.append(_clean_text_value(await node.inner_text()))
+                            except Exception:
+                                pass
+                            for attr in ["title", "data-original-title", "data-status", "class"]:
+                                try:
+                                    val = await node.get_attribute(attr)
+                                    if val:
+                                        target_sources.append(val)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                target_status_source = " | ".join(x for x in target_sources if x)
+                target_success = bool(re.search(r"成功", target_status_source, re.I))
+                target_failed = bool(re.search(r"(?:失败|失敗)", target_status_source, re.I))
+                if target_success or target_failed:
+                    is_success = target_success
+                    is_failed = target_failed and not target_success
+                else:
+                    is_success = False
+                    is_failed = False
+            else:
+                is_success = bool(success_match)
+                is_failed = bool(failed_match) and not is_success
+
+            # 最后的 cells 兜底：只扫描当前目标订单行，不扫描页面其它区域。
             if not is_success and not is_failed:
                 for cell in cells:
                     nc = _clean_text_value(cell)
-                    if re.search(r"(?:成功|成功（已補單）|成功（已补单）)", nc, re.I):
+                    if re.search(r"成功", nc, re.I):
                         is_success = True
                         status_text = nc
                         break
@@ -1485,8 +1557,7 @@ async def _query_jj_order(single_order_no, task_id):
                         break
 
             if not is_success and not is_failed:
-                # 只有在确实无法从目标订单行判断时才报错。
-                raise Exception(f"JJ 订单状态无法判断：{combined_status_source[:800]}")
+                raise Exception(f"JJ 订单状态无法判断：{row_status_text[:1000] or full_row[:1000]}")
 
             order_no = _cell_by_header(headers, cells, ["平台订单", "平台訂單", "订单号", "訂單號"])
             recipient_raw = _cell_by_header(headers, cells, ["商户会员", "商戶會員", "实名", "實名", "收件人", "收件人姓名"])
