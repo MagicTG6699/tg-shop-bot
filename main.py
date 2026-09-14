@@ -751,6 +751,7 @@ async def _single_search_account(page, account):
     await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
 
+# 重构强化版的 _create_single_shop 函数，包含精确定位与重定向拦截检测
 async def _create_single_shop(info: dict, task_id: str):
     if not SINGLE_ADMIN_URL:
         raise Exception("未检测到环境变量 SINGLE_ADMIN_URL！")
@@ -780,22 +781,39 @@ async def _create_single_shop(info: dict, task_id: str):
             if task_id in ACTIVE_TASKS:
                 ACTIVE_TASKS[task_id]["page"] = page
 
+            # 1. 执行登录
             await _login_generic(page, SINGLE_ADMIN_URL, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{domain_root}/market_managers/merchants/new", wait_until="domcontentloaded")
                 
+                # 2. 打开建店页面
+                target_url = f"{domain_root}/market_managers/merchants/new"
+                await page.goto(target_url, wait_until="domcontentloaded")
+                
+                # 检查页面是否被重新定向到了登录页
+                if "login" in page.url or "sign_in" in page.url:
+                    raise Exception(f"登录失效或未成功登录，页面被拦截重定向至: {page.url}")
+
+                # 3. 增强选择器：寻找多可能性的账号输入框
                 username_input = page.locator(
-                    "input[name='market_manager[username]'], "
                     "#merchant_username, "
+                    "input[name='market_manager[username]'], "
                     "input[name='merchant[username]'], "
                     "input[name='username'], "
                     "input[name='account'], "
-                    "input[placeholder='帐号'], "
-                    "input[placeholder='账号']"
+                    "input[placeholder*='帐号'], "
+                    "input[placeholder*='账号'], "
+                    "form input[type='text']"
                 ).first
-                await username_input.wait_for(state="visible", timeout=30000)
+
+                try:
+                    await username_input.wait_for(state="visible", timeout=10000)
+                except Exception:
+                    curr_url = page.url
+                    curr_title = await page.title()
+                    raise Exception(f"无法定位到建店账号框！页面标题: [{curr_title}] | URL: {curr_url}")
+
                 await username_input.fill(current_account)
 
                 for sel in ["input[name='market_manager[password]']", "#merchant_password", "#merchant_password_confirmation"]:
