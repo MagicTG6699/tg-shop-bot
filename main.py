@@ -398,7 +398,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 default_num = "6226220809397366"
 
                 bank_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']").first
-                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_bank_branch_name, #merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
+                branch_name_input = page.locator("#merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']").first
                 card_no_input = page.locator("#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']").first
 
                 if info_type == "bank":
@@ -597,8 +597,13 @@ async def _login_generic(page, url, username, password, use_totp=False):
     if not username or not password:
         raise Exception("后台账号或密码未配置")
 
-    await page.goto(url, wait_until="domcontentloaded")
     page.set_default_timeout(20000)
+    page.set_default_navigation_timeout(30000)
+    await page.goto(url, wait_until="commit", timeout=30000)
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
 
     user_input = page.locator(
         "input[name='market_manager[username]'], "
@@ -651,8 +656,22 @@ async def _login_generic(page, url, username, password, use_totp=False):
     submit_btn = page.locator(
         "button[type='submit'], input[type='submit'], input[name='commit']"
     ).first
+    await submit_btn.wait_for(state="visible", timeout=10000)
     await submit_btn.click()
-    await page.wait_for_load_state("domcontentloaded")
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(500)
+
+    if "sign_in" in page.url.lower() or "login" in page.url.lower():
+        # 登录失败时立即报错，不继续等待建店页。
+        body = ""
+        try:
+            body = (await page.locator("body").inner_text())[:500]
+        except Exception:
+            pass
+        raise Exception(f"后台登录没有成功，当前 URL：{page.url}；页面文字：{body}")
 
 
 async def _first_visible(page, selectors, timeout=5000):
@@ -718,7 +737,7 @@ async def _select_any_option(select_loc):
 
 async def _single_search_account(page, account):
     domain_root = "/".join(SINGLE_ADMIN_URL.split("/")[:3])
-    # 单笔商城使用 /market_managers 命名空间
+    # 修正单数 market_manager 路径
     await page.goto(f"{domain_root}/market_manager/merchants", wait_until="domcontentloaded")
     search_input = await _first_visible(page, [
         "input[name='account']",
@@ -745,134 +764,191 @@ async def _single_search_account(page, account):
     await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
 
-# 单笔商城 /market_managers 路由结构的建店函数
+# 适应单笔商城 /market_manager 路由结构的建店函数
 async def _create_single_shop(info: dict, task_id: str):
+    """单笔商城建店。
+    登录地址与建店地址是两个不同路由：
+      登录: /market_managers/sign_in
+      建店: /market_manager/merchants/new
+    """
     if not SINGLE_ADMIN_URL:
         raise Exception("未检测到环境变量 SINGLE_ADMIN_URL！")
     if not SINGLE_ADMIN_USER or not SINGLE_ADMIN_PASS:
-        raise Exception("未检测到 SINGLE_ADMIN_USER 或 SINGLE_ADMIN_PASS！")
+        raise Exception("未检测到 SINGLE_ADMIN_USER / SINGLE_ADMIN_PASS！")
 
     base_account = info["account"]
     target_skin = info.get("skin", "极速微商")
     info_type = info.get("type", "alipay")
-    suffix_num = 0
     final_account = base_account
     domain_root = "/".join(SINGLE_ADMIN_URL.split("/")[:3])
+    login_target = SINGLE_ADMIN_URL
+    create_url = f"{domain_root}/market_manager/merchants/new"
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
             args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
         try:
             context = await browser.new_context()
             page = await context.new_page()
             page.set_default_timeout(20000)
+            page.set_default_navigation_timeout(30000)
+
             if task_id in ACTIVE_TASKS:
                 ACTIVE_TASKS[task_id]["page"] = page
 
-            # 1. 执行登录 (如果配置没带/sign_in，补全访问)
-            login_target = SINGLE_ADMIN_URL if "sign_in" in SINGLE_ADMIN_URL else f"{domain_root}/market_managers/sign_in"
-            await _login_generic(page, login_target, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
+            # 1. 登录
+            await _login_generic(
+                page, login_target, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS
+            )
 
-            while True:
-                current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
+            # 登录后直接访问实际存在的建店地址。
+            response = await page.goto(
+                create_url,
+                wait_until="commit",
+                timeout=30000,
+            )
+            await page.wait_for_timeout(500)
 
-                # 2. 跳转至单笔商城 /market_manager/merchants/new 建店路径
-                target_url = f"{domain_root}/market_manager/merchants/new"
-                await page.goto(target_url, wait_until="domcontentloaded")
+            status_code = response.status if response else None
+            if status_code == 404:
+                raise Exception(f"单笔商城建店地址不存在(404)：{create_url}")
 
-                # 检查页面是否处于登录状态
-                if "sign_in" in page.url or "login" in page.url:
-                    raise Exception(f"登录失效，重新被引导至登录页: {page.url}")
+            # 如果被踢回登录页，明确报错，不让任务一直等。
+            if "sign_in" in page.url.lower() or "login" in page.url.lower():
+                raise Exception(f"登录状态失效，当前页面：{page.url}")
 
-                # 3. 元素定位
+            # 2. 建店。最多尝试 20 个递增帐号，避免后台验证失败时无限循环。
+            for suffix_num in range(20):
+                current_account = (
+                    base_account
+                    if suffix_num == 0
+                    else f"{base_account}{suffix_num:02d}"
+                )
+
+                # 每次尝试都重新打开建店页，避免提交失败后停留在旧页面。
+                if suffix_num > 0:
+                    await page.goto(
+                        create_url,
+                        wait_until="commit",
+                        timeout=30000,
+                    )
+                    await page.wait_for_timeout(300)
+
+                # 截图已确认的实际字段 ID 优先使用，其他 selector 只作为备用。
                 username_input = page.locator(
                     "#merchant_username, "
-                    "input[name='market_manager[username]'], "
                     "input[name='merchant[username]'], "
-                    "input[name='username'], "
-                    "input[name='account'], "
-                    "input[placeholder*='帐号'], "
-                    "input[placeholder*='账号'], "
-                    "form input[type='text']"
+                    "input[name='market_manager[username]'], "
+                    "input[name*='username'], "
+                    "input[name*='account']"
                 ).first
 
                 try:
-                    await username_input.wait_for(state="visible", timeout=10000)
+                    await username_input.wait_for(
+                        state="visible",
+                        timeout=15000,
+                    )
                 except Exception:
-                    curr_url = page.url
-                    curr_title = await page.title()
-                    raise Exception(f"无法定位输入框！当前标题: [{curr_title}] | URL: {curr_url}")
+                    body = ""
+                    try:
+                        body = (await page.locator("body").inner_text())[:800]
+                    except Exception:
+                        pass
+                    raise Exception(
+                        "无法定位建店【帐号】输入框！"
+                        f" 当前 URL：{page.url}"
+                        f"；HTTP：{status_code}"
+                        f"；页面文字：{body}"
+                    )
 
                 await username_input.fill(current_account)
 
-                for sel in ["input[name='market_manager[password]']", "#merchant_password", "#merchant_password_confirmation"]:
-                    loc = page.locator(sel)
-                    if await loc.count() and await loc.is_visible():
-                        await loc.fill("a12345")
+                # 密码与确认密码
+                password_input = page.locator(
+                    "#merchant_password, input[name='merchant[password]'], input[name='market_manager[password]']"
+                ).first
+                confirm_input = page.locator(
+                    "#merchant_password_confirmation, input[name='merchant[password_confirmation]']"
+                ).first
 
-                sprite = page.locator("#merchant_sprite_platform")
+                if await password_input.count() and await password_input.is_visible():
+                    await password_input.fill("a12345")
+                if await confirm_input.count() and await confirm_input.is_visible():
+                    await confirm_input.fill("a12345")
+
+                # Sprite 平台：截图显示默认为 jj。
+                sprite = page.locator("#merchant_sprite_platform").first
                 if await sprite.count() and await sprite.is_visible():
                     try:
                         await sprite.select_option(label="jj")
                     except Exception:
-                        try:
-                            await sprite.select_option(value="jj")
-                        except Exception:
-                            pass
+                        await sprite.select_option(value="jj")
 
-                for sel, val in [
-                    ("#merchant_account_name", info.get("name", "")),
-                    ("#merchant_phone", info.get("phone", "")),
-                ]:
-                    loc = page.locator(sel)
-                    if await loc.count() and await loc.is_visible():
-                        await loc.fill(val)
+                # 户名、电话
+                account_name_input = page.locator("#merchant_account_name").first
+                phone_input = page.locator("#merchant_phone").first
+                if await account_name_input.count() and await account_name_input.is_visible():
+                    await account_name_input.fill(info.get("name", ""))
+                if await phone_input.count() and await phone_input.is_visible():
+                    await phone_input.fill(info.get("phone", ""))
 
+                # 银行帐户。这里使用已确认的 bank_branch_name ID。
                 default_num = "6226220809397366"
                 bank_name_input = page.locator(
-                    "#merchant_bank_accounts_attributes_0_bank_name, input[id$='_bank_name']"
+                    "#merchant_bank_accounts_attributes_0_bank_name"
                 ).first
                 branch_name_input = page.locator(
-                    "#merchant_bank_accounts_attributes_0_bank_branch_name, #merchant_bank_accounts_attributes_0_branch_name, input[id$='_branch_name']"
+                    "#merchant_bank_accounts_attributes_0_bank_branch_name, "
+                    "#merchant_bank_accounts_attributes_0_branch_name"
                 ).first
                 card_no_input = page.locator(
-                    "#merchant_bank_accounts_attributes_0_account_no, input[id$='_account_no']"
+                    "#merchant_bank_accounts_attributes_0_account_no"
                 ).first
 
                 if info_type == "bank":
-                    vals = [
-                        (bank_name_input, info.get("bank_name", "")),
-                        (branch_name_input, info.get("branch_name", "")),
-                        (card_no_input, info.get("bank_account", "")),
-                    ]
+                    bank_values = (
+                        info.get("bank_name", ""),
+                        info.get("branch_name", ""),
+                        info.get("bank_account", ""),
+                    )
                 else:
-                    vals = [
-                        (bank_name_input, default_num),
-                        (branch_name_input, default_num),
-                        (card_no_input, default_num),
-                    ]
+                    bank_values = (default_num, default_num, default_num)
 
-                for loc, val in vals:
+                for loc, value in zip(
+                    (bank_name_input, branch_name_input, card_no_input), bank_values
+                ):
                     try:
-                        if await loc.is_visible():
-                            await loc.fill(val)
+                        if await loc.count() and await loc.is_visible():
+                            await loc.fill(value)
                     except Exception:
                         pass
 
-                alipay_input = page.locator("#merchant_alipay_accounts_attributes_0_account_name").first
+                # 支付宝 / 数字人民币
+                alipay_input = page.locator(
+                    "#merchant_alipay_accounts_attributes_0_account_name"
+                ).first
                 if await alipay_input.count() and await alipay_input.is_visible():
-                    await alipay_input.fill(info.get("alipay_account", "") if info_type == "alipay" else "")
+                    await alipay_input.fill(
+                        info.get("alipay_account", "") if info_type == "alipay" else ""
+                    )
 
-                ecny_input = page.locator("#merchant_ecny_accounts_attributes_0_account_name").first
+                ecny_input = page.locator(
+                    "#merchant_ecny_accounts_attributes_0_account_name"
+                ).first
                 if await ecny_input.count() and await ecny_input.is_visible():
-                    await ecny_input.fill(info.get("digital_account", "") if info_type == "digital_wallet" else "")
+                    await ecny_input.fill(
+                        info.get("digital_account", "")
+                        if info_type == "digital_wallet"
+                        else ""
+                    )
 
+                # 商城界面
                 shop_template = page.locator("#merchant_store_skin_type").first
                 if await shop_template.count() and await shop_template.is_visible():
                     try:
@@ -883,37 +959,77 @@ async def _create_single_shop(info: dict, task_id: str):
                         except Exception:
                             pass
 
-                submit_btn = page.locator("button[type='submit'], input[name='commit'][value='送出']").first
+                # 送出
+                submit_btn = page.locator(
+                    "input[name='commit'][value='送出'], "
+                    "button[type='submit'], "
+                    "input[type='submit']"
+                ).first
+                await submit_btn.wait_for(state="visible", timeout=10000)
                 await submit_btn.click()
-                await page.wait_for_load_state("domcontentloaded")
+
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(500)
 
                 body_text = await page.locator("body").inner_text()
-                is_used = any(x in body_text for x in ["已经被使用", "已經被使用"])
-                if is_used:
-                    suffix_num += 1
+                duplicate = any(
+                    x in body_text
+                    for x in [
+                        "已经被使用",
+                        "已經被使用",
+                        "帐号已经存在",
+                        "帳號已經存在",
+                        "帐号已存在",
+                        "帳號已存在",
+                    ]
+                )
+
+                if duplicate:
                     continue
+
+                # 如果仍停留在建店表单，说明提交没有成功；不要无限循环。
+                if "/merchants/new" in page.url:
+                    errors = re.findall(
+                        r"(?:错误|錯誤|失败|失敗|不能为空|不能為空|已经|已經)[^\n]{0,120}",
+                        body_text,
+                    )
+                    detail = "；".join(errors[:3]) if errors else body_text[:500]
+                    raise Exception(f"建店提交后仍停留在建立店铺页面：{detail}")
 
                 final_account = current_account
                 break
+            else:
+                raise Exception("连续尝试 20 个递增帐号仍无法完成建店，已停止避免无限循环。")
 
+            # 3. 找到刚创建的商户
             await _single_search_account(page, final_account)
             shop_url = ""
             try:
-                shop_url = (await page.locator("tbody tr").first.locator("td").nth(3).inner_text()).strip()
+                shop_url = (
+                    await page.locator("tbody tr").first.locator("td").nth(3).inner_text()
+                ).strip()
             except Exception:
-                shop_url = ""
+                pass
 
-            # 商品 60
+            # 4. 商品 60
             await page.locator("tbody tr").first.locator("a[href$='items']").click()
             await page.wait_for_load_state("domcontentloaded")
-            import_btn = page.locator("a[href='items/new'], a:has-text('導入商品'), a:has-text('导入商品')").first
+            import_btn = page.locator(
+                "a[href*='/items/new'], a[href='items/new'], "
+                "a:has-text('導入商品'), a:has-text('导入商品')"
+            ).first
             await import_btn.wait_for(state="visible", timeout=20000)
             await import_btn.click()
             await page.locator("#count_of_items, input[name='count_of_items']").fill("60")
-            await page.locator("button[type='submit'], input[name='commit'], input[value='送出']").first.click()
+            await page.locator(
+                "input[name='commit'], input[value='送出'], button[type='submit']"
+            ).first.click()
             await page.wait_for_load_state("domcontentloaded")
 
-            # 移除银行卡占位符
+            # 5. 非银行付款移除默认银行卡占位符
             if info_type != "bank":
                 await _single_search_account(page, final_account)
                 await page.locator("tbody tr").first.locator("a[href$='edit']").click()
@@ -930,13 +1046,15 @@ async def _create_single_shop(info: dict, task_id: str):
                     ).first
                 if await remove_btn.count() and await remove_btn.is_visible():
                     await remove_btn.click()
-                    await page.locator("button[type='submit'], input[name='commit'][value='送出']").first.click()
+                    await page.locator(
+                        "input[name='commit'][value='送出'], button[type='submit']"
+                    ).first.click()
                     await page.wait_for_load_state("domcontentloaded")
 
-            # JJ 查询
+            # 6. JJ 查询
             jj_result = await _query_jj_order(info["single_order_no"], task_id)
 
-            # 单笔商城充值
+            # 7. 单笔商城充值
             recharge_result = await _single_recharge(
                 page=page,
                 account=final_account,
@@ -946,7 +1064,7 @@ async def _create_single_shop(info: dict, task_id: str):
             msg_text = (
                 "✅ <b>单笔商城流程完成！</b>\n\n"
                 f"店铺网址： <code>{html.escape(shop_url)}</code>\n"
-                f"登入帳號： <code>{html.escape(final_account)}</code>\n"
+                f"登入帐号： <code>{html.escape(final_account)}</code>\n"
                 "登入密码： <code>a12345</code>\n"
                 f"JJ订单状态： <b>{html.escape(jj_result['status'])}</b>\n"
                 f"充值结果： <b>{html.escape(recharge_result)}</b>"
