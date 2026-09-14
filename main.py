@@ -882,13 +882,22 @@ async def _create_single_shop(info: dict, task_id: str):
                 if await confirm_input.count() and await confirm_input.is_visible():
                     await confirm_input.fill("a12345")
 
-                # Sprite 平台：截图显示默认为 jj。
+                # Sprite 平台：截图显示该下拉框是 disabled，通常后台已固定为 jj。
+                # disabled 的 select 不能执行 select_option，会直接触发 Timeout。
+                # 因此只有在“存在、可见、可用”时才尝试选择；如果 disabled，直接保留后台默认值。
                 sprite = page.locator("#merchant_sprite_platform").first
                 if await sprite.count() and await sprite.is_visible():
                     try:
-                        await sprite.select_option(label="jj")
-                    except Exception:
-                        await sprite.select_option(value="jj")
+                        if await sprite.is_enabled():
+                            try:
+                                await sprite.select_option(label="jj", timeout=5000)
+                            except Exception:
+                                await sprite.select_option(value="jj", timeout=5000)
+                        else:
+                            print("ℹ️ merchant_sprite_platform 当前为 disabled，保留后台默认平台。")
+                    except Exception as e:
+                        # 这个字段不是单笔建店的阻塞条件；如果后台把它锁死，继续建店。
+                        print(f"⚠️ Sprite 平台选择跳过：{e}")
 
                 # 户名、电话
                 account_name_input = page.locator("#merchant_account_name").first
@@ -952,12 +961,18 @@ async def _create_single_shop(info: dict, task_id: str):
                 shop_template = page.locator("#merchant_store_skin_type").first
                 if await shop_template.count() and await shop_template.is_visible():
                     try:
-                        await shop_template.select_option(label=target_skin)
-                    except Exception:
-                        try:
-                            await shop_template.select_option(index=1)
-                        except Exception:
-                            pass
+                        if await shop_template.is_enabled():
+                            try:
+                                await shop_template.select_option(label=target_skin, timeout=5000)
+                            except Exception:
+                                try:
+                                    await shop_template.select_option(index=1, timeout=5000)
+                                except Exception as e:
+                                    print(f"⚠️ 商城界面选择跳过：{e}")
+                        else:
+                            print("ℹ️ merchant_store_skin_type 当前为 disabled，保留后台默认商城界面。")
+                    except Exception as e:
+                        print(f"⚠️ 商城界面检测跳过：{e}")
 
                 # 送出
                 submit_btn = page.locator(
