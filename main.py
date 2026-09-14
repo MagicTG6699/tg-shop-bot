@@ -1146,7 +1146,14 @@ async def _jj_search(page, order_no, kind):
     except Exception:
         await inp.press("Enter")
 
-    await page.wait_for_timeout(1000)
+    # 搜索后等待真正的结果行出现；截图确认结果行 id 为 guest_payment_order_<UUID>。
+    try:
+        await page.locator(f"tr#guest_payment_order_{order_no}").wait_for(state="attached", timeout=8000)
+    except Exception:
+        try:
+            await page.locator("span.short-uuid[data-origin-uuid]").first.wait_for(state="attached", timeout=5000)
+        except Exception:
+            await page.wait_for_timeout(1000)
 
 
 
@@ -1211,28 +1218,40 @@ async def _extract_jj_row(page, order_no=""):
             pass
         return [], []
 
-    # 1) JJ 实际页面的最可靠识别方式：
-    #    平台订单号显示成 acd8c604...，完整 UUID 放在 span.short-uuid 的
-    #    data-origin-uuid 属性中。优先读取该属性，避免把截断文字误判成找不到订单。
+    # 1) JJ 实际页面最可靠的识别方式。
+    # 截图已确认：结果行本身的 id 就是 guest_payment_order_<完整UUID>，
+    # 且 span.short-uuid 的 data-origin-uuid 也保存完整 UUID。
+    # 因此先用“结果行 id”精确定位，再用 data-origin-uuid 双重确认。
+    try:
+        exact_row = page.locator(f"tr#guest_payment_order_{order_no}").first
+        if await exact_row.count():
+            h, c = await row_to_data(exact_row)
+            if c:
+                return h, c
+    except Exception:
+        pass
+
     try:
         uuid_nodes = page.locator("span.short-uuid[data-origin-uuid]")
         uuid_count = await uuid_nodes.count()
         for i in range(uuid_count):
             node = uuid_nodes.nth(i)
             try:
-                if not await node.is_visible():
-                    continue
+                # 不要求 visible；后台表格可能在滚动区域或刚刷新完成时
+                # 暂时被 Playwright 判定为不可见，但 DOM 已经存在。
                 origin = norm(await node.get_attribute("data-origin-uuid"))
                 if origin != wanted:
                     continue
 
+                # 截图确认标准结果行结构：
+                # <tr id="guest_payment_order_<uuid>">...<span class="short-uuid" ...>
                 tr = node.locator("xpath=ancestor::tr[1]").first
                 if await tr.count():
                     h, c = await row_to_data(tr)
                     if c:
                         return h, c
 
-                # 若页面不是标准 table，则向上寻找包含 td 的结果容器。
+                # 非标准表格时再向上寻找包含 td 的结果容器。
                 ancestor = node.locator("xpath=ancestor::*[.//td][1]").first
                 if await ancestor.count():
                     h, c = await row_to_data(ancestor)
