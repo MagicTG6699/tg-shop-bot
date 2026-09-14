@@ -78,6 +78,14 @@ JJ_ADMIN_URL = (
     if match_jj
     else raw_jj_admin_url.rstrip('/')
 )
+_JJ_ORIGIN_MATCH = re.match(r"^(https?://[^/]+)", JJ_ADMIN_URL, flags=re.IGNORECASE)
+JJ_ADMIN_ORIGIN = (
+    _JJ_ORIGIN_MATCH.group(1).rstrip('/')
+    if _JJ_ORIGIN_MATCH
+    else JJ_ADMIN_URL.rstrip('/')
+)
+JJ_LOGIN_URL = JJ_ADMIN_URL if "/sign_in" in JJ_ADMIN_URL.lower() else f"{JJ_ADMIN_ORIGIN}/admin"
+JJ_OUTBOUND_URL = f"{JJ_ADMIN_ORIGIN}/admin/guest_payment_orders"
 
 MANAGER_RECEIVE_NAME = "管理员代收"
 
@@ -1120,24 +1128,50 @@ async def _create_single_shop(info: dict, task_id: str):
 
 
 async def _jj_open_outbound(page):
-    # 用户截图显示的菜单是「出货管理」
-    candidates = [
-        "a:has-text('出货管理')",
-        "a:has-text('出貨管理')",
-        "a[href*='guest_payment_orders']",
-    ]
-    for selector in candidates:
-        loc = page.locator(selector).first
-        try:
-            if await loc.is_visible():
-                await loc.click()
-                await page.wait_for_load_state("domcontentloaded")
-                return
-        except Exception:
-            continue
-    # 如果首页已经是出货管理，也继续
-    if "guest_payment_orders" not in page.url:
-        raise Exception("JJ 后台找不到【出货管理】页面入口")
+    # JJ 后台订单页面有固定地址。优先直接进入，避免点击菜单后停留在首页/其他页面。
+    try:
+        await page.goto(JJ_OUTBOUND_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(800)
+    except Exception as e:
+        raise Exception(f"JJ 无法打开【出货管理/订单】页面：{e}")
+
+    if "guest_payment_orders" not in page.url.lower():
+        # 直接地址被重定向时，再尝试菜单入口。
+        candidates = [
+            "a[href*='guest_payment_orders']",
+            "a:has-text('出货管理')",
+            "a:has-text('出貨管理')",
+        ]
+        for selector in candidates:
+            loc = page.locator(selector).first
+            try:
+                if await loc.count() and await loc.is_visible():
+                    await loc.click()
+                    await page.wait_for_load_state("domcontentloaded", timeout=60000)
+                    break
+            except Exception:
+                continue
+
+    if "guest_payment_orders" not in page.url.lower():
+        raise Exception(f"JJ 后台未进入订单页面；当前地址：{page.url}")
+
+    # 这是截图确认过的真实搜索表单。等 #q_id 出现，后续再进行日期与订单号查询。
+    try:
+        await page.locator("#guest_payment_order_search").wait_for(
+            state="visible", timeout=60000
+        )
+    except Exception:
+        pass
+
+    try:
+        await page.locator("#q_id").wait_for(state="visible", timeout=30000)
+    except Exception:
+        title = await page.title()
+        body = _clean_text_value(await page.locator("body").inner_text())[:300]
+        raise Exception(
+            f"JJ 订单页面已打开，但找不到【平台订单号】输入框 #q_id；"
+            f" 当前地址：{page.url}；标题：{title}；页面：{body}"
+        )
 
 
 async def _jj_unlock_search_range(page):
@@ -1171,127 +1205,110 @@ async def _jj_unlock_search_range(page):
 
 
 async def _jj_set_one_year_date(page):
-    now = datetime.now()
-    start = now - timedelta(days=365)
-    end = now
+    # JJ 页面实际字段已确认：
+    #   开始：#q_created_at_gte / q[created_at_gte]
+    #   结束：#q_created_at_lte / q[created_at_lte]
+    # 输入值示例：2026-09-15T03:00:00+08:00
+    now = datetime.now().astimezone()
+    start_dt = now - timedelta(days=365)
 
-    # 截图中建立日期是一组 date/time 输入。优先按 name/id 中的 created_at 搜索。
-    date_inputs = page.locator(
-        "input[type='date'], input[name*='start'], input[name*='begin'], "
-        "input[name*='created'], input[id*='start'], input[id*='begin'], input[id*='created']"
-    )
-    visible = []
-    count = await date_inputs.count()
-    for i in range(count):
-        el = date_inputs.nth(i)
+    start_input = page.locator("#q_created_at_gte").first
+    end_input = page.locator("#q_created_at_lte").first
+
+    try:
+        await start_input.wait_for(state="visible", timeout=30000)
+        await end_input.wait_for(state="visible", timeout=30000)
+    except Exception as e:
+        raise Exception(f"JJ 找不到建立日期范围输入框：{e}")
+
+    # 直接使用原生 value setter，兼容 datetime-local / jQuery 控件。
+    def iso_value(dt):
+        offset = dt.strftime("%z")
+        offset = offset[:3] + ":" + offset[3:] if len(offset) == 5 else offset
+        return dt.strftime("%Y-%m-%dT%H:%M:%S") + offset
+
+    start_value = iso_value(start_dt)
+    end_value = iso_value(now)
+
+    for loc, value in [(start_input, start_value), (end_input, end_value)]:
+        await loc.evaluate(
+            """(el, value) => {
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur', {bubbles:true}));
+            }""",
+            value,
+        )
+
+    # 如果站点把值转换成 datetime-local 格式，再用 fill 作为兜底。
+    try:
+        current_start = await start_input.input_value()
+        current_end = await end_input.input_value()
+    except Exception:
+        current_start = current_end = ""
+
+    if not current_start:
         try:
-            if await el.is_visible():
-                visible.append(el)
+            await start_input.fill(start_dt.strftime("%Y-%m-%dT%H:%M"))
         except Exception:
             pass
-
-    if len(visible) >= 2:
-        # 仅对 date 类型直接填 YYYY-MM-DD；datetime-local 则带时间
-        for el, dt in [(visible[0], start), (visible[1], end)]:
-            typ = await el.get_attribute("type")
-            if typ == "date":
-                await el.fill(dt.strftime("%Y-%m-%d"))
-            elif typ == "datetime-local":
-                await el.fill(dt.strftime("%Y-%m-%dT%H:%M"))
-            else:
-                await el.fill(dt.strftime("%Y/%m/%d %H:%M"))
-        return
-
-    # Rails/jQuery datepicker 常见 text 输入框：从「建立日期」单选旁的输入框取值
-    candidates = page.locator("input[type='text']")
-    vals = []
-    count = await candidates.count()
-    for i in range(count):
-        el = candidates.nth(i)
+    if not current_end:
         try:
-            if await el.is_visible():
-                ph = (await el.get_attribute("placeholder") or "").lower()
-                nm = (await el.get_attribute("name") or "").lower()
-                if any(k in (ph + " " + nm) for k in ["date", "日期", "日期"]):
-                    vals.append(el)
+            await end_input.fill(now.strftime("%Y-%m-%dT%H:%M"))
         except Exception:
             pass
-
-    if len(vals) >= 2:
-        await vals[0].fill(start.strftime("%Y/%m/%d 00:00"))
-        await vals[1].fill(end.strftime("%Y/%m/%d 23:59"))
-        return
-
-    # 兜底：截图中建立日期区域位于左上，通常是前两个可见文本框
-    text_inputs = []
-    for i in range(count):
-        el = candidates.nth(i)
-        try:
-            if await el.is_visible():
-                text_inputs.append(el)
-        except Exception:
-            pass
-    if len(text_inputs) >= 2:
-        await text_inputs[0].fill(start.strftime("%Y/%m/%d 00:00"))
-        await text_inputs[1].fill(end.strftime("%Y/%m/%d 23:59"))
 
 
 async def _jj_find_order_input(page, kind):
     if kind == "platform":
+        # DevTools 已确认真实字段：id=q_id, name=q[id]
         selectors = [
             "#q_id",
             "input[name='q[id]']",
-            "input[name*='platform_order']",
-            "input[id*='platform_order']",
-            "input[placeholder*='平台订单']",
-            "input[placeholder*='平台訂單']",
         ]
-        labels = ["平台订单号", "平台訂單號"]
+        label_text = "平台订单号"
     else:
+        # DevTools 已确认其他订单号字段
         selectors = [
             "#q_merchant_order_id_or_order_trade_id",
             "input[name='q[merchant_order_id_or_order_trade_id]']",
-            "input[name*='merchant_order_id_or_order_trade_id']",
-            "input[name*='other_order']",
-            "input[id*='other_order']",
-            "input[placeholder*='其他订单']",
-            "input[placeholder*='其他訂單']",
         ]
-        labels = ["其他订单号", "其他訂單號"]
+        label_text = "其他订单号"
 
-    loc = await _first_visible(page, selectors, timeout=3000)
-    if loc:
-        return loc
-
-    for txt in labels:
-        label = page.locator(f"label:has-text('{txt}')").first
+    for selector in selectors:
+        loc = page.locator(selector).first
         try:
-            if await label.count() and await label.is_visible():
-                target_id = await label.get_attribute("for")
-                if target_id:
-                    target = page.locator(f"#{target_id}").first
-                    if await target.is_visible():
-                        return target
-                target = label.locator("xpath=..").locator("input").first
-                if await target.is_visible():
-                    return target
+            await loc.wait_for(state="visible", timeout=10000)
+            return loc
         except Exception:
-            pass
+            continue
 
-    raise Exception(f"JJ 找不到【{labels[0]}】输入框")
-
+    raise Exception(
+        f"JJ 找不到【{label_text}】输入框；当前地址：{page.url}"
+    )
 
 
 async def _jj_search(page, order_no, kind):
     inp = await _jj_find_order_input(page, kind)
-    await inp.fill("")
+
+    # 清掉两个订单号条件，确保第二次「其他订单号」查询不会残留第一次条件。
+    for selector in ["#q_id", "#q_merchant_order_id_or_order_trade_id"]:
+        loc = page.locator(selector).first
+        try:
+            if await loc.count() and await loc.is_visible():
+                await loc.fill("")
+        except Exception:
+            pass
+
     await inp.fill(order_no)
 
-    # 搜索按钮优先找搜索表单内按钮，避免点到分页/其他按钮。
     search_btn = page.locator(
         "#guest_payment_order_search button[type='submit'], "
         "#guest_payment_order_search input[type='submit'], "
         "#guest_payment_order_search .btn-primary, "
+        "#guest_payment_order_search button, "
         "button:has-text('搜尋'), button:has-text('搜索'), "
         "input[value='搜索'], input[value='搜尋']"
     ).first
@@ -1304,10 +1321,11 @@ async def _jj_search(page, order_no, kind):
     except Exception:
         await inp.press("Enter")
 
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(1500)
+    # 给 Rails 查询/表格渲染一点时间；没有结果不算异常，由调用方决定是否切换第二种订单号查询。
     try:
         await page.locator("table tbody tr").first.wait_for(
-            state="visible", timeout=10000
+            state="visible", timeout=15000
         )
     except Exception:
         pass
