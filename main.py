@@ -1155,25 +1155,137 @@ def _normalize_header(text):
 
 
 async def _extract_jj_row(page, order_no=""):
-    """从 JJ 搜索结果中找真正对应订单的一行。
+    """从 JJ 搜索结果中找目标订单。
 
-    JJ 表格的订单号在页面上可能被 CSS 截断成 acd8c604...，
-    因此不能要求整串 UUID 必须出现在 inner_text() 里；优先使用
-    完整订单号，其次使用 UUID 前 8~12 个字符进行唯一匹配。
+    JJ 实际页面可能把结果渲染成 table、tr、role=row 或普通 div，
+    而平台订单号又可能显示为 acd8c604... 的截断文字。
+    因此这里不再只依赖 table/tbody tr，而是优先直接寻找订单号文字，
+    再向上寻找对应的行容器；最后才使用单结果兜底。
     """
     wanted = re.sub(r"\s+", "", order_no or "").lower()
-    prefixes = []
-    if wanted:
-        prefixes.append(wanted)
-        if len(wanted) >= 12:
-            prefixes.append(wanted[:12])
-        if len(wanted) >= 8:
-            prefixes.append(wanted[:8])
+    if not wanted:
+        return [], []
 
+    prefixes = [wanted]
+    if len(wanted) >= 12:
+        prefixes.append(wanted[:12])
+    if len(wanted) >= 8:
+        prefixes.append(wanted[:8])
+
+    def norm(v):
+        return re.sub(r"\s+", "", v or "").lower()
+
+    async def row_to_data(row):
+        """把各种可能的行容器转换成 headers/cells。"""
+        try:
+            # 标准 table 行
+            cells = row.locator("td")
+            if await cells.count():
+                table = row.locator("xpath=ancestor::table[1]").first
+                headers = table.locator("thead th") if await table.count() else page.locator("thead th")
+                header_count = await headers.count()
+                header_texts = [
+                    _normalize_header(await headers.nth(i).inner_text())
+                    for i in range(header_count)
+                ]
+                cell_texts = [
+                    _clean_text_value(await cells.nth(i).inner_text())
+                    for i in range(await cells.count())
+                ]
+                if cell_texts:
+                    return header_texts, cell_texts
+
+            # role=row 或普通 div 行：优先直接拿可见文字。
+            text = _clean_text_value(await row.inner_text())
+            if text:
+                # 如果内部存在 role=cell，则按 cell 拆分
+                role_cells = row.locator("[role='cell']")
+                if await role_cells.count():
+                    vals = [_clean_text_value(await role_cells.nth(i).inner_text())
+                            for i in range(await role_cells.count())]
+                    if vals:
+                        return [], vals
+                # 普通 div 没有明确列时，把整行作为一格，后续用文本兜底解析
+                return [], [text]
+        except Exception:
+            pass
+        return [], []
+
+    # 1) JJ 实际页面的最可靠识别方式：
+    #    平台订单号显示成 acd8c604...，完整 UUID 放在 span.short-uuid 的
+    #    data-origin-uuid 属性中。优先读取该属性，避免把截断文字误判成找不到订单。
+    try:
+        uuid_nodes = page.locator("span.short-uuid[data-origin-uuid]")
+        uuid_count = await uuid_nodes.count()
+        for i in range(uuid_count):
+            node = uuid_nodes.nth(i)
+            try:
+                if not await node.is_visible():
+                    continue
+                origin = norm(await node.get_attribute("data-origin-uuid"))
+                if origin != wanted:
+                    continue
+
+                tr = node.locator("xpath=ancestor::tr[1]").first
+                if await tr.count():
+                    h, c = await row_to_data(tr)
+                    if c:
+                        return h, c
+
+                # 若页面不是标准 table，则向上寻找包含 td 的结果容器。
+                ancestor = node.locator("xpath=ancestor::*[.//td][1]").first
+                if await ancestor.count():
+                    h, c = await row_to_data(ancestor)
+                    if c:
+                        return h, c
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 2) 其次才找页面上显示的订单号/截断前缀。
+    for prefix in prefixes:
+        try:
+            # 用 regex 忽略大小写；只要求前缀连续出现，兼容 acd8c604...。
+            target = page.get_by_text(re.compile(re.escape(prefix), re.I)).first
+            if await target.count() and await target.is_visible():
+                # 标准 table
+                tr = target.locator("xpath=ancestor::tr[1]").first
+                if await tr.count():
+                    h, c = await row_to_data(tr)
+                    if c:
+                        return h, c
+
+                # aria/grid 行
+                grid_row = target.locator("xpath=ancestor::*[@role='row'][1]").first
+                if await grid_row.count():
+                    h, c = await row_to_data(grid_row)
+                    if c:
+                        return h, c
+
+                # 常见 bootstrap 表格/结果容器：向上找带 td 的祖先
+                ancestor = target.locator("xpath=ancestor::*[.//td][1]").first
+                if await ancestor.count():
+                    h, c = await row_to_data(ancestor)
+                    if c:
+                        return h, c
+
+                # 最后：目标元素附近的可见父容器
+                parent = target.locator("xpath=..").first
+                for _ in range(4):
+                    if not await parent.count():
+                        break
+                    h, c = await row_to_data(parent)
+                    if c and (len(c) > 1 or prefix in norm(" | ".join(c))):
+                        return h, c
+                    parent = parent.locator("xpath=..").first
+        except Exception:
+            continue
+
+    # 3) 标准 table 全量扫描，兼容订单号被放在 title/data-* 属性。
     tables = page.locator("table")
     table_count = await tables.count()
     fallback = None
-
     for ti in range(table_count):
         table = tables.nth(ti)
         try:
@@ -1182,7 +1294,8 @@ async def _extract_jj_row(page, order_no=""):
             rows = table.locator("tbody tr")
             row_count = await rows.count()
             if row_count == 0:
-                continue
+                rows = table.locator("tr")
+                row_count = await rows.count()
 
             headers = table.locator("thead th")
             header_count = await headers.count()
@@ -1193,50 +1306,64 @@ async def _extract_jj_row(page, order_no=""):
 
             for ri in range(row_count):
                 row = rows.nth(ri)
-                cells = row.locator("td")
-                if await cells.count() == 0:
+                try:
+                    if not await row.is_visible():
+                        continue
+                except Exception:
+                    pass
+                row_text = _clean_text_value(await row.inner_text())
+                nr = norm(row_text)
+                if not row_text or any(x in row_text for x in ["没有资料", "沒有資料", "无数据", "無資料"]):
                     continue
-                row_preview = _clean_text_value(await row.inner_text())
-                if not row_preview or any(x in row_preview for x in ["没有资料", "沒有資料", "无数据", "無資料"]):
-                    continue
 
-                cell_texts = [
-                    _clean_text_value(await cells.nth(i).inner_text())
-                    for i in range(await cells.count())
-                ]
-                normalized_row = re.sub(r"\s+", "", row_preview).lower()
-
-                # 最可靠：完整订单号存在于 row / title / data 属性。
-                matched = bool(wanted and wanted in normalized_row)
-                if not matched and prefixes:
-                    matched = any(prefix in normalized_row for prefix in prefixes[1:])
-
-                # 页面常把 UUID 显示成 acd8c604...；检查该行所有元素的 title/data-*。
-                if not matched and prefixes:
+                matched = any(x in nr for x in prefixes)
+                if not matched:
                     try:
-                        attrs = row.locator("[title], [data-original-title], [data-id], [data-value]")
+                        attrs = row.locator("[title], [data-original-title], [data-id], [data-value], a")
                         for ai in range(await attrs.count()):
                             el = attrs.nth(ai)
-                            vals = []
-                            for attr in ["title", "data-original-title", "data-id", "data-value"]:
-                                v = await el.get_attribute(attr)
-                                if v:
-                                    vals.append(re.sub(r"\s+", "", v).lower())
-                            if any(prefix in v for v in vals for prefix in prefixes):
-                                matched = True
+                            for attr in ["title", "data-original-title", "data-id", "data-value", "href"]:
+                                val = await el.get_attribute(attr)
+                                if val and any(x in norm(val) for x in prefixes):
+                                    matched = True
+                                    break
+                            if matched:
                                 break
                     except Exception:
                         pass
 
                 if matched:
+                    cells = row.locator("td")
+                    cell_texts = [_clean_text_value(await cells.nth(i).inner_text())
+                                  for i in range(await cells.count())]
                     return header_texts, cell_texts
 
-                # 如果只有一行结果，保留为兜底。搜索动作本身已经带订单号，
-                # 所以单结果表通常就是目标订单。
                 if row_count == 1:
-                    fallback = (header_texts, cell_texts)
+                    cells = row.locator("td")
+                    cell_texts = [_clean_text_value(await cells.nth(i).inner_text())
+                                  for i in range(await cells.count())]
+                    if cell_texts:
+                        fallback = (header_texts, cell_texts)
         except Exception:
             continue
+
+    # 4) role=row 全量扫描。
+    try:
+        role_rows = page.locator("[role='row']")
+        rr_count = await role_rows.count()
+        for i in range(rr_count):
+            row = role_rows.nth(i)
+            if not await row.is_visible():
+                continue
+            text = _clean_text_value(await row.inner_text())
+            if any(x in norm(text) for x in prefixes):
+                cells = row.locator("[role='cell']")
+                if await cells.count():
+                    return [], [_clean_text_value(await cells.nth(j).inner_text()) for j in range(await cells.count())]
+                if text:
+                    return [], [text]
+    except Exception:
+        pass
 
     return fallback if fallback else ([], [])
 
@@ -1314,7 +1441,12 @@ async def _query_jj_order(single_order_no, task_id):
             order_no = _cell_by_header(headers, cells, ["平台订单", "平台訂單", "订单号", "訂單號"])
             recipient_raw = _cell_by_header(headers, cells, ["商户会员", "商戶會員", "实名", "實名", "收件人", "收件人姓名"])
             amount = _cell_by_header(headers, cells, ["交易金额", "交易金額", "金额", "金額"])
-            shipment = _cell_by_header(headers, cells, ["运单号", "運單號", "货运", "貨運", "物流单号", "物流單號", "货号", "貨號"])
+            # JJ 后台目前显示为「貨運」；同时兼容未来改成简体「货运」、
+            # 「运单号/運單號」等字段名称。失败订单没有貨運是正常状态。
+            shipment = _cell_by_header(headers, cells, [
+                "运单号", "運單號", "货运", "貨運",
+                "物流单号", "物流單號", "货号", "貨號"
+            ])
             created = _cell_by_header(headers, cells, ["建立时间", "建立時間", "创建时间", "創建時間", "提交时间", "提交時間"])
             completed = _cell_by_header(headers, cells, ["完成时间", "完成時間"])
 
@@ -1338,7 +1470,7 @@ async def _query_jj_order(single_order_no, task_id):
             if is_success and not shipment:
                 # 只有成功订单才尝试从整行找运单号。
                 for cell in cells:
-                    m = re.search(r"(?:运单号|運單號|物流单号|物流單號|货运|貨運)\s*[:：]?\s*([A-Za-z0-9_-]+)", cell)
+                    m = re.search(r"(?:运单号|運單號|物流单号|物流單號|货运|貨運)\s*[:：]?\s*([A-Za-z0-9_-]+)", cell, re.I)
                     if m:
                         shipment = m.group(1)
                         break
