@@ -1723,16 +1723,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        print("❌ 未检测到 BOT_TOKEN 环境变量！")
+        print("❌ 未检测到 BOT_TOKEN 环境变量。")
         sys.exit(1)
 
     print("🤖 Telegram 机器人服务运行中...")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     msg_filter = filters.TEXT & (~filters.COMMAND)
 
     app.add_handler(MessageHandler(msg_filter, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
 
 
