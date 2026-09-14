@@ -1128,15 +1128,15 @@ async def _create_single_shop(info: dict, task_id: str):
 
 
 async def _jj_open_outbound(page):
-    # JJ 后台订单页面有固定地址。优先直接进入，避免点击菜单后停留在首页/其他页面。
+    # JJ 订单页面固定地址。进入后不假设搜索框一定已经由主 document 渲染完成，
+    # 因为该后台可能通过 Turbo/异步区域载入搜索表单。
     try:
         await page.goto(JJ_OUTBOUND_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(1200)
     except Exception as e:
         raise Exception(f"JJ 无法打开【出货管理/订单】页面：{e}")
 
     if "guest_payment_orders" not in page.url.lower():
-        # 直接地址被重定向时，再尝试菜单入口。
         candidates = [
             "a[href*='guest_payment_orders']",
             "a:has-text('出货管理')",
@@ -1148,6 +1148,7 @@ async def _jj_open_outbound(page):
                 if await loc.count() and await loc.is_visible():
                     await loc.click()
                     await page.wait_for_load_state("domcontentloaded", timeout=60000)
+                    await page.wait_for_timeout(1200)
                     break
             except Exception:
                 continue
@@ -1155,36 +1156,52 @@ async def _jj_open_outbound(page):
     if "guest_payment_orders" not in page.url.lower():
         raise Exception(f"JJ 后台未进入订单页面；当前地址：{page.url}")
 
-    # 这是截图确认过的真实搜索表单。等 #q_id 出现，后续再进行日期与订单号查询。
+    # 搜索表单可能在 iframe / Turbo Frame / 动态区域内，因此这里只确认页面已经打开，
+    # 不在这里强制等待 #q_id；真正查询时由 _jj_find_order_input 跨 frame 查找。
+
+
+async def _jj_all_contexts(page):
+    """返回主页面及所有 iframe，供 JJ 后台兼容不同渲染方式。"""
+    contexts = [page]
     try:
-        await page.locator("#guest_payment_order_search").wait_for(
-            state="visible", timeout=60000
-        )
+        for frame in page.frames:
+            if frame != page.main_frame:
+                contexts.append(frame)
     except Exception:
         pass
+    return contexts
 
-    try:
-        await page.locator("#q_id").wait_for(state="visible", timeout=30000)
-    except Exception:
-        title = await page.title()
-        body = _clean_text_value(await page.locator("body").inner_text())[:300]
-        raise Exception(
-            f"JJ 订单页面已打开，但找不到【平台订单号】输入框 #q_id；"
-            f" 当前地址：{page.url}；标题：{title}；页面：{body}"
-        )
+
+async def _jj_find_locator(page, selectors, timeout=15000):
+    """在主 document + 所有 iframe 中寻找可见元素。"""
+    deadline = asyncio.get_running_loop().time() + timeout / 1000
+    last_error = None
+    while asyncio.get_running_loop().time() < deadline:
+        for ctx in await _jj_all_contexts(page):
+            for selector in selectors:
+                try:
+                    loc = ctx.locator(selector).first
+                    if await loc.count() and await loc.is_visible():
+                        return loc
+                except Exception as e:
+                    last_error = e
+        await page.wait_for_timeout(300)
+    raise PlaywrightTimeoutError(str(last_error or "locator not found"))
+
+
+async def _jj_dump_inputs(page):
+    """取得当前 JJ 页面所有输入框的 id/name/type，方便错误诊断。"""
+    result = []
+    for ctx in await _jj_all_contexts(page):
+        try:
+            result.extend(await ctx.locator("input").evaluate_all("els => els.map(e => ({id:e.id,name:e.name,type:e.type,placeholder:e.placeholder,visible:!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length)}))"))
+        except Exception:
+            pass
+    return result
 
 
 async def _jj_unlock_search_range(page):
-    """自动解除 JJ 查询日期的暗锁。"""
-    unlock = page.locator(
-        "i.fa-unlock.unlock-btn, .fa-unlock.unlock-btn, .unlock-btn"
-    ).first
-    try:
-        if await unlock.count() and await unlock.is_visible():
-            return
-    except Exception:
-        pass
-
+    """自动解除 JJ 查询日期的暗锁，兼容主 document / iframe。"""
     selectors = [
         ".toggle-order-search-days-btn-placeholder",
         ".toggle-search-days-btn-placeholder",
@@ -1192,36 +1209,25 @@ async def _jj_unlock_search_range(page):
         "i.fa-lock.lock-btn",
         "i.fa-lock",
     ]
-    for selector in selectors:
-        loc = page.locator(selector).first
-        try:
-            if await loc.count() and await loc.is_visible():
-                await loc.click()
-                await page.wait_for_timeout(500)
-                return
-        except Exception:
-            continue
-
+    for ctx in await _jj_all_contexts(page):
+        for selector in selectors:
+            try:
+                loc = ctx.locator(selector).first
+                if await loc.count() and await loc.is_visible():
+                    await loc.click()
+                    await page.wait_for_timeout(500)
+                    return
+            except Exception:
+                continue
 
 
 async def _jj_set_one_year_date(page):
-    # JJ 页面实际字段已确认：
-    #   开始：#q_created_at_gte / q[created_at_gte]
-    #   结束：#q_created_at_lte / q[created_at_lte]
-    # 输入值示例：2026-09-15T03:00:00+08:00
     now = datetime.now().astimezone()
     start_dt = now - timedelta(days=365)
 
-    start_input = page.locator("#q_created_at_gte").first
-    end_input = page.locator("#q_created_at_lte").first
+    start_input = await _jj_find_locator(page, ["#q_created_at_gte", "input[name='q[created_at_gte]']"], timeout=30000)
+    end_input = await _jj_find_locator(page, ["#q_created_at_lte", "input[name='q[created_at_lte]']"], timeout=30000)
 
-    try:
-        await start_input.wait_for(state="visible", timeout=30000)
-        await end_input.wait_for(state="visible", timeout=30000)
-    except Exception as e:
-        raise Exception(f"JJ 找不到建立日期范围输入框：{e}")
-
-    # 直接使用原生 value setter，兼容 datetime-local / jQuery 控件。
     def iso_value(dt):
         offset = dt.strftime("%z")
         offset = offset[:3] + ":" + offset[3:] if len(offset) == 5 else offset
@@ -1231,104 +1237,94 @@ async def _jj_set_one_year_date(page):
     end_value = iso_value(now)
 
     for loc, value in [(start_input, start_value), (end_input, end_value)]:
-        await loc.evaluate(
-            """(el, value) => {
+        try:
+            await loc.evaluate("""(el, value) => {
                 const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
                 setter.call(el, value);
                 el.dispatchEvent(new Event('input', {bubbles:true}));
                 el.dispatchEvent(new Event('change', {bubbles:true}));
                 el.dispatchEvent(new Event('blur', {bubbles:true}));
-            }""",
-            value,
-        )
-
-    # 如果站点把值转换成 datetime-local 格式，再用 fill 作为兜底。
-    try:
-        current_start = await start_input.input_value()
-        current_end = await end_input.input_value()
-    except Exception:
-        current_start = current_end = ""
-
-    if not current_start:
-        try:
-            await start_input.fill(start_dt.strftime("%Y-%m-%dT%H:%M"))
+            }""", value)
         except Exception:
-            pass
-    if not current_end:
-        try:
-            await end_input.fill(now.strftime("%Y-%m-%dT%H:%M"))
-        except Exception:
-            pass
+            try:
+                await loc.fill(value)
+            except Exception:
+                await loc.fill(value[:16])
 
 
 async def _jj_find_order_input(page, kind):
     if kind == "platform":
-        # DevTools 已确认真实字段：id=q_id, name=q[id]
-        selectors = [
-            "#q_id",
-            "input[name='q[id]']",
-        ]
+        selectors = ["#q_id", "input[name='q[id]']"]
         label_text = "平台订单号"
     else:
-        # DevTools 已确认其他订单号字段
         selectors = [
             "#q_merchant_order_id_or_order_trade_id",
             "input[name='q[merchant_order_id_or_order_trade_id]']",
         ]
         label_text = "其他订单号"
 
-    for selector in selectors:
-        loc = page.locator(selector).first
-        try:
-            await loc.wait_for(state="visible", timeout=10000)
-            return loc
-        except Exception:
-            continue
-
-    raise Exception(
-        f"JJ 找不到【{label_text}】输入框；当前地址：{page.url}"
-    )
+    try:
+        return await _jj_find_locator(page, selectors, timeout=30000)
+    except Exception:
+        inputs = await _jj_dump_inputs(page)
+        compact = ", ".join(
+            f"id={x.get('id','')},name={x.get('name','')},type={x.get('type','')}"
+            for x in inputs[:30]
+        )
+        raise Exception(
+            f"JJ 找不到【{label_text}】输入框；当前地址：{page.url}；"
+            f"实际输入框：{compact or '无'}"
+        )
 
 
 async def _jj_search(page, order_no, kind):
     inp = await _jj_find_order_input(page, kind)
 
-    # 清掉两个订单号条件，确保第二次「其他订单号」查询不会残留第一次条件。
+    # 清掉两个订单号条件，跨 iframe 处理。
     for selector in ["#q_id", "#q_merchant_order_id_or_order_trade_id"]:
-        loc = page.locator(selector).first
-        try:
-            if await loc.count() and await loc.is_visible():
-                await loc.fill("")
-        except Exception:
-            pass
+        for ctx in await _jj_all_contexts(page):
+            try:
+                loc = ctx.locator(selector).first
+                if await loc.count() and await loc.is_visible():
+                    await loc.fill("")
+            except Exception:
+                pass
 
     await inp.fill(order_no)
 
-    search_btn = page.locator(
-        "#guest_payment_order_search button[type='submit'], "
-        "#guest_payment_order_search input[type='submit'], "
-        "#guest_payment_order_search .btn-primary, "
-        "#guest_payment_order_search button, "
-        "button:has-text('搜尋'), button:has-text('搜索'), "
-        "input[value='搜索'], input[value='搜尋']"
-    ).first
+    search_selectors = [
+        "#guest_payment_order_search button[type='submit']",
+        "#guest_payment_order_search input[type='submit']",
+        "#guest_payment_order_search .btn-primary",
+        "#guest_payment_order_search button",
+        "button:has-text('搜尋')", "button:has-text('搜索')",
+        "input[value='搜索']", "input[value='搜尋']",
+    ]
+    search_btn = None
+    for ctx in await _jj_all_contexts(page):
+        for selector in search_selectors:
+            try:
+                loc = ctx.locator(selector).first
+                if await loc.count() and await loc.is_visible():
+                    search_btn = loc
+                    break
+            except Exception:
+                continue
+        if search_btn:
+            break
 
-    try:
-        if await search_btn.count() and await search_btn.is_visible():
-            await search_btn.click()
-        else:
-            await inp.press("Enter")
-    except Exception:
+    if search_btn:
+        await search_btn.click()
+    else:
         await inp.press("Enter")
 
-    await page.wait_for_timeout(1500)
-    # 给 Rails 查询/表格渲染一点时间；没有结果不算异常，由调用方决定是否切换第二种订单号查询。
-    try:
-        await page.locator("table tbody tr").first.wait_for(
-            state="visible", timeout=15000
-        )
-    except Exception:
-        pass
+    await page.wait_for_timeout(1800)
+    for ctx in await _jj_all_contexts(page):
+        try:
+            await ctx.locator("table tbody tr").first.wait_for(state="visible", timeout=12000)
+            return
+        except Exception:
+            pass
 
 
 
