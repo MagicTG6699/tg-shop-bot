@@ -1266,12 +1266,12 @@ async def _jj_set_one_year_date(page):
 
 async def _jj_find_order_input(page, kind):
     if kind == "platform":
-        selectors = ["#q_id", "input[name='q[id]']"]
+        selectors = ["#q_id_eq", "input[name='q[id_eq]']"]
         label_text = "平台订单号"
     else:
         selectors = [
-            "#q_merchant_order_id_or_order_trade_id",
-            "input[name='q[merchant_order_id_or_order_trade_id]']",
+            "#q_merchant_order_id_or_order_trade_id_eq",
+            "input[name='q[merchant_order_id_or_order_trade_id_eq]']",
         ]
         label_text = "其他订单号"
 
@@ -1293,7 +1293,7 @@ async def _jj_search(page, order_no, kind):
     inp = await _jj_find_order_input(page, kind)
 
     # 先清空两个订单号条件。
-    for selector in ["#q_id", "#q_merchant_order_id_or_order_trade_id"]:
+    for selector in ["#q_id_eq", "#q_merchant_order_id_or_order_trade_id_eq"]:
         for ctx in await _jj_all_contexts(page):
             try:
                 loc = ctx.locator(selector).first
