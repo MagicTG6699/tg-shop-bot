@@ -307,6 +307,44 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     return info, ""
 
 
+async def _login_all_shop(page):
+    """全部商城专用登录流程。保持原本可运行版本的登录方式，不使用单笔/JJ的登录逻辑。"""
+    if not BASE_ADMIN_URL:
+        raise Exception("未检测到环境变量 ADMIN_URL！")
+    if not ADMIN_USER or not ADMIN_PASS:
+        raise Exception("未检测到 ADMIN_USER / ADMIN_PASS！")
+
+    # 全部商城原始入口就是 ADMIN_URL（目前为 https://asdtvheq.com/admin）。
+    await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded", timeout=30000)
+    user_input = page.locator(
+        "#admin_user_email, #user_email, input[type='email'], "
+        "input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
+    ).first
+    try:
+        await user_input.wait_for(state="visible", timeout=20000)
+    except Exception:
+        raise Exception(f"无法找到登录框！标题: 【{await page.title()}】，地址: {page.url}")
+
+    await user_input.fill(ADMIN_USER)
+    password_input = page.locator("#admin_user_password, #user_password, input[type='password']").first
+    await password_input.wait_for(state="visible", timeout=10000)
+    await password_input.fill(ADMIN_PASS)
+
+    submit_btn = page.locator(
+        "input[type='submit'], button[type='submit'], input[name='commit']"
+    ).first
+    await submit_btn.wait_for(state="visible", timeout=10000)
+    await submit_btn.click()
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+
+    # 登录后如果仍然停在登录页，立即报错，避免任务无提示卡住。
+    if "sign_in" in page.url or "/login" in page.url:
+        raise Exception(f"全部商城登录失败！当前地址：{page.url}")
+
+
 async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
     if not BASE_ADMIN_URL:
         raise Exception("未检测到环境变量 ADMIN_URL！")
