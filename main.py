@@ -792,7 +792,7 @@ async def _create_single_shop(info: dict, task_id: str):
 
             while True:
                 current_account = base_account if suffix_num == 0 else f"{base_account}{suffix_num:02d}"
-                await page.goto(f"{SINGLE_ADMIN_ROOT}/market_manager/merchants/new", wait_until="domcontentloaded")
+                await page.goto(f"{SINGLE_ADMIN_ROOT}/market_manager/merchants/new", wait_until="commit", timeout=15000)
                 merchant_username = page.locator("#merchant_username").first
                 try:
                     await merchant_username.wait_for(state="visible", timeout=20000)
