@@ -1172,8 +1172,9 @@ async def _jj_all_contexts(page):
     return contexts
 
 
-async def _jj_find_locator(page, selectors, timeout=15000):
-    """在主 document + 所有 iframe 中寻找可见元素。"""
+async def _jj_find_locator(page, selectors, timeout=60000, visible_only=False):
+    """在主 document + iframe 中寻找元素。JJ 的搜索表单有时存在于 DOM 中但尚未被判定为 visible，
+    因此默认只要求元素存在，不强制 visible。"""
     deadline = asyncio.get_running_loop().time() + timeout / 1000
     last_error = None
     while asyncio.get_running_loop().time() < deadline:
@@ -1181,13 +1182,15 @@ async def _jj_find_locator(page, selectors, timeout=15000):
             for selector in selectors:
                 try:
                     loc = ctx.locator(selector).first
-                    if await loc.count() and await loc.is_visible():
-                        return loc
+                    if await loc.count():
+                        if not visible_only:
+                            return loc
+                        if await loc.is_visible():
+                            return loc
                 except Exception as e:
                     last_error = e
         await page.wait_for_timeout(300)
     raise PlaywrightTimeoutError(str(last_error or "locator not found"))
-
 
 async def _jj_dump_inputs(page):
     """取得当前 JJ 页面所有输入框的 id/name/type，方便错误诊断。"""
@@ -1225,9 +1228,6 @@ async def _jj_set_one_year_date(page):
     now = datetime.now().astimezone()
     start_dt = now - timedelta(days=365)
 
-    start_input = await _jj_find_locator(page, ["#q_created_at_gte", "input[name='q[created_at_gte]']"], timeout=30000)
-    end_input = await _jj_find_locator(page, ["#q_created_at_lte", "input[name='q[created_at_lte]']"], timeout=30000)
-
     def iso_value(dt):
         offset = dt.strftime("%z")
         offset = offset[:3] + ":" + offset[3:] if len(offset) == 5 else offset
@@ -1236,7 +1236,17 @@ async def _jj_set_one_year_date(page):
     start_value = iso_value(start_dt)
     end_value = iso_value(now)
 
-    for loc, value in [(start_input, start_value), (end_input, end_value)]:
+    # 日期欄位在 JJ 有時要解鎖/動態載入後才會出現；找不到時不要阻斷訂單號查詢。
+    pairs = [
+        (["#q_created_at_gte", "input[name='q[created_at_gte]']"], start_value, "建立時間開始"),
+        (["#q_created_at_lte", "input[name='q[created_at_lte]']"], end_value, "建立時間結束"),
+    ]
+    for selectors, value, label in pairs:
+        try:
+            loc = await _jj_find_locator(page, selectors, timeout=15000, visible_only=False)
+        except Exception:
+            print(f"⚠️ JJ {label}欄位目前未找到，先略過日期設定")
+            continue
         try:
             await loc.evaluate("""(el, value) => {
                 const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
@@ -1249,8 +1259,10 @@ async def _jj_set_one_year_date(page):
             try:
                 await loc.fill(value)
             except Exception:
-                await loc.fill(value[:16])
-
+                try:
+                    await loc.fill(value[:16])
+                except Exception:
+                    pass
 
 async def _jj_find_order_input(page, kind):
     if kind == "platform":
@@ -1264,34 +1276,35 @@ async def _jj_find_order_input(page, kind):
         label_text = "其他订单号"
 
     try:
-        return await _jj_find_locator(page, selectors, timeout=30000)
+        # 这是你 DevTools 已确认的真实字段；允许元素尚未被判定 visible。
+        return await _jj_find_locator(page, selectors, timeout=60000, visible_only=False)
     except Exception:
         inputs = await _jj_dump_inputs(page)
         compact = ", ".join(
             f"id={x.get('id','')},name={x.get('name','')},type={x.get('type','')}"
-            for x in inputs[:30]
+            for x in inputs[:50]
         )
         raise Exception(
             f"JJ 找不到【{label_text}】输入框；当前地址：{page.url}；"
             f"实际输入框：{compact or '无'}"
         )
 
-
 async def _jj_search(page, order_no, kind):
     inp = await _jj_find_order_input(page, kind)
 
-    # 清掉两个订单号条件，跨 iframe 处理。
+    # 先清空两个订单号条件。
     for selector in ["#q_id", "#q_merchant_order_id_or_order_trade_id"]:
         for ctx in await _jj_all_contexts(page):
             try:
                 loc = ctx.locator(selector).first
-                if await loc.count() and await loc.is_visible():
+                if await loc.count():
                     await loc.fill("")
             except Exception:
                 pass
 
     await inp.fill(order_no)
 
+    search_btn = None
     search_selectors = [
         "#guest_payment_order_search button[type='submit']",
         "#guest_payment_order_search input[type='submit']",
@@ -1300,12 +1313,11 @@ async def _jj_search(page, order_no, kind):
         "button:has-text('搜尋')", "button:has-text('搜索')",
         "input[value='搜索']", "input[value='搜尋']",
     ]
-    search_btn = None
     for ctx in await _jj_all_contexts(page):
         for selector in search_selectors:
             try:
                 loc = ctx.locator(selector).first
-                if await loc.count() and await loc.is_visible():
+                if await loc.count():
                     search_btn = loc
                     break
             except Exception:
@@ -1314,18 +1326,16 @@ async def _jj_search(page, order_no, kind):
             break
 
     if search_btn:
-        await search_btn.click()
+        try:
+            await search_btn.click(timeout=15000)
+        except Exception:
+            await inp.press("Enter")
     else:
         await inp.press("Enter")
 
-    await page.wait_for_timeout(1800)
-    for ctx in await _jj_all_contexts(page):
-        try:
-            await ctx.locator("table tbody tr").first.wait_for(state="visible", timeout=12000)
-            return
-        except Exception:
-            pass
-
+    # 等待 Turbo/页面异步更新；不要求一定出现 tbody，因为无结果时也可能正常返回。
+    await page.wait_for_timeout(2500)
+    return True
 
 
 def _normalize_header(text):
@@ -1333,32 +1343,34 @@ def _normalize_header(text):
 
 
 async def _extract_jj_row(page):
-    tables = page.locator("table")
-    table_count = await tables.count()
-    for ti in range(table_count):
-        table = tables.nth(ti)
+    for ctx in await _jj_all_contexts(page):
         try:
-            if not await table.is_visible():
-                continue
-            rows = table.locator("tbody tr")
-            if await rows.count() == 0:
-                continue
-            row = rows.first
-            cells = row.locator("td")
-            if await cells.count() == 0:
-                continue
+            tables = ctx.locator("table")
+            table_count = await tables.count()
+            for ti in range(table_count):
+                table = tables.nth(ti)
+                try:
+                    rows = table.locator("tbody tr")
+                    if await rows.count() == 0:
+                        continue
+                    row = rows.first
+                    cells = row.locator("td")
+                    if await cells.count() == 0:
+                        continue
 
-            headers = table.locator("thead th")
-            header_count = await headers.count()
-            header_texts = [
-                _normalize_header(await headers.nth(i).inner_text())
-                for i in range(header_count)
-            ]
-            cell_texts = [
-                _clean_text_value(await cells.nth(i).inner_text())
-                for i in range(await cells.count())
-            ]
-            return header_texts, cell_texts
+                    headers = table.locator("thead th")
+                    header_count = await headers.count()
+                    header_texts = [
+                        _normalize_header(await headers.nth(i).inner_text())
+                        for i in range(header_count)
+                    ]
+                    cell_texts = [
+                        _clean_text_value(await cells.nth(i).inner_text())
+                        for i in range(await cells.count())
+                    ]
+                    return header_texts, cell_texts
+                except Exception:
+                    continue
         except Exception:
             continue
     return [], []
