@@ -1061,7 +1061,8 @@ async def _create_single_shop(info: dict, task_id: str):
                 shop_url = ""
 
             # 商品 60
-            await _single_target_row(page).locator("a[href$='/items']").click()
+            single_row = await _single_target_row(page)
+            await single_row.locator("a[href$='/items']").click()
             await page.wait_for_load_state("domcontentloaded")
             import_btn = page.locator("a[href*='/items/new'], a:has-text('導入商品'), a:has-text('导入商品')").first
             await import_btn.wait_for(state="visible", timeout=20000)
@@ -1073,7 +1074,8 @@ async def _create_single_shop(info: dict, task_id: str):
             # 非银行付款才移除默认银行占位符
             if info_type != "bank":
                 await _single_search_account(page, final_account)
-                await _single_target_row(page).locator("a[href$='/edit']").click()
+                single_row = await _single_target_row(page)
+                await single_row.locator("a[href$='/edit']").click()
                 await page.wait_for_load_state("domcontentloaded")
                 bank_section = page.locator(
                     ".nested-fields, div:has(#merchant_bank_accounts_attributes_0_account_no)"
@@ -1619,7 +1621,8 @@ async def update_shop_skin(account_name: str, new_skin: str):
                 await search_input.press("Enter")
             await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
 
-            await _single_target_row(page).locator("a[href$='/edit']").click()
+            single_row = await _single_target_row(page)
+            await single_row.locator("a[href$='/edit']").click()
             await page.wait_for_load_state("domcontentloaded")
 
             shop_template = page.locator("#merchant_store_skin_type")
