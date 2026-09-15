@@ -1706,7 +1706,111 @@ async def _query_jj_order(single_order_no, task_id):
                 pass
 
 
-async def _single_recharge(account, jj_result, task_id=None):
+async def _select_select2_by_text(page, native_select, target_text, label_name="下拉框"):
+    """选择 Select2 动态下拉：先尝试原生 option，再打开 Select2 搜索并点击匹配结果。"""
+    target = _clean_text_value(str(target_text or ""))
+    if not target:
+        raise Exception(f"{label_name}目标值为空。")
+
+    # 1) 原生 select option（Select2 背后仍通常保留这个 select）
+    try:
+        options = native_select.locator("option")
+        for i in range(await options.count()):
+            opt = options.nth(i)
+            value = await opt.get_attribute("value")
+            text = _clean_text_value(await opt.inner_text())
+            hay = f"{text} {value or ''}".lower()
+            if value and (target.lower() == text.lower() or target.lower() in hay):
+                try:
+                    await native_select.select_option(value=value)
+                    await native_select.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
+                    await page.wait_for_timeout(700)
+                    return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 2) 找 native select 对应的 Select2 container 并打开
+    container = None
+    candidates = [
+        native_select.locator("xpath=following-sibling::span[contains(@class,'select2-container')]").first,
+        native_select.locator("xpath=..//span[contains(@class,'select2-container')]").first,
+    ]
+    for c in candidates:
+        try:
+            if await c.count():
+                container = c
+                break
+        except Exception:
+            pass
+
+    if container is not None:
+        try:
+            await container.click()
+        except Exception:
+            pass
+    else:
+        # 兜底：通过 select 的 select2 id / 相邻容器定位
+        try:
+            sid = await native_select.get_attribute("id")
+            if sid:
+                c = page.locator(f"span.select2-container[aria-labelledby='select2-{sid}-container']").first
+                if await c.count():
+                    await c.click()
+        except Exception:
+            pass
+
+    await page.wait_for_timeout(300)
+
+    search = page.locator("input.select2-search__field, input.select2-search_field").last
+    try:
+        await search.wait_for(state="visible", timeout=5000)
+    except Exception:
+        search = page.locator(".select2-container--open input[type='search'], .select2-container--open input.select2-search__field").last
+        await search.wait_for(state="visible", timeout=5000)
+
+    await search.fill(target)
+    await page.wait_for_timeout(1000)
+
+    # 结果只在当前打开的 Select2 下拉里找，避免点到别的字段。
+    result_selectors = [
+        ".select2-container--open .select2-results__option",
+        ".select2-results__option",
+        ".select2-container--open li[role='option']",
+    ]
+    for sel in result_selectors:
+        results = page.locator(sel)
+        try:
+            count = await results.count()
+        except Exception:
+            continue
+        for i in range(count):
+            item = results.nth(i)
+            try:
+                if not await item.is_visible():
+                    continue
+                txt = _clean_text_value(await item.inner_text())
+                if target.lower() in txt.lower() or txt.lower() in target.lower():
+                    await item.click()
+                    await page.wait_for_timeout(700)
+                    return True
+            except Exception:
+                pass
+
+    raise Exception(f"{label_name}找不到【{target}】。")
+
+
+def _payment_account_from_info(info):
+    info_type = info.get("type", "alipay")
+    if info_type == "bank":
+        return info.get("bank_account", "")
+    if info_type == "digital_wallet":
+        return info.get("digital_account", "")
+    return info.get("alipay_account", "")
+
+
+async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
     """重新登录单笔商城并填写充值；不依赖建店时已关闭的浏览器页面。"""
     if not SINGLE_ADMIN_URL:
         raise Exception("未检测到环境变量 SINGLE_ADMIN_URL！")
@@ -1785,34 +1889,23 @@ async def _single_recharge(account, jj_result, task_id=None):
             if await merchant_select.count() == 0:
                 raise Exception("单笔商城充值页面找不到【商户】下拉框。")
 
-            # 商户 select2 的原生 select 是隐藏的，select_option 仍可直接操作。
-            matched = False
-            options = merchant_select.locator("option")
-            for i in range(await options.count()):
-                opt = options.nth(i)
-                value = await opt.get_attribute("value")
-                text = _clean_text_value(await opt.inner_text())
-                if value and (text == account or account.lower() == text.lower() or account.lower() in text.lower()):
-                    await merchant_select.select_option(value=value)
-                    matched = True
-                    break
-            if not matched:
-                try:
-                    await merchant_select.select_option(label=account)
-                    matched = True
-                except Exception:
-                    pass
-            if not matched:
-                raise Exception(f"充值商户下拉找不到刚建立的商户【{account}】。")
+            # 商户是 Select2 动态下拉。优先直接匹配 option；如果后台用 AJAX，
+            # 就打开下拉，输入刚建立的商户帐号，等待并点击结果。
+            try:
+                await _select_select2_by_text(page, merchant_select, account, "充值商户")
+            except Exception as e:
+                raise Exception(f"充值商户选择失败：{e}")
 
             # 触发 select2 / Rails 的 change。
             try:
                 await merchant_select.evaluate("el => { el.dispatchEvent(new Event('change', {bubbles:true})); }")
             except Exception:
                 pass
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(1200)
 
-            # 银行账户：截图确认是 disabled，不填。商户选择后后台会自动带入。
+            # 【重要】充值页面的【銀行帳戶】按照用户最新确认：保持空白，不填写。
+            # Telegram 中的支付宝/数字/银行卡资料仍可用于建店流程；
+            # 但这里的“新增充值”表单不要选择或填写銀行帳戶。
 
             # 收件人资讯 = 任意一个现有选项。截图确认 ID 为 shipment_info_id。
             recipient_info = page.locator("#deposit_order_shipment_info_id").first
@@ -2091,7 +2184,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                 )
 
                 try:
-                    recharge_result = await _single_recharge(final_account, jj_result, task_id)
+                    recharge_result = await _single_recharge(final_account, jj_result, parsed_info, task_id)
                 except Exception as recharge_error:
                     safe_recharge = html.escape(str(recharge_error))
                     await status_msg.edit_text(
