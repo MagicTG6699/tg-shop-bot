@@ -1967,7 +1967,18 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
                     await delivery_input.fill(delivery_text)
                     # 确认实际值已经写进去；避免浏览器控件拒绝格式后默默保留当前时间。
                     actual_delivery = await delivery_input.input_value()
-                    if actual_delivery[:16] != delivery_text[:16]:
+                    # 后台可能把 datetime-local 显示成 YYYY/MM/DD HH:MM，
+                    # 与目标 YYYY-MM-DDTHH:MM 是同一时间；这里统一解析后比较。
+                    def _same_form_datetime(actual, target):
+                        a = (actual or "").strip()
+                        t = (target or "").strip()
+                        if a[:16] == t[:16]:
+                            return True
+                        a_norm = a.replace("/", "-").replace("T", " ")
+                        t_norm = t.replace("/", "-").replace("T", " ")
+                        return a_norm[:16] == t_norm[:16]
+
+                    if not _same_form_datetime(actual_delivery, delivery_text):
                         await delivery_input.evaluate(
                             """(el, value) => {
                                 const setter = Object.getOwnPropertyDescriptor(
@@ -1981,7 +1992,7 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
                             delivery_text,
                         )
                         actual_delivery = await delivery_input.input_value()
-                    if actual_delivery[:16] != delivery_text[:16]:
+                    if not _same_form_datetime(actual_delivery, delivery_text):
                         raise Exception(
                             f"配送时间写入失败：目标={delivery_text}，实际={actual_delivery}"
                         )
@@ -1998,7 +2009,13 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
                 created_text = created_dt.strftime("%Y-%m-%dT%H:%M")
                 await created_input.fill(created_text)
                 actual_created = await created_input.input_value()
-                if actual_created[:16] != created_text[:16]:
+                # 同样兼容后台返回 YYYY/MM/DD HH:MM 的显示格式。
+                def _same_created_datetime(actual, target):
+                    a = (actual or "").strip().replace("/", "-").replace("T", " ")
+                    t = (target or "").strip().replace("/", "-").replace("T", " ")
+                    return a[:16] == t[:16]
+
+                if not _same_created_datetime(actual_created, created_text):
                     await created_input.evaluate(
                         """(el, value) => {
                             const setter = Object.getOwnPropertyDescriptor(
@@ -2012,7 +2029,7 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
                         created_text,
                     )
                     actual_created = await created_input.input_value()
-                if actual_created[:16] != created_text[:16]:
+                if not _same_created_datetime(actual_created, created_text):
                     raise Exception(
                         f"建立时间写入失败：目标={created_text}，实际={actual_created}"
                     )
