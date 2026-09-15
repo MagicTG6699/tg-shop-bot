@@ -1616,6 +1616,15 @@ async def _query_jj_order(single_order_no, task_id):
             if not is_success and not is_failed:
                 raise Exception(f"JJ 订单状态无法判断：{row_status_text[:1000] or full_row[:1000]}")
 
+            # JJ 当前实际 DOM 已由 DevTools 确认：
+            # 目标订单 tr#guest_payment_order_<UUID> 的外层 td 顺序固定为：
+            # 0 提交时间、1 完成时间、2 订单号、3 平台会员、4 採購方、
+            # 5 商户会员、6 出货平台、7 交易金额、8 金流、9 图片、10 等待时长、
+            # 11 到期时间、12 异常回报、13 状态、14 操作。
+            #
+            # 【重要】这里不再依赖 thead/header 来读取“提交时间”。
+            # 直接从目标订单 tr 的第 0 个 td 读取，避免页面表头变化导致
+            # “找到订单后却读取不到提交时间”。
             order_no = _cell_by_header(headers, cells, ["平台订单", "平台訂單", "订单号", "訂單號"])
             recipient_raw = _cell_by_header(headers, cells, ["商户会员", "商戶會員", "实名", "實名", "收件人", "收件人姓名"])
             amount = _cell_by_header(headers, cells, ["交易金额", "交易金額", "金额", "金額"])
@@ -1625,11 +1634,38 @@ async def _query_jj_order(single_order_no, task_id):
             ])
             completed = _cell_by_header(headers, cells, ["完成时间", "完成時間"])
 
-            # JJ 当前截图确认的外层表格固定顺序：
-            # 0 提交时间、1 完成时间、2 订单号、3 平台会员、4 採購方、
-            # 5 商户会员、6 出货平台、7 交易金额、8 金流、9 图片、10 等待时长、
-            # 11 到期时间、12 异常回报、13 状态、14 操作。
-            # 如果某个版本没有标准 thead，直接使用这些外层 td 的位置。
+            # 直接从目标 tr 读取固定列；这是当前 JJ 页面最可靠的来源。
+            try:
+                exact_data_row = page.locator(
+                    f"xpath=//tr[@id='guest_payment_order_{single_order_no}']"
+                ).first
+                if await exact_data_row.count():
+                    direct_cells = exact_data_row.locator(":scope > td")
+                    direct_count = await direct_cells.count()
+                    if direct_count >= 8:
+                        direct_texts = [
+                            _clean_text_value(await direct_cells.nth(i).inner_text())
+                            for i in range(direct_count)
+                        ]
+                        if direct_texts:
+                            # 提交时间永远优先使用第 0 格；不要使用完成时间替代。
+                            created = direct_texts[0]
+                            if direct_count > 1:
+                                completed = direct_texts[1]
+                            if direct_count > 2 and not order_no:
+                                order_no = direct_texts[2]
+                            if direct_count > 5 and not recipient_raw:
+                                recipient_raw = direct_texts[5]
+                            if direct_count > 7 and not amount:
+                                amount = direct_texts[7]
+                            if direct_count > 13:
+                                status_text = direct_texts[13]
+                            # 保留目标行的完整外层单元格供后续貨運解析。
+                            cells = direct_texts
+            except Exception:
+                pass
+
+            # 没有标准 tr 时才使用前面的 cells 位置兜底。
             if len(cells) >= 8:
                 if not recipient_raw and len(cells) > 5:
                     recipient_raw = cells[5]
@@ -1663,12 +1699,15 @@ async def _query_jj_order(single_order_no, task_id):
                         amount = m.group(1)
                         break
 
-            created_dt = _parse_jj_datetime(created) or _parse_jj_datetime(completed)
+            # 【重要】建立时间只认 JJ 的“提交时间”（第 0 格）。
+            # 不再用“完成时间”兜底，避免真正的提交时间读取失败时被悄悄替换。
+            created_dt = _parse_jj_datetime(created)
             if not created_dt:
-                # 允许页面使用 ISO/带秒/带时区的时间。
-                raw_time = created or completed or ""
+                raw_time = created or ""
                 try:
-                    created_dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00")).replace(tzinfo=None)
+                    created_dt = datetime.fromisoformat(
+                        raw_time.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
                 except Exception:
                     pass
 
@@ -1681,7 +1720,7 @@ async def _query_jj_order(single_order_no, task_id):
                         break
 
             if is_success and not created_dt:
-                raise Exception("JJ 成功订单没有读取到建立时间，无法生成配送时间。")
+                raise Exception(f"JJ 成功订单无法读取【提交时间】：{created[:200]}")
             if not amount:
                 raise Exception("JJ 订单没有读取到交易金额。")
 
