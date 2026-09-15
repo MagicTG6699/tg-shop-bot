@@ -1955,27 +1955,67 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
                 raise Exception("JJ 订单金额为空。")
             await page.locator("#deposit_order_total_amount").first.fill(amount)
 
-            # 配送时间 = JJ 建立时间后 1~2 天，08:00~18:00；失败订单留空。
+            # 配送时间 = JJ【提交时间】后 1~2 天，08:00~18:00；失败订单留空。
+            # 充值页面通常是 datetime-local，必须填写 ISO 格式 YYYY-MM-DDTHH:MM。
             if status == "成功":
                 delivery_dt = jj_result.get("delivery")
                 if not delivery_dt:
                     raise Exception("成功订单缺少配送时间。")
-                delivery_text = delivery_dt.strftime("%Y/%m/%d %H:%M")
                 delivery_input = page.locator("#deposit_order_completed_at").first
                 if await delivery_input.count():
-                    try:
-                        await delivery_input.fill(delivery_text)
-                    except Exception:
-                        await delivery_input.fill(delivery_dt.strftime("%Y-%m-%dT%H:%M"))
+                    delivery_text = delivery_dt.strftime("%Y-%m-%dT%H:%M")
+                    await delivery_input.fill(delivery_text)
+                    # 确认实际值已经写进去；避免浏览器控件拒绝格式后默默保留当前时间。
+                    actual_delivery = await delivery_input.input_value()
+                    if actual_delivery[:16] != delivery_text[:16]:
+                        await delivery_input.evaluate(
+                            """(el, value) => {
+                                const setter = Object.getOwnPropertyDescriptor(
+                                    HTMLInputElement.prototype, 'value'
+                                ).set;
+                                setter.call(el, value);
+                                el.dispatchEvent(new Event('input', {bubbles:true}));
+                                el.dispatchEvent(new Event('change', {bubbles:true}));
+                                el.dispatchEvent(new Event('blur', {bubbles:true}));
+                            }""",
+                            delivery_text,
+                        )
+                        actual_delivery = await delivery_input.input_value()
+                    if actual_delivery[:16] != delivery_text[:16]:
+                        raise Exception(
+                            f"配送时间写入失败：目标={delivery_text}，实际={actual_delivery}"
+                        )
 
-            # 建立时间 = JJ 建立时间。截图确认 ID 为 deposit_order_created_at。
-            created = jj_result.get("created", "")
+            # 建立时间 = JJ【提交时间】。充值页面通常是 datetime-local，
+            # 不能把 JJ 显示的“01月19日 08:30”原文直接 fill，否则浏览器会拒绝，
+            # 然后留下表单默认的当前时间。这里必须使用已经解析出的 created_dt。
+            created_dt = jj_result.get("created_dt")
+            if not created_dt:
+                raise Exception("JJ 订单缺少可用的提交时间。")
+
             created_input = page.locator("#deposit_order_created_at").first
-            if created and await created_input.count():
-                try:
-                    await created_input.fill(created)
-                except Exception:
-                    pass
+            if await created_input.count():
+                created_text = created_dt.strftime("%Y-%m-%dT%H:%M")
+                await created_input.fill(created_text)
+                actual_created = await created_input.input_value()
+                if actual_created[:16] != created_text[:16]:
+                    await created_input.evaluate(
+                        """(el, value) => {
+                            const setter = Object.getOwnPropertyDescriptor(
+                                HTMLInputElement.prototype, 'value'
+                            ).set;
+                            setter.call(el, value);
+                            el.dispatchEvent(new Event('input', {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                            el.dispatchEvent(new Event('blur', {bubbles:true}));
+                        }""",
+                        created_text,
+                    )
+                    actual_created = await created_input.input_value()
+                if actual_created[:16] != created_text[:16]:
+                    raise Exception(
+                        f"建立时间写入失败：目标={created_text}，实际={actual_created}"
+                    )
 
             submit = await _first_visible(page, [
                 "input[type='submit'][name='commit'][value='送出']",
