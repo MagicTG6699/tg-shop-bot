@@ -4536,7 +4536,7 @@ def main():
         _debug_log("未检测到 BOT_TOKEN 环境变量！")
         sys.exit(1)
 
-    _debug_log("Telegram 机器人服务运行中...")
+    print("🤖 Telegram 机器人服务运行中...", flush=True)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     msg_filter = filters.TEXT & (~filters.COMMAND)
 
