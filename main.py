@@ -1270,27 +1270,31 @@ async def _jj_open_outbound(page):
 
 
 async def _jj_unlock_search_range(page):
-    """严格处理 JJ 搜索暗锁。
+    """JJ 出货/拼多多搜索页暗锁处理。
 
-    关键点：JJ 的日期输入框即使在暗锁状态下也可能仍然是可编辑的，
-    因此“日期框可编辑”绝不能当成“暗锁已经解除”。
-
-    当前截图已确认真正的锁头 DOM 位于：
-      .toggle-order-search-days-btn-placeholder i.fa-lock
-
-    流程：
-      1. 如果页面仍有可见的 fa-lock，必须先点击锁头；
-      2. 等待锁头 DOM / class / aria / data 状态发生解锁变化；
-      3. 如果锁头 class 不变化，也等待前端事件完成，但不把“日期框可编辑”
-         单独当成解锁证据；
-      4. 最终是否能查到一年前订单，由 _jj_set_one_year_date + 实际搜索结果验证。
+    JJ 的特殊点：初始页面锁头区域有时不会立即显示 fa-lock，甚至可能暂时空白，
+    但必须实际点击 `.toggle-order-search-days-btn-placeholder` 才会解除暗锁。
+    因此：
+      1. 已明确看到 fa-unlock -> 直接通过；
+      2. 其他情况 -> 点击锁头容器（包括“空白但可点击”的状态）；
+      3. 点击后轮询确认 fa-unlock/状态变化；
+      4. 没有确认成功就返回 False，绝不在未解锁状态下继续搜索。
     """
-    lock_containers = [
+    containers = [
         ".toggle-order-search-days-btn-placeholder",
         ".toggle-search-days-btn-placeholder",
         ".toggle-order-search-days-btn",
     ]
-    lock_icons = [
+    unlock_selectors = [
+        ".toggle-order-search-days-btn-placeholder i.fa-unlock",
+        ".toggle-search-days-btn-placeholder i.fa-unlock",
+        ".toggle-order-search-days-btn i.fa-unlock",
+        "i.fa-unlock.unlock-btn",
+        "i.fas.fa-unlock.unlock-btn",
+        ".unlock-btn",
+        "i.fa-unlock",
+    ]
+    lock_selectors = [
         ".toggle-order-search-days-btn-placeholder i.fa-lock",
         ".toggle-search-days-btn-placeholder i.fa-lock",
         ".toggle-order-search-days-btn i.fa-lock",
@@ -1299,18 +1303,8 @@ async def _jj_unlock_search_range(page):
         ".lock-btn",
         "i.lock-btn",
     ]
-    unlock_selectors = [
-        ".toggle-order-search-days-btn-placeholder i.fa-unlock",
-        ".toggle-search-days-btn-placeholder i.fa-unlock",
-        ".toggle-order-search-days-btn i.fa-unlock",
-        "i.fa-unlock.lock-btn",
-        ".unlock-btn",
-    ]
 
-    def norm_class(value):
-        return re.sub(r"\s+", " ", (value or "").strip().lower())
-
-    async def visible_locator(selectors):
+    async def visible(selectors):
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
@@ -1320,159 +1314,109 @@ async def _jj_unlock_search_range(page):
                 continue
         return None, ""
 
-    async def lock_snapshot():
-        """返回页面锁状态，不把日期框 editable 当作解锁。"""
-        # 明确的 unlock 图标优先。
-        loc, sel = await visible_locator(unlock_selectors)
+    async def has_unlock():
+        loc, sel = await visible(unlock_selectors)
         if loc is not None:
-            try:
-                return {
-                    "unlocked": True,
-                    "has_visible_lock": False,
-                    "evidence": f"visible unlock selector={sel}",
-                }
-            except Exception:
-                pass
-
-        # 只要明确看到 fa-lock，就认为仍然需要解锁。
-        for sel in lock_icons:
+            return True, f"visible unlock={sel}"
+        for sel in containers:
             try:
                 loc = page.locator(sel).first
                 if not await loc.count() or not await loc.is_visible():
                     continue
-                cls = norm_class(await loc.get_attribute("class"))
-                html_text = (await loc.evaluate("el => el.outerHTML") or "").lower()
-                if "fa-lock" in cls or "fa-lock" in html_text:
-                    return {
-                        "unlocked": False,
-                        "has_visible_lock": True,
-                        "evidence": f"visible lock selector={sel}, class={cls!r}",
-                    }
-            except Exception:
-                continue
-
-        # 检查容器的明确状态属性。
-        for sel in lock_containers:
-            try:
-                loc = page.locator(sel).first
-                if not await loc.count():
-                    continue
-                if not await loc.is_visible():
-                    continue
-                cls = norm_class(await loc.get_attribute("class"))
+                cls = (await loc.get_attribute("class") or "").lower()
                 html_text = (await loc.evaluate("el => el.outerHTML") or "").lower()
                 data_locked = (await loc.get_attribute("data-locked") or "").strip().lower()
                 data_unlocked = (await loc.get_attribute("data-unlocked") or "").strip().lower()
-                aria_pressed = (await loc.get_attribute("aria-pressed") or "").strip().lower()
-
+                aria = (await loc.get_attribute("aria-pressed") or "").strip().lower()
                 if data_unlocked in ("true", "1", "yes"):
-                    return {"unlocked": True, "has_visible_lock": False,
-                            "evidence": f"{sel} data-unlocked={data_unlocked}"}
+                    return True, f"{sel} data-unlocked={data_unlocked}"
                 if data_locked in ("false", "0", "no"):
-                    return {"unlocked": True, "has_visible_lock": False,
-                            "evidence": f"{sel} data-locked={data_locked}"}
+                    return True, f"{sel} data-locked={data_locked}"
                 if "fa-unlock" in cls or "fa-unlock" in html_text:
-                    return {"unlocked": True, "has_visible_lock": False,
-                            "evidence": f"{sel} contains unlock"}
-                if aria_pressed in ("true", "1") and "fa-lock" not in html_text:
-                    return {"unlocked": True, "has_visible_lock": False,
-                            "evidence": f"{sel} aria-pressed={aria_pressed}"}
+                    return True, f"{sel} contains fa-unlock"
+                if aria in ("true", "1") and "fa-lock" not in html_text:
+                    return True, f"{sel} aria-pressed={aria}"
             except Exception:
                 continue
+        return False, ""
 
-        # 没看到锁头，也没有明确的锁定状态：允许进入日期设置。
-        return {
-            "unlocked": True,
-            "has_visible_lock": False,
-            "evidence": "页面未检测到可见 fa-lock，允许继续验证日期范围",
-        }
+    # 页面刚打开后给菜单/搜索区一点时间完成初始化。
+    await page.wait_for_timeout(300)
 
-    # ★ JJ 这里有一个特殊行为：未点击前，锁头区域可能只显示空白，
-    # 但真正点击整个 .toggle-order-search-days-btn-placeholder 后才会出现 unlock。
-    # 因此“没有检测到 fa-lock”绝对不能直接视为已解锁。
-    # 只有明确看到 fa-unlock，才可以直接继续；否则必须尝试点击锁头容器。
-    snap = await lock_snapshot()
-    if snap["unlocked"] and not snap["has_visible_lock"] and "visible unlock" in snap.get("evidence", ""):
-        _debug_log(f"[JJ] 已明确检测到 unlock：{snap['evidence']}")
+    unlocked, evidence = await has_unlock()
+    if unlocked:
+        _debug_log(f"[JJ] 暗锁已是解锁状态：{evidence}")
         return True
-    _debug_log(f"[JJ] 未明确检测到 unlock，必须点击暗锁/锁头容器；当前状态={snap}")
 
-    before_html = ""
-    try:
-        loc, _ = await visible_locator(lock_containers)
-        if loc is not None:
-            before_html = (await loc.evaluate("el => el.outerHTML") or "")
-    except Exception:
-        pass
-
+    # 关键修正：不要求先看到 fa-lock。
+    # JJ 初始可能是空白，但点击整个 placeholder 才会真正解锁。
+    click_candidates = containers + lock_selectors
     clicked = False
-    clicked_selector = ""
+    clicked_sel = ""
+    before_html = ""
+    for sel in containers:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                before_html = await loc.evaluate("el => el.outerHTML") or ""
+                break
+        except Exception:
+            pass
 
-    # 第一优先：点击整个锁头容器。
-    # JJ 未点击时图标可能为空白，单独找 fa-lock 会漏掉这种情况。
-    # 如果页面已经是 unlock，上面已经 return；所以这里点击不会把已解锁状态重新锁回去。
-    click_candidates = lock_containers + lock_icons
     for sel in click_candidates:
         try:
             loc = page.locator(sel).first
-            if not await loc.count():
+            if not await loc.count() or not await loc.is_visible():
                 continue
-            if not await loc.is_visible():
-                continue
-            await loc.click(force=True)
+            await loc.click(force=True, timeout=3000)
             clicked = True
-            clicked_selector = sel
-            _debug_log(f"[JJ] 已点击暗锁：{sel}")
+            clicked_sel = sel
+            _debug_log(f"[JJ] 已实际点击暗锁：{sel}")
             break
         except Exception as e:
             _debug_log(f"[JJ] 点击暗锁失败 {sel}: {e!r}")
 
-    # Playwright click 没成功时使用 JS click。
     if not clicked:
+        # JS click 兜底，兼容图标区域被透明层覆盖的情况。
         for sel in click_candidates:
             try:
                 loc = page.locator(sel).first
-                if await loc.count():
+                if await loc.count() and await loc.is_visible():
                     await loc.evaluate("el => el.click()")
                     clicked = True
-                    clicked_selector = sel + " [js-click]"
+                    clicked_sel = sel + " [js]"
                     _debug_log(f"[JJ] 已使用 JS click 暗锁：{sel}")
                     break
             except Exception as e:
                 _debug_log(f"[JJ] JS click 暗锁失败 {sel}: {e!r}")
 
     if not clicked:
-        _debug_log("[JJ] 页面存在锁定状态，但没有找到可点击的暗锁元素")
+        _debug_log("[JJ] 找不到可点击的暗锁容器")
         return False
 
-    # 点击后最多等待 8 秒，确认锁头真正消失/变成 unlock。
+    # 点击后最长等待 8 秒；必须看到 unlock 或明确解锁状态才算成功。
     for i in range(80):
         await page.wait_for_timeout(100)
-        snap = await lock_snapshot()
-        if snap["unlocked"] and not snap["has_visible_lock"]:
-            _debug_log(
-                f"[JJ] 暗锁已确认解除：{snap['evidence']}；"
-                f"等待={(i + 1) * 0.1:.1f}s；点击={clicked_selector}"
-            )
+        unlocked, evidence = await has_unlock()
+        if unlocked:
+            _debug_log(f"[JJ] 暗锁确认解除：{evidence}；等待={(i+1)*0.1:.1f}s")
             return True
 
-        # 有些前端会替换整个容器；检测 outerHTML 是否发生变化。
-        try:
-            loc, _ = await visible_locator(lock_containers)
-            if loc is not None:
-                current_html = (await loc.evaluate("el => el.outerHTML") or "")
-                if before_html and current_html != before_html:
-                    # DOM 有变化后再重新检查一次；仍有 fa-lock 就不能算成功。
-                    snap2 = await lock_snapshot()
-                    if snap2["unlocked"] and not snap2["has_visible_lock"]:
-                        _debug_log(
-                            f"[JJ] 暗锁 DOM 已变化并确认解除；等待={(i + 1) * 0.1:.1f}s"
-                        )
-                        return True
-        except Exception:
-            pass
+        # 某些版本会替换整个 placeholder；DOM 变化后再立即检查一次。
+        if before_html:
+            try:
+                loc, _ = await visible(containers)
+                if loc is not None:
+                    current_html = await loc.evaluate("el => el.outerHTML") or ""
+                    if current_html != before_html:
+                        unlocked, evidence = await has_unlock()
+                        if unlocked:
+                            _debug_log(f"[JJ] 暗锁 DOM 已替换并确认解除：{evidence}")
+                            return True
+            except Exception:
+                pass
 
-    _debug_log(f"[JJ] 点击暗锁后 8 秒仍未确认解除：{clicked_selector}")
+    _debug_log(f"[JJ] 点击暗锁后 8 秒仍未确认解除：{clicked_sel}")
     return False
 
 
@@ -1599,12 +1543,22 @@ async def _jj_prepare_search_range(page):
 
 
 async def _jj_find_order_input(page, kind):
+    """快速、稳定地定位 JJ 订单号输入框。
+
+    出货管理：两个订单号输入框；拼多多：调用方只传 platform，页面只找它自己的唯一订单号框。
+    不再对每个 selector 连续等待 5 秒，避免一个元素暂时不可见时把整笔订单拖到超时。
+    """
     if kind == "platform":
         selectors = [
             "#q_id_eq",
             "input[name='q[id_eq]']",
             "#q_id",
             "input[name='q[id]']",
+            "#q_platform_order_id_eq",
+            "input[name='q[platform_order_id_eq]']",
+            "#q_platform_order_no_eq",
+            "input[name='q[platform_order_no_eq]']",
+            "input[name*='platform_order']",
             "input[placeholder*='平台订单']",
             "input[placeholder*='平台訂單']",
         ]
@@ -1615,32 +1569,44 @@ async def _jj_find_order_input(page, kind):
             "input[name='q[merchant_order_id_or_order_trade_id_eq]']",
             "#q_merchant_order_id_or_order_trade_id",
             "input[name='q[merchant_order_id_or_order_trade_id]']",
+            "input[name*='merchant_order_id']",
+            "input[name*='order_trade_id']",
             "input[placeholder*='其他订单']",
             "input[placeholder*='其他訂單']",
         ]
         label = "其他订单号"
 
-    loc = await _first_visible(page, selectors, timeout=5000)
-    if loc:
-        return loc
+    contexts = [page] + list(page.frames)
+    deadline = asyncio.get_running_loop().time() + 8.0
+    while asyncio.get_running_loop().time() < deadline:
+        for ctx in contexts:
+            for selector in selectors:
+                try:
+                    loc = ctx.locator(selector).first
+                    if await loc.count() and await loc.is_visible() and await loc.is_enabled():
+                        return loc
+                except Exception:
+                    continue
+        await page.wait_for_timeout(200)
 
     # label 兜底。
-    for txt in [label, label.replace("号", "號")]:
-        lab = page.locator(f"label:has-text('{txt}')").first
-        try:
-            if await lab.count():
-                target_id = await lab.get_attribute("for")
-                if target_id:
-                    target = page.locator(f"#{target_id}").first
-                    if await target.count():
+    for ctx in contexts:
+        for txt in [label, label.replace("号", "號")]:
+            try:
+                lab = ctx.locator(f"label:has-text('{txt}')").first
+                if await lab.count() and await lab.is_visible():
+                    target_id = await lab.get_attribute("for")
+                    if target_id:
+                        target = ctx.locator(f"#{target_id}").first
+                        if await target.count() and await target.is_visible():
+                            return target
+                    target = lab.locator("xpath=..//input[1]").first
+                    if await target.count() and await target.is_visible():
                         return target
-                target = lab.locator("xpath=..//input[1]").first
-                if await target.count():
-                    return target
-        except Exception:
-            pass
+            except Exception:
+                continue
 
-    raise Exception(f"JJ 找不到【{label}】输入框")
+    raise JJOrderNotFound(f"JJ 找不到【{label}】输入框")
 
 
 async def _jj_search(page, order_no, kind):
@@ -1655,6 +1621,8 @@ async def _jj_search(page, order_no, kind):
       tr#guest_payment_order_<完整UUID>
     这是当前 JJ 页面 DevTools 已确认的最可靠结果判定方式。
     """
+    # 暗锁/日期完成后，JJ 前端偶尔还会有极短的表单重绘。
+    await page.wait_for_timeout(250)
     inp = await _jj_find_order_input(page, kind)
     form = page.locator("#guest_payment_order_search").first
     if not await form.count():
@@ -4100,6 +4068,17 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         # 只有“出货管理真正没有找到订单”才允许分流到拼多多。
                         _debug_log(f"[出货] 确认未找到订单，才分流 PDD: order={order_no}")
                         _debug_log(f"[出货] not-found detail: {outbound_not_found!r}")
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⚠️ 第 {idx}/{len(order_numbers)} 笔：出货管理未找到"
+                            f"\n订单号：<code>{html.escape(order_no)}</code>"
+                            "\n\n⏳ 转查拼多多订单管理...",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        await asyncio.sleep(0.2)
                         outbound_result = None
                     except Exception as outbound_error:
                         # 出货管理已经进入查询/处理阶段后，任何异常都只影响当前订单。
