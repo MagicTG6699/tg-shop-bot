@@ -430,7 +430,7 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
     # 不再要求一定出现“单笔”。只要检测到订单号，就自动走单笔商城。
     order_numbers = _extract_order_numbers(clean_text)
     if len(order_numbers) > 5:
-        errors.append("• 已超过单笔最大笔数")
+        errors.append("• 已超过单笔最大笔数 <b>5笔</b>")
     elif order_numbers:
         info["single_order_nos"] = order_numbers
         # 保留旧字段，兼容其他旧流程。
