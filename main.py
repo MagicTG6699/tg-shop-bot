@@ -57,6 +57,11 @@ JJ_ADMIN_URL = match_jj.group(0).rstrip('/') if match_jj else raw_jj_admin_url.r
 MANAGER_RECEIVE_NAME = "管理员代收"
 
 
+class JJOrderNotFound(Exception):
+    """JJ 出货管理中真正没有找到订单；只有此异常允许分流到拼多多。"""
+    pass
+
+
 def _debug_log(message):
     """GitHub Actions / 本地诊断日志：立即输出，避免异常被吞掉后完全看不到原因。"""
     try:
@@ -1817,101 +1822,103 @@ async def _jj_open_pdd(page):
     raise Exception(f"JJ 后台展开【进货管理】后仍找不到【拼多多订单管理】；当前URL={page.url}; {detail}")
 
 
-async def _jj_search_page_order(page, order_no, kind, form_ids=()):
-    """在拼多多订单管理里搜索一个订单号。复用出货管理的订单号字段兼容策略。"""
-    _debug_log(f"[PDD] 准备搜索 kind={kind}, order={order_no}, URL={page.url}")
-    selectors = []
-    if kind == "platform":
-        selectors = [
-            "#q_id_eq", "input[name='q[id_eq]']", "#q_id", "input[name='q[id]']",
-            "#q_platform_order_id_eq", "input[name='q[platform_order_id_eq]']",
-            "#q_platform_order_no_eq", "input[name='q[platform_order_no_eq]']",
-            "input[name*='platform_order']", "input[placeholder*='平台订单']",
-            "input[placeholder*='平台訂單']",
-        ]
-        label_texts = ["平台订单号", "平台訂單號", "平台订单", "平台訂單"]
-    else:
-        selectors = [
-            "#q_merchant_order_id_eq", "input[name='q[merchant_order_id_eq]']",
-            "#q_merchant_order_no_eq", "input[name='q[merchant_order_no_eq]']",
-            "#q_merchant_order_id_or_order_trade_id_eq",
-            "input[name='q[merchant_order_id_or_order_trade_id_eq]']",
-            "#q_merchant_order_id_or_order_trade_id",
-            "input[name='q[merchant_order_id_or_order_trade_id]']",
-            "input[name*='merchant_order']", "input[name*='order_trade_id']",
-            "input[placeholder*='商户订单']", "input[placeholder*='商戶訂單']",
-            "input[placeholder*='其他订单']", "input[placeholder*='其他訂單']",
-        ]
-        label_texts = ["商户订单号", "商戶訂單號", "其他订单号", "其他訂單號"]
+async def _jj_search_page_order(page, order_no, kind="platform", form_ids=()):
+    """在 JJ【拼多多订单管理】搜索订单号。
 
-    inp = await _first_visible(page, selectors, timeout=5000)
+    重要：拼多多订单管理只有一个“订单号”输入框，和出货管理的两个
+    订单号输入框不同。这里固定使用实际 DOM：
+      #q_id_or_merchant_order_id_or_channel_order_id_or_order_trade_id_eq
+    不再尝试出货管理的“平台订单号 / 商户订单号”两套字段，也不再二次搜索。
+    """
+    _debug_log(f"[PDD] 准备搜索唯一【订单号】输入框，order={order_no}, URL={page.url}")
+
+    selectors = [
+        "#q_id_or_merchant_order_id_or_channel_order_id_or_order_trade_id_eq",
+        "input[name='q[id_or_merchant_order_id_or_channel_order_id_or_order_trade_id_eq]']",
+    ]
+
+    # DevTools 已确认该页面只有一个“订单号”字段；以下仅作为同一字段的
+    # HTML label / class 兜底，不去寻找第二个订单号字段。
+    inp = await _first_visible(page, selectors, timeout=7000)
     if not inp:
+        label_texts = ["订单号", "訂單號"]
         for txt in label_texts:
-            lab = page.locator(f"label:has-text('{txt}')").first
             try:
-                if await lab.count():
-                    target_id = await lab.get_attribute("for")
+                labels = page.locator("label").filter(has_text=re.compile(rf"^\\s*{re.escape(txt)}\\s*$")).first
+                if await labels.count():
+                    target_id = await labels.get_attribute("for")
                     if target_id:
                         target = page.locator(f"#{target_id}").first
-                        if await target.count():
+                        if await target.count() and await target.is_visible():
                             inp = target
                             break
-                    target = lab.locator("xpath=..//input[1]").first
-                    if await target.count():
+                    target = labels.locator("xpath=..//input[1]").first
+                    if await target.count() and await target.is_visible():
                         inp = target
                         break
             except Exception:
                 pass
+
     if not inp:
-        raise Exception(f"JJ 拼多多订单管理找不到【{'平台订单号' if kind == 'platform' else '商户订单号'}】输入框")
+        raise Exception("JJ 拼多多订单管理找不到【订单号】输入框")
 
     try:
-        _debug_log(f"[PDD] 找到搜索输入框: id={await inp.get_attribute('id')}, name={await inp.get_attribute('name')}, placeholder={await inp.get_attribute('placeholder')}")
+        _debug_log(
+            f"[PDD] 找到唯一订单号输入框: "
+            f"id={await inp.get_attribute('id')}, "
+            f"name={await inp.get_attribute('name')}, "
+            f"placeholder={await inp.get_attribute('placeholder')}"
+        )
     except Exception:
         pass
 
     await inp.fill("")
     await inp.fill(order_no)
 
+    # 实际页面表单由 DevTools 确认为 investor_reward_deposit_order_search；
+    # 同时保留调用方传入的 form_ids 及通用 action 兜底。
     form = None
-    for fid in form_ids:
-        f = page.locator(fid).first
+    form_candidates = list(form_ids) + [
+        "#investor_reward_deposit_order_search",
+        "form[action*='investor_reward_deposit_orders']",
+        "form[action*='reward_deposit']",
+    ]
+    for fid in form_candidates:
         try:
-            if await f.count():
+            f = page.locator(fid).first
+            if await f.count() and await f.is_visible():
                 form = f
                 break
         except Exception:
             pass
-    if form is None:
-        # 常见命名；没有也可以直接按 Enter。
-        for fid in ["#pinduoduo_order_search", "#pdd_order_search", "form[action*='pinduoduo']", "form[action*='pdd']"]:
-            f = page.locator(fid).first
-            try:
-                if await f.count():
-                    form = f
-                    break
-            except Exception:
-                pass
 
     search_btn = None
     if form is not None:
-        search_btn = await _first_visible(form, [
-            "input[type='submit']", "button[type='submit']",
-            "input[value*='搜']", "button:has-text('搜索')", "button:has-text('搜尋')",
-        ], timeout=3000)
+        search_btn = await _first_visible(
+            form,
+            [
+                "input[type='submit']",
+                "button[type='submit']",
+                "input[value*='搜']",
+                "button:has-text('搜索')",
+                "button:has-text('搜尋')",
+            ],
+            timeout=3000,
+        )
+
     try:
         if search_btn:
-            _debug_log("[PDD] 使用搜索按钮提交")
+            _debug_log("[PDD] 使用拼多多唯一订单号搜索按钮提交")
             await search_btn.click()
         else:
-            _debug_log("[PDD] 没找到搜索按钮，使用 Enter 提交")
+            _debug_log("[PDD] 没找到搜索按钮，使用唯一订单号输入框 Enter 提交")
             await inp.press("Enter")
     except Exception as e:
-        _debug_log(f"[PDD] 搜索按钮提交失败，改用 Enter: {repr(e)}")
+        _debug_log(f"[PDD] 搜索按钮提交失败，改用唯一订单号输入框 Enter: {repr(e)}")
         await inp.press("Enter")
 
-    await page.wait_for_timeout(1200)
-    _debug_log(f"[PDD] 搜索完成；当前 URL={page.url}")
+    await page.wait_for_timeout(1500)
+    _debug_log(f"[PDD] 唯一订单号搜索完成；当前 URL={page.url}")
 
 
 async def _jj_query_pdd_order(single_order_no, task_id):
@@ -1952,19 +1959,20 @@ async def _jj_query_pdd_order(single_order_no, task_id):
             await _jj_set_one_year_date(page)
             _debug_log("[PDD] 已设置最近一年日期范围")
 
-            # 先平台订单号，再商户订单号；一旦找到即停止本页继续搜索。
-            await _jj_search_page_order(page, single_order_no, "platform",
-                                        form_ids=("#pinduoduo_order_search", "#pdd_order_search"))
+            # 拼多多页面只有一个“订单号”搜索框：只搜索一次。
+            # 不再套用出货管理的“平台订单号 / 商户订单号”双字段逻辑。
+            await _jj_search_page_order(
+                page,
+                single_order_no,
+                "platform",
+                form_ids=("#investor_reward_deposit_order_search",),
+            )
             headers, cells = await _extract_jj_row(page, single_order_no)
             result_row = await _locate_jj_result_row(page, single_order_no)
-            _debug_log(f"[PDD] 平台订单号查询结果: cells={len(cells)}, result_row={bool(result_row and await result_row.count()) if result_row is not None else False}")
-
-            if not cells:
-                await _jj_search_page_order(page, single_order_no, "other",
-                                            form_ids=("#pinduoduo_order_search", "#pdd_order_search"))
-                headers, cells = await _extract_jj_row(page, single_order_no)
-                result_row = await _locate_jj_result_row(page, single_order_no)
-                _debug_log(f"[PDD] 其他订单号查询结果: cells={len(cells)}, result_row={bool(result_row and await result_row.count()) if result_row is not None else False}")
+            _debug_log(
+                f"[PDD] 唯一【订单号】查询结果: cells={len(cells)}, "
+                f"result_row={bool(result_row and await result_row.count()) if result_row is not None else False}"
+            )
 
             if not cells:
                 _debug_log(f"[PDD] 订单未找到: {single_order_no}")
@@ -2370,7 +2378,7 @@ async def _query_jj_order(single_order_no, task_id):
                 headers, cells = await _extract_jj_row(page, single_order_no)
 
             if not cells:
-                raise Exception(f"JJ 找不到订单：{single_order_no}")
+                raise JJOrderNotFound(f"JJ 找不到订单：{single_order_no}")
 
             result_row = await _locate_jj_result_row(page, single_order_no)
 
@@ -3289,22 +3297,25 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                     # --------------------------------------------------
                     try:
                         outbound_result = await _query_jj_order(order_no, task_id)
+                    except JJOrderNotFound as outbound_not_found:
+                        # 只有“出货管理真正没有找到订单”才允许分流到拼多多。
+                        _debug_log(f"[出货] 确认未找到订单，才分流 PDD: order={order_no}")
+                        _debug_log(f"[出货] not-found detail: {outbound_not_found!r}")
+                        outbound_result = None
                     except Exception as outbound_error:
-                        _debug_log(f"[出货] 查询异常 order={order_no}: repr={outbound_error!r}")
+                        # 任何“找到订单之后”的异常（例如收款号读取失败）都属于
+                        # 出货管理异常，绝不能因为文字里出现“找不到”就误分流 PDD。
+                        _debug_log(f"[出货] 查询/处理异常，禁止分流 PDD: order={order_no}, repr={outbound_error!r}")
                         _debug_log(traceback.format_exc())
-                        # “找不到订单”属于正常分流条件；其他错误才是真正的查询异常。
-                        outbound_error_text = str(outbound_error)
-                        if "找不到订单" in outbound_error_text or "找不到" in outbound_error_text and "订单" in outbound_error_text:
-                            outbound_result = None
-                        else:
-                            safe_err = html.escape(outbound_error_text)
-                            await status_msg.edit_text(
-                                result_text +
-                                f"\n\n⚠️ <b>出货管理查询异常</b>\n订单号：<code>{html.escape(order_no)}</code>\n<code>{safe_err}</code>",
-                                reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
-                                parse_mode="HTML", disable_web_page_preview=True
-                            )
-                            return
+                        outbound_error_text = str(outbound_error) or repr(outbound_error)
+                        safe_err = html.escape(outbound_error_text)
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⚠️ <b>出货管理查询异常</b>\n订单号：<code>{html.escape(order_no)}</code>\n<code>{safe_err}</code>",
+                            reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        return
 
                     if outbound_result is not None:
                         # 出货管理命中 = 充值流程，成功订单必须核对收款号。
