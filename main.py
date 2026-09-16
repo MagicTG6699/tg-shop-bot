@@ -4,6 +4,7 @@ import asyncio
 import re
 import html
 import random
+import traceback
 from datetime import datetime, timedelta
 try:
     import pyotp
@@ -54,6 +55,14 @@ match_jj = re.search(r'https?://[^\s\]\)\>\"\']+', raw_jj_admin_url)
 JJ_ADMIN_URL = match_jj.group(0).rstrip('/') if match_jj else raw_jj_admin_url.rstrip('/')
 
 MANAGER_RECEIVE_NAME = "管理员代收"
+
+
+def _debug_log(message):
+    """GitHub Actions / 本地诊断日志：立即输出，避免异常被吞掉后完全看不到原因。"""
+    try:
+        print(f"[TG-BOT] {message}", flush=True)
+    except Exception:
+        pass
 
 # 全局任务字典
 ACTIVE_TASKS = {}
@@ -1692,31 +1701,125 @@ def _payment_account_matches(expected, actual):
 
 
 async def _jj_open_pdd(page):
-    """打开 JJ 的拼多多订单管理页面。优先按菜单文字/链接 href 定位，不写死平台名称。"""
-    candidates = [
-        "a:has-text('拼多多订单管理')",
-        "a:has-text('拼多多訂單管理')",
-        "a:has-text('拼多多订单')",
-        "a:has-text('拼多多訂單')",
-        "a[href*='pinduoduo']",
-        "a[href*='pdd']",
+    """打开 JJ 的【进货管理 -> 拼多多订单管理】页面。
+
+    JJ 左侧菜单默认会把【拼多多订单管理】收在【进货管理】下面，
+    所以必须先展开【进货管理】，再点击子菜单。
+    """
+    _debug_log(f"[PDD] 开始打开拼多多订单管理；当前 URL={page.url}")
+
+    # ① 先展开左侧【进货管理】。
+    parent_selectors = [
+        "li.treeview:has(> a span:text-is('进货管理')) > a",
+        "li.treeview:has(> a span:text-is('進貨管理')) > a",
+        "li.treeview:has(> a:has-text('进货管理')) > a",
+        "li.treeview:has(> a:has-text('進貨管理')) > a",
     ]
-    for selector in candidates:
+    expanded = False
+    parent_errors = []
+
+    for selector in parent_selectors:
         loc = page.locator(selector).first
         try:
-            if await loc.count() and await loc.is_visible():
+            count = await loc.count()
+            visible = await loc.is_visible() if count else False
+            _debug_log(f"[PDD] 进货管理父菜单候选 {selector}: count={count}, visible={visible}")
+            if not (count and visible):
+                continue
+
+            # 已经展开时不需要重复点击；以 active / aria-expanded / 子菜单可见性判断。
+            parent_li = loc.locator("..")
+            cls = await parent_li.get_attribute("class") or ""
+            aria = await loc.get_attribute("aria-expanded")
+            child_visible = False
+            for child_sel in [
+                "ul.treeview-menu li a:has-text('拼多多订单管理')",
+                "ul.treeview-menu li a:has-text('拼多多訂單管理')",
+                "ul.treeview-menu li a:has-text('拼多多订单')",
+                "ul.treeview-menu li a:has-text('拼多多訂單')",
+            ]:
+                child = parent_li.locator(child_sel).first
+                if await child.count() and await child.is_visible():
+                    child_visible = True
+                    break
+
+            if child_visible or "active" in cls or aria == "true":
+                _debug_log(f"[PDD] 进货管理已经展开；class={cls!r}, aria-expanded={aria!r}")
+                expanded = True
+                break
+
+            await loc.click()
+            await page.wait_for_timeout(500)
+            _debug_log(f"[PDD] 已点击【进货管理】展开菜单；URL={page.url}")
+            expanded = True
+            break
+        except Exception as e:
+            err = repr(e)
+            parent_errors.append(f"{selector}: {err}")
+            _debug_log(f"[PDD] 展开【进货管理】失败: {err}")
+
+    if not expanded:
+        detail = " | ".join(parent_errors[-3:])
+        raise Exception(f"JJ 后台找不到或无法展开【进货管理】菜单；当前URL={page.url}; {detail}")
+
+    # ② 展开后再找【拼多多订单管理】子菜单。
+    child_selectors = [
+        "li.treeview-menu a:has-text('拼多多订单管理')",
+        "li.treeview-menu a:has-text('拼多多訂單管理')",
+        "ul.treeview-menu a:has-text('拼多多订单管理')",
+        "ul.treeview-menu a:has-text('拼多多訂單管理')",
+        "ul.treeview-menu a:has-text('拼多多订单')",
+        "ul.treeview-menu a:has-text('拼多多訂單')",
+    ]
+    child_errors = []
+
+    for selector in child_selectors:
+        loc = page.locator(selector).first
+        try:
+            count = await loc.count()
+            visible = await loc.is_visible() if count else False
+            _debug_log(f"[PDD] 子菜单候选 {selector}: count={count}, visible={visible}")
+            if count and visible:
+                href = await loc.get_attribute("href")
+                _debug_log(f"[PDD] 找到【拼多多订单管理】子菜单，href={href!r}")
                 await loc.click()
                 await page.wait_for_load_state("domcontentloaded")
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(800)
+                _debug_log(f"[PDD] 已点击【拼多多订单管理】；进入 URL={page.url}")
                 return
-        except Exception:
-            continue
-    if not any(x in page.url.lower() for x in ["pinduoduo", "pdd"]):
-        raise Exception("JJ 后台找不到【拼多多订单管理】页面入口")
+        except Exception as e:
+            err = repr(e)
+            child_errors.append(f"{selector}: {err}")
+            _debug_log(f"[PDD] 点击子菜单 {selector} 失败: {err}")
+
+    # ③ 最后才尝试直接链接。注意：该页面实际 href 不一定包含 pdd/pinduoduo，
+    # 因此不能只靠 href 关键字判断。
+    fallback_links = page.locator("a").filter(
+        has_text=re.compile(r"^\s*拼多多(?:订单|訂單)(?:管理)?\s*$")
+    )
+    try:
+        count = await fallback_links.count()
+        for i in range(count):
+            loc = fallback_links.nth(i)
+            if await loc.is_visible():
+                href = await loc.get_attribute("href")
+                _debug_log(f"[PDD] 文字精确匹配找到子菜单，href={href!r}")
+                await loc.click()
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(800)
+                _debug_log(f"[PDD] 已通过精确文字进入拼多多订单管理；URL={page.url}")
+                return
+    except Exception as e:
+        child_errors.append(f"exact-text: {repr(e)}")
+        _debug_log(f"[PDD] 精确文字点击失败: {repr(e)}")
+
+    detail = " | ".join(child_errors[-5:])
+    raise Exception(f"JJ 后台展开【进货管理】后仍找不到【拼多多订单管理】；当前URL={page.url}; {detail}")
 
 
 async def _jj_search_page_order(page, order_no, kind, form_ids=()):
     """在拼多多订单管理里搜索一个订单号。复用出货管理的订单号字段兼容策略。"""
+    _debug_log(f"[PDD] 准备搜索 kind={kind}, order={order_no}, URL={page.url}")
     selectors = []
     if kind == "platform":
         selectors = [
@@ -1762,6 +1865,11 @@ async def _jj_search_page_order(page, order_no, kind, form_ids=()):
     if not inp:
         raise Exception(f"JJ 拼多多订单管理找不到【{'平台订单号' if kind == 'platform' else '商户订单号'}】输入框")
 
+    try:
+        _debug_log(f"[PDD] 找到搜索输入框: id={await inp.get_attribute('id')}, name={await inp.get_attribute('name')}, placeholder={await inp.get_attribute('placeholder')}")
+    except Exception:
+        pass
+
     await inp.fill("")
     await inp.fill(order_no)
 
@@ -1793,13 +1901,17 @@ async def _jj_search_page_order(page, order_no, kind, form_ids=()):
         ], timeout=3000)
     try:
         if search_btn:
+            _debug_log("[PDD] 使用搜索按钮提交")
             await search_btn.click()
         else:
+            _debug_log("[PDD] 没找到搜索按钮，使用 Enter 提交")
             await inp.press("Enter")
-    except Exception:
+    except Exception as e:
+        _debug_log(f"[PDD] 搜索按钮提交失败，改用 Enter: {repr(e)}")
         await inp.press("Enter")
 
-    await page.wait_for_timeout(800)
+    await page.wait_for_timeout(1200)
+    _debug_log(f"[PDD] 搜索完成；当前 URL={page.url}")
 
 
 async def _jj_query_pdd_order(single_order_no, task_id):
@@ -1820,6 +1932,7 @@ async def _jj_query_pdd_order(single_order_no, task_id):
             args=["--no-sandbox", "--disable-setuid-sandbox",
                   "--disable-blink-features=AutomationControlled"]
         )
+        _debug_log(f"[PDD] 启动 JJ 查询浏览器，订单={single_order_no}")
         try:
             context = await browser.new_context()
             page = await context.new_page()
@@ -1827,26 +1940,34 @@ async def _jj_query_pdd_order(single_order_no, task_id):
             if task_id in ACTIVE_TASKS:
                 ACTIVE_TASKS[task_id]["page"] = page
 
+            _debug_log(f"[PDD] 开始登录 JJ；订单={single_order_no}")
             await _login_generic(page, JJ_ADMIN_URL, JJ_ADMIN_USER, JJ_ADMIN_PASS, use_totp=True)
+            _debug_log(f"[PDD] JJ 登录完成；URL={page.url}")
 
             await _jj_open_pdd(page)
+            _debug_log(f"[PDD] 已进入拼多多页面；URL={page.url}")
             # 拼多多订单管理同样解暗锁，并把建立日期范围拉到最近一年。
             await _jj_unlock_search_range(page)
+            _debug_log("[PDD] 搜索日期暗锁处理完成")
             await _jj_set_one_year_date(page)
+            _debug_log("[PDD] 已设置最近一年日期范围")
 
             # 先平台订单号，再商户订单号；一旦找到即停止本页继续搜索。
             await _jj_search_page_order(page, single_order_no, "platform",
                                         form_ids=("#pinduoduo_order_search", "#pdd_order_search"))
             headers, cells = await _extract_jj_row(page, single_order_no)
             result_row = await _locate_jj_result_row(page, single_order_no)
+            _debug_log(f"[PDD] 平台订单号查询结果: cells={len(cells)}, result_row={bool(result_row and await result_row.count()) if result_row is not None else False}")
 
             if not cells:
                 await _jj_search_page_order(page, single_order_no, "other",
                                             form_ids=("#pinduoduo_order_search", "#pdd_order_search"))
                 headers, cells = await _extract_jj_row(page, single_order_no)
                 result_row = await _locate_jj_result_row(page, single_order_no)
+                _debug_log(f"[PDD] 其他订单号查询结果: cells={len(cells)}, result_row={bool(result_row and await result_row.count()) if result_row is not None else False}")
 
             if not cells:
+                _debug_log(f"[PDD] 订单未找到: {single_order_no}")
                 return None
 
             # 读取目标行文字/HTML，仅针对目标订单判断状态。
@@ -1890,7 +2011,10 @@ async def _jj_query_pdd_order(single_order_no, task_id):
                         break
 
             if not is_success and not is_failed:
+                _debug_log(f"[PDD] 无法判断订单状态；row_text={row_text[:1000]!r}")
                 raise Exception(f"JJ 拼多多订单状态无法判断：{row_text[:1000] or '无状态资料'}")
+
+            _debug_log(f"[PDD] 订单状态判断: success={is_success}, failed={is_failed}, status={status_text!r}")
 
             # 当前拼多多页面字段可能略有差异，优先 header，再按常见列位置兜底。
             order_display = _cell_by_header(headers, cells, [
@@ -3166,6 +3290,8 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                     try:
                         outbound_result = await _query_jj_order(order_no, task_id)
                     except Exception as outbound_error:
+                        _debug_log(f"[出货] 查询异常 order={order_no}: repr={outbound_error!r}")
+                        _debug_log(traceback.format_exc())
                         # “找不到订单”属于正常分流条件；其他错误才是真正的查询异常。
                         outbound_error_text = str(outbound_error)
                         if "找不到订单" in outbound_error_text or "找不到" in outbound_error_text and "订单" in outbound_error_text:
@@ -3233,7 +3359,11 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                     try:
                         pdd_result = await _jj_query_pdd_order(order_no, task_id)
                     except Exception as pdd_error:
-                        safe_pdd = html.escape(str(pdd_error))
+                        _debug_log(f"[PDD] 查询异常 order={order_no}: repr={pdd_error!r}")
+                        _debug_log("[PDD] 完整 Traceback 开始")
+                        _debug_log(traceback.format_exc())
+                        _debug_log("[PDD] 完整 Traceback 结束")
+                        safe_pdd = html.escape(str(pdd_error) or repr(pdd_error) or "未知异常（str 为空）")
                         await status_msg.edit_text(
                             result_text +
                             f"\n\n⚠️ <b>拼多多订单查询异常</b>\n订单号：<code>{html.escape(order_no)}</code>\n<code>{safe_pdd}</code>",
