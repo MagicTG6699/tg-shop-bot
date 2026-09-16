@@ -1587,10 +1587,10 @@ async def _locate_jj_result_row(page, order_no):
 
 
 async def _extract_payment_account_from_order(page, order_no, result_row=None):
-    """进入本次命中的 JJ 订单对应的出货平台详情页，读取真实收款号。
+    """进入 JJ 出货订单对应的【收款帐号】详情页，读取真实收款账号。
 
-    不按淘宝/京东/数字等平台名称判断；统一寻找订单行中的 /payment_settings/ 链接。
-    result_row 是本次搜索实际命中的那一行，因此商户订单号也能正确找到对应收款帐户。
+    这里必须进入截图中的收款帐户详情页核对，不能直接从出货订单列表猜测。
+    详情页实际结构为：左侧字段（例如“帳號”）+ 右侧字段值（例如邮箱/账号）。
     """
     row = result_row
     if row is None:
@@ -1598,21 +1598,34 @@ async def _extract_payment_account_from_order(page, order_no, result_row=None):
     if row is None or not await row.count():
         raise Exception(f"订单【{order_no}】找不到对应结果行，无法核对收款号。")
 
+    # ① 从“出货平台”这一列找到收款帐户详情链接。
     link = row.locator("a[href*='/payment_settings/']").first
     if not await link.count():
-        # 截图确认“出货平台”在第 6 个外层 td；平台文字可能不同，仍以链接 href 为准。
         cells = row.locator(":scope > td")
         if await cells.count() > 6:
+            # 你截图里的出货平台是第 7 个外层 td（索引 6）。
             link = cells.nth(6).locator("a[href]").first
 
+    # 再做一次全行 href 扫描，避免页面版本变化导致第 7 列位置变化。
     if not await link.count():
-        raise Exception(f"订单【{order_no}】找不到【出货平台】详情链接，无法核对收款号。")
+        anchors = row.locator("a[href]")
+        for i in range(await anchors.count()):
+            a = anchors.nth(i)
+            try:
+                href0 = await a.get_attribute("href")
+                if href0 and '/payment_settings/' in href0:
+                    link = a
+                    break
+            except Exception:
+                continue
+
+    if not await link.count():
+        raise Exception(f"订单【{order_no}】找不到【出货平台】收款帐户详情链接，无法核对收款号。")
 
     href = await link.get_attribute("href")
     if not href:
-        raise Exception(f"订单【{order_no}】的出货平台链接地址为空。")
+        raise Exception(f"订单【{order_no}】的收款帐户详情链接地址为空。")
 
-    # Playwright 对相对地址需要补当前站点 origin。
     if href.startswith('/'):
         origin = re.match(r'^(https?://[^/]+)', page.url)
         href = (origin.group(1) if origin else '') + href
@@ -1620,64 +1633,164 @@ async def _extract_payment_account_from_order(page, order_no, result_row=None):
         base = re.sub(r'/[^/]*$', '/', page.url)
         href = base + href.lstrip('/')
 
+    _debug_log(f"[出货] 进入收款帐户详情页核对账号：order={order_no}, url={href}")
     await page.goto(href, wait_until="domcontentloaded")
-    await page.wait_for_timeout(300)
+    await page.wait_for_timeout(500)
+    _debug_log(f"[出货] 收款帐户详情页已打开：url={page.url}")
 
-    # 详情页结构为“左边字段名称、右边字段值”。
-    account_labels = {
-        '帳號', '账号', '帳户', '账户', '收款号', '收款號',
-        '收款账号', '收款帳號', '收款帐号', '收款帳號',
+    account_label_norms = {
+        '帳號', '账号', '帐号', '帳户', '账户',
+        '收款号', '收款號', '收款账号', '收款帳號', '收款帐号',
+        '支付帳號', '支付账号', '支付帐号',
     }
+    account_keywords = ('帳號', '账号', '帐号', '帳户', '账户', '收款号', '收款號', '收款账号', '收款帳號', '收款帐号')
     payment_account = ''
     payment_method = ''
 
-    rows = page.locator('table tr')
-    for i in range(await rows.count()):
-        r = rows.nth(i)
-        try:
-            cells = r.locator(':scope > th, :scope > td')
-            count = await cells.count()
-            if count < 2:
-                continue
-            label = _clean_text_value(await cells.nth(0).inner_text())
-            value = _clean_text_value(await cells.nth(1).inner_text())
-            label_norm = re.sub(r'\s+', '', label)
-            if label_norm in {'收款方式', '收款方法'}:
-                payment_method = value
-            if label_norm in account_labels:
-                payment_account = value
-                break
-        except Exception:
-            continue
+    def norm(v):
+        return re.sub(r'\s+', '', _clean_text_value(v or ''))
 
+    # ② 第一优先：严格按“字段名称 -> 下一格字段值”读取。
+    try:
+        rows = page.locator('table tr')
+        row_count = await rows.count()
+        _debug_log(f"[出货] 收款帐户详情页 table tr 数量：{row_count}")
+        for i in range(row_count):
+            r = rows.nth(i)
+            try:
+                cells = r.locator(':scope > th, :scope > td')
+                count = await cells.count()
+                if count < 2:
+                    continue
+                values = []
+                for j in range(count):
+                    values.append(_clean_text_value(await cells.nth(j).inner_text()))
+
+                for j, label in enumerate(values):
+                    label_norm = norm(label)
+                    if label_norm in account_label_norms or any(k in label_norm for k in account_keywords):
+                        # 从标签右侧寻找第一个非空值；详情页截图就是这种结构。
+                        for k in range(j + 1, count):
+                            candidate = _clean_text_value(values[k])
+                            if candidate and norm(candidate) not in account_label_norms:
+                                payment_account = candidate
+                                break
+                        if payment_account:
+                            break
+                if payment_account:
+                    break
+
+                # 兼容某些版本把“帳號 caco@163.com”放在同一个 td/th 中。
+                row_text = _clean_text_value(await r.inner_text())
+                row_norm = norm(row_text)
+                if any(k in row_norm for k in account_keywords):
+                    for k in account_keywords:
+                        pos = row_norm.find(norm(k))
+                        if pos >= 0:
+                            raw_after = row_norm[pos + len(norm(k)):]
+                            raw_after = re.sub(r'^[：:：=\-\s]+', '', raw_after)
+                            if raw_after and raw_after not in account_label_norms:
+                                payment_account = raw_after
+                                break
+                if payment_account:
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        _debug_log(f"[出货] 收款帐户详情页表格读取异常：{repr(e)}")
+
+    # ③ 第二优先：直接找“帳號”元素，再向最近的 tr 取其它单元格。
     if not payment_account:
-        # 兼容字段名不是标准第一格的版本：找“帳號”文字，再向最近的 tr 取第二格。
-        for label in ['帳號', '账号', '帐号', '收款号', '收款號', '收款账号', '收款帳號']:
+        for label in account_keywords:
             try:
                 loc = page.get_by_text(label, exact=True).first
                 if not await loc.count():
+                    # exact 可能因空格/换行失败，再用包含文字的定位。
+                    loc = page.get_by_text(re.compile(re.escape(label), re.I)).first
+                if not await loc.count():
                     continue
+
                 tr = loc.locator('xpath=ancestor::tr[1]').first
                 if await tr.count():
                     vals = tr.locator(':scope > th, :scope > td')
-                    if await vals.count() >= 2:
-                        payment_account = _clean_text_value(await vals.nth(1).inner_text())
-                if not payment_account:
-                    parent = loc.locator('xpath=..').first
-                    vals = parent.locator('td, span, div')
-                    for j in range(await vals.count()):
-                        v = _clean_text_value(await vals.nth(j).inner_text())
-                        if v and v != label:
-                            payment_account = v
+                    n = await vals.count()
+                    texts = [_clean_text_value(await vals.nth(j).inner_text()) for j in range(n)]
+                    label_idx = -1
+                    for j, t in enumerate(texts):
+                        if norm(t) in account_label_norms or norm(label) in norm(t):
+                            label_idx = j
                             break
+                    if label_idx >= 0:
+                        for j in range(label_idx + 1, n):
+                            if texts[j] and norm(texts[j]) not in account_label_norms:
+                                payment_account = texts[j]
+                                break
+                    if not payment_account:
+                        # 若标签和值在同一个 cell，从标签后面截取。
+                        joined = _clean_text_value(await tr.inner_text())
+                        joined_norm = norm(joined)
+                        p = joined_norm.find(norm(label))
+                        if p >= 0:
+                            candidate = re.sub(r'^[：:：=\-\s]+', '', joined_norm[p + len(norm(label)):])
+                            if candidate and candidate not in account_label_norms:
+                                payment_account = candidate
                 if payment_account:
                     break
             except Exception:
                 continue
 
+    # ④ 第三优先：从详情页“帳號”所在文本块中提取邮箱/数字账号。
+    # 这一步只在“帳號”标签附近执行，不会从 QRCode 或其它字段乱抓。
     if not payment_account:
-        raise Exception(f"订单【{order_no}】的收款平台详情页找不到【帳號/收款号】。")
+        try:
+            all_rows = page.locator('tr')
+            for i in range(await all_rows.count()):
+                txt = _clean_text_value(await all_rows.nth(i).inner_text())
+                if not txt:
+                    continue
+                compact = re.sub(r'\s+', '', txt)
+                if not any(k in compact for k in account_keywords):
+                    continue
 
+                # 邮箱优先，例如截图中的 caco@163.com。
+                m = re.search(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', txt)
+                if m:
+                    payment_account = m.group(0)
+                    break
+
+                # 没有邮箱时，允许常见纯数字收款账号/手机号。
+                m = re.search(r'(?<!\d)\d{6,30}(?!\d)', txt)
+                if m:
+                    payment_account = m.group(0)
+                    break
+        except Exception:
+            pass
+
+    # 收款方式只作记录，不参与账号核对条件。
+    try:
+        for label in ['收款方式', '收款方法', '收款方式']:
+            loc = page.get_by_text(label, exact=True).first
+            if await loc.count():
+                tr = loc.locator('xpath=ancestor::tr[1]').first
+                if await tr.count():
+                    vals = tr.locator(':scope > th, :scope > td')
+                    if await vals.count() >= 2:
+                        payment_method = _clean_text_value(await vals.nth(1).inner_text())
+                if payment_method:
+                    break
+    except Exception:
+        pass
+
+    if not payment_account:
+        # 诊断时输出详情页可见文本的前一部分，方便下一次针对真实 DOM 修正。
+        try:
+            visible_text = _clean_text_value(await page.locator('body').inner_text())
+            _debug_log(f"[出货] 收款帐户详情页未读取到帳號；页面文字前1000字：{visible_text[:1000]}")
+        except Exception:
+            pass
+        raise Exception(f"订单【{order_no}】的收款帐户详情页找不到【帳號/收款号】。")
+
+    _debug_log(f"[出货] 已从收款帐户详情页读取真实收款号：order={order_no}, account={payment_account}")
     return {
         'account': payment_account,
         'method': payment_method,
