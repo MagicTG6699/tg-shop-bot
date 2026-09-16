@@ -2092,8 +2092,32 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
                 pass
 
 
-# 修改商城界面函数（无排队锁，可并发独立运行）
-async def update_shop_skin(account_name: str, new_skin: str):
+# 修改商城界面函数（支持全部商城 / 单笔商城各自后台）
+async def update_shop_skin(account_name: str, new_skin: str, backend: str = "all"):
+    """
+    修改指定商城的界面。
+    backend=all    -> 全部商城后台
+    backend=single -> 单笔商城后台
+
+    重要：不能把单笔商城的账号拿去 BASE_ADMIN_URL 搜索。
+    单笔商城必须使用 SINGLE_ADMIN_URL，并进入 /market_manager/merchants。
+    """
+    if backend == "single":
+        admin_url = SINGLE_ADMIN_URL
+        admin_user = SINGLE_ADMIN_USER
+        admin_pass = SINGLE_ADMIN_PASS
+        merchants_url = f"{SINGLE_ADMIN_ROOT}/market_manager/merchants"
+    else:
+        admin_url = BASE_ADMIN_URL
+        admin_user = ADMIN_USER
+        admin_pass = ADMIN_PASS
+        merchants_url = f"{BASE_ADMIN_URL}/merchants"
+
+    if not admin_url:
+        raise Exception("商城后台 URL 未配置")
+    if not admin_user or not admin_pass:
+        raise Exception("商城后台账号或密码未配置")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -2104,36 +2128,104 @@ async def update_shop_skin(account_name: str, new_skin: str):
             page = await context.new_page()
             page.set_default_timeout(20000)
 
-            await page.goto(BASE_ADMIN_URL, wait_until="domcontentloaded")
-            user_input = page.locator(
-                "#admin_user_email, #user_email, input[type='email'], input[name*='email'], input[name*='login'], input[name*='username'], input[type='text']"
-            ).first
-            await user_input.fill(ADMIN_USER)
-            await page.locator("#admin_user_password, #user_password, input[type='password']").first.fill(ADMIN_PASS)
-            await page.locator("input[type='submit'], button[type='submit'], input[name='commit']").first.click()
-            await page.wait_for_load_state("domcontentloaded")
+            await _login_generic(page, admin_url, admin_user, admin_pass)
 
-            await page.goto(f"{BASE_ADMIN_URL}/merchants", wait_until="domcontentloaded")
-            search_input = page.locator("input[name*='account'], #search_account, input[type='search'], input[type='text']").first
-            await search_input.fill(account_name)
-            search_btn = page.locator("button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary").first
-            if await search_btn.is_visible():
-                await search_btn.click()
+            if backend == "single":
+                # 单笔商城已确认真实搜索字段是 q_username_eq。
+                await page.goto(merchants_url, wait_until="domcontentloaded")
+                search_input = await _first_visible(page, [
+                    "#q_username_eq",
+                    "input[name='q[username_eq]']",
+                    "#q_username",
+                    "input[name='q[username]']",
+                    "input[name*='account']",
+                    "input[type='search']",
+                    "input[type='text']",
+                ], timeout=8000)
+                if not search_input:
+                    raise Exception(f"单笔商城找不到商户搜索框；当前地址：{page.url}")
+
+                await search_input.fill(account_name)
+                search_btn = await _first_visible(page, [
+                    "button:has-text('搜尋')",
+                    "button:has-text('搜索')",
+                    "input[type='submit']",
+                    ".btn-primary",
+                ], timeout=3000)
+                if search_btn:
+                    await search_btn.click()
+                else:
+                    await search_input.press("Enter")
+
+                await page.wait_for_timeout(500)
+                rows = page.locator("tbody tr")
+                target_row = None
+                for i in range(await rows.count()):
+                    row = rows.nth(i)
+                    try:
+                        txt = _clean_text_value(await row.inner_text())
+                        if account_name.lower() in txt.lower():
+                            target_row = row
+                            break
+                    except Exception:
+                        continue
+                if target_row is None:
+                    raise Exception(f"单笔商城找不到商户【{account_name}】")
+
+                edit_link = target_row.locator("a[href$='/edit']").first
+                await edit_link.wait_for(state="visible", timeout=10000)
+                await edit_link.click()
+                await page.wait_for_load_state("domcontentloaded")
+
             else:
-                await search_input.press("Enter")
-            await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
+                # 全部商城维持原本的搜索逻辑。
+                await page.goto(merchants_url, wait_until="domcontentloaded")
+                search_input = page.locator(
+                    "input[name*='account'], #search_account, input[type='search'], input[type='text']"
+                ).first
+                await search_input.wait_for(state="visible", timeout=20000)
+                await search_input.fill(account_name)
+                search_btn = page.locator(
+                    "button:has-text('搜尋'), button:has-text('搜索'), input[type='submit'], .btn-primary"
+                ).first
+                if await search_btn.is_visible():
+                    await search_btn.click()
+                else:
+                    await search_input.press("Enter")
+                await page.locator("tbody tr").first.wait_for(state="visible", timeout=20000)
+                await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
+                await page.wait_for_load_state("domcontentloaded")
 
-            await page.locator("tbody tr").first.locator("a[href$='/edit']").click()
-            await page.wait_for_load_state("domcontentloaded")
-
-            shop_template = page.locator("#merchant_store_skin_type")
-            if await shop_template.is_visible():
+            shop_template = page.locator("#merchant_store_skin_type").first
+            await shop_template.wait_for(state="visible", timeout=10000)
+            try:
+                await shop_template.select_option(label=new_skin)
+            except Exception:
                 try:
-                    await shop_template.select_option(label=new_skin)
-                except Exception:
                     await shop_template.select_option(label=f"预设{new_skin}")
+                except Exception:
+                    # 最后尝试按 option 文字去掉“预设”后的匹配。
+                    options = await shop_template.locator("option").evaluate_all(
+                        "els => els.map(e => ({value:e.value,text:(e.textContent||'').trim()}))"
+                    )
+                    matched = next(
+                        (x for x in options if x.get("text", "").replace("预设", "") == new_skin),
+                        None
+                    )
+                    if not matched:
+                        raise Exception(f"后台找不到商城界面【{new_skin}】")
+                    await shop_template.select_option(value=matched["value"])
 
-            await page.locator("input[name='commit'][value='送出']").first.click()
+            submit = await _first_visible(page, [
+                "input[name='commit'][value='送出']",
+                "input[type='submit'][value='送出']",
+                "input[name='commit']",
+                "button[type='submit']",
+            ], timeout=10000)
+            if not submit:
+                raise Exception("商城编辑页面找不到【送出】按钮")
+
+            await submit.click()
             await page.wait_for_load_state("domcontentloaded")
         finally:
             try:
@@ -2143,28 +2235,34 @@ async def update_shop_skin(account_name: str, new_skin: str):
 
 
 # 默认主按钮键盘
-def build_main_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
+def build_main_keyboard(account: str, current_skin: str = "极速微商", backend: str = "all") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
+    # callback 中明确记录后台类型，避免单笔商城误走全部商城后台。
+    backend_key = "s" if backend == "single" else "a"
     buttons = [
-        [InlineKeyboardButton(f"✨ 更改商城界面（当前{current_skin}）", callback_data=f"op:{account}:{current_skin}")]
+        [InlineKeyboardButton(
+            f"✨ 更改商城界面（当前{current_skin}）",
+            callback_data=f"op:{backend_key}:{account}:{current_skin}"
+        )]
     ]
     return InlineKeyboardMarkup(buttons)
 
 
 # 展开风格选项键盘
-def build_skin_options_keyboard(account: str, current_skin: str = "极速微商") -> InlineKeyboardMarkup:
+def build_skin_options_keyboard(account: str, current_skin: str = "极速微商", backend: str = "all") -> InlineKeyboardMarkup:
     current_skin = current_skin.replace("预设", "")
+    backend_key = "s" if backend == "single" else "a"
     buttons = [
         [
-            InlineKeyboardButton("极速微商", callback_data=f"sk:jisumeishang:{account}"),
-            InlineKeyboardButton("七喵", callback_data=f"sk:qimiao:{account}")
+            InlineKeyboardButton("极速微商", callback_data=f"sk:{backend_key}:jisumeishang:{account}"),
+            InlineKeyboardButton("七喵", callback_data=f"sk:{backend_key}:qimiao:{account}")
         ],
         [
-            InlineKeyboardButton("柒月", callback_data=f"sk:qiyue:{account}"),
-            InlineKeyboardButton("音你而来", callback_data=f"sk:yinnierlai:{account}")
+            InlineKeyboardButton("柒月", callback_data=f"sk:{backend_key}:qiyue:{account}"),
+            InlineKeyboardButton("音你而来", callback_data=f"sk:{backend_key}:yinnierlai:{account}")
         ],
         [
-            InlineKeyboardButton("⬅️ 收起", callback_data=f"cl:{account}:{current_skin}")
+            InlineKeyboardButton("⬅️ 收起", callback_data=f"cl:{backend_key}:{account}:{current_skin}")
         ]
     ]
     return InlineKeyboardMarkup(buttons)
@@ -2265,7 +2363,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                     safe_jj = html.escape(str(jj_error))
                     await status_msg.edit_text(
                         result_text + f"\n\n⚠️ <b>JJ 订单查询失败</b>\n<code>{safe_jj}</code>",
-                        reply_markup=build_main_keyboard(final_account, initial_skin),
+                        reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
                         parse_mode="HTML", disable_web_page_preview=True
                     )
                     return
@@ -2287,7 +2385,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         result_text +
                         f"\n\nJJ订单状态：<b>{html.escape(status_label)}</b>"
                         f"\n❌ <b>新增充值失败</b>\n<code>{safe_recharge}</code>",
-                        reply_markup=build_main_keyboard(final_account, initial_skin),
+                        reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
                         parse_mode="HTML", disable_web_page_preview=True
                     )
                     return
@@ -2299,7 +2397,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                 )
                 await status_msg.edit_text(
                     final_text,
-                    reply_markup=build_main_keyboard(final_account, initial_skin),
+                    reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
                     parse_mode="HTML", disable_web_page_preview=True
                 )
             else:
@@ -2378,17 +2476,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
 
     elif data.startswith("op:"):
-        _, account, current_skin = data.split(":", 2)
-        keyboard = build_skin_options_keyboard(account, current_skin)
-        await query.edit_message_reply_markup(reply_markup=keyboard)
+        # 格式：op:<a/s>:<account>:<current_skin>
+        try:
+            _, backend_key, account, current_skin = data.split(":", 3)
+            backend = "single" if backend_key == "s" else "all"
+            keyboard = build_skin_options_keyboard(account, current_skin, backend=backend)
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception as e:
+            print(f"⚠️ 打开商城界面选择菜单失败：{e}")
+            try:
+                await query.answer("⚠️ 打开界面选择失败，请再点一次。", show_alert=True)
+            except Exception:
+                pass
 
     elif data.startswith("cl:"):
-        _, account, current_skin = data.split(":", 2)
-        keyboard = build_main_keyboard(account, current_skin)
-        await query.edit_message_reply_markup(reply_markup=keyboard)
+        # 格式：cl:<a/s>:<account>:<current_skin>
+        try:
+            _, backend_key, account, current_skin = data.split(":", 3)
+            backend = "single" if backend_key == "s" else "all"
+            keyboard = build_main_keyboard(account, current_skin, backend=backend)
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception as e:
+            print(f"⚠️ 收起商城界面选择菜单失败：{e}")
 
     elif data.startswith("sk:"):
-        _, skin_key, account = data.split(":", 2)
+        # 格式：sk:<a/s>:<skin_key>:<account>
+        _, backend_key, skin_key, account = data.split(":", 3)
+        backend = "single" if backend_key == "s" else "all"
         new_skin_name = SKIN_OPTIONS.get(skin_key, "极速微商")
 
         # callback query 已在函数开头立即 answer，这里不再重复 answer。
@@ -2401,11 +2515,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             await update_shop_skin(account, new_skin_name)
-            keyboard = build_main_keyboard(account, new_skin_name)
+            keyboard = build_main_keyboard(account, new_skin_name, backend=backend)
             await query.edit_message_reply_markup(reply_markup=keyboard)
         except Exception as e:
-            keyboard = build_skin_options_keyboard(account)
+            print(f"⚠️ 商城界面切换失败 [{backend}] {account} -> {new_skin_name}: {e}")
+            keyboard = build_skin_options_keyboard(account, backend=backend)
             await query.edit_message_reply_markup(reply_markup=keyboard)
+            try:
+                await query.answer(f"⚠️ 切换失败：{str(e)[:180]}", show_alert=True)
+            except Exception:
+                pass
 
 
 # 6. 主程序入口
