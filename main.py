@@ -35,6 +35,7 @@ match = re.search(r'https?://[^\s\]\)\>\"\']+', raw_admin_url)
 BASE_ADMIN_URL = match.group(0).rstrip('/') if match else raw_admin_url.rstrip('/')
 
 # 单笔商城 / JJ 订单后台配置
+# v21：订单独立查询；成功/失败分流；收款号按详情表格读取；商城完成时间=JJ成功时间
 SINGLE_ADMIN_USER = os.environ.get("SINGLE_ADMIN_USER", "").strip()
 SINGLE_ADMIN_PASS = os.environ.get("SINGLE_ADMIN_PASS", "").strip()
 
@@ -1507,20 +1508,80 @@ def _cell_by_header(headers, cells, keywords):
     return ""
 
 
-async def _extract_payment_account_from_order(page, order_no):
-    """进入 JJ 订单对应的“出货平台/收款帐户”详情页，读取真实收款号。
+async def _locate_jj_result_row(page, order_no):
+    """定位本次搜索真正命中的 JJ 订单行。
 
-    不按“淘宝/京东/数字”等平台文字判断，因为平台种类和字体可能变化；
-    统一寻找该订单行里的 /payment_settings/ 链接。
+    输入可能是平台订单号，也可能是商户订单号；商户订单号不会出现在
+    guest_payment_order_<输入值> 的 tr id 中，因此不能只拼接 tr id。
     """
-    row = page.locator(f"xpath=//tr[@id='guest_payment_order_{order_no}']").first
-    if not await row.count():
-        # 兼容 short-uuid DOM。
-        node = page.locator(f"span.short-uuid[data-origin-uuid='{order_no}']").first
-        if await node.count():
-            row = node.locator("xpath=ancestor::tr[1]").first
+    wanted = _clean_text_value(str(order_no or ""))
+    if not wanted:
+        return None
+    norm_wanted = re.sub(r"\s+", "", wanted).lower()
 
-    if not await row.count():
+    try:
+        row = page.locator(f"xpath=//tr[@id='guest_payment_order_{wanted}']").first
+        if await row.count():
+            return row
+    except Exception:
+        pass
+
+    try:
+        nodes = page.locator("span.short-uuid[data-origin-uuid]")
+        for i in range(await nodes.count()):
+            node = nodes.nth(i)
+            origin = _clean_text_value(await node.get_attribute("data-origin-uuid"))
+            if re.sub(r"\s+", "", origin).lower() == norm_wanted:
+                row = node.locator("xpath=ancestor::tr[1]").first
+                if await row.count():
+                    return row
+    except Exception:
+        pass
+
+    try:
+        target = page.get_by_text(re.compile(re.escape(wanted), re.I)).first
+        if await target.count():
+            row = target.locator("xpath=ancestor::tr[1]").first
+            if await row.count():
+                return row
+    except Exception:
+        pass
+
+    try:
+        rows = page.locator("table tbody tr")
+        for i in range(await rows.count()):
+            row = rows.nth(i)
+            try:
+                text = _clean_text_value(await row.inner_text())
+                if norm_wanted in re.sub(r"\s+", "", text).lower():
+                    return row
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        rows = page.locator("table tbody tr")
+        if await rows.count() == 1:
+            row = rows.first
+            text = _clean_text_value(await row.inner_text())
+            if text and not any(x in text for x in ["没有资料", "沒有資料", "无数据", "無資料"]):
+                return row
+    except Exception:
+        pass
+    return None
+
+
+async def _extract_payment_account_from_order(page, order_no, result_row=None):
+    """进入本次命中的 JJ 订单对应的出货平台详情页，读取真实收款号。
+
+    不按淘宝/京东/数字等平台名称判断；统一寻找订单行中的 /payment_settings/ 链接。
+    result_row 是本次搜索实际命中的那一行，因此商户订单号也能正确找到对应收款帐户。
+    """
+    row = result_row
+    if row is None:
+        row = await _locate_jj_result_row(page, order_no)
+    if row is None or not await row.count():
         raise Exception(f"订单【{order_no}】找不到对应结果行，无法核对收款号。")
 
     link = row.locator("a[href*='/payment_settings/']").first
@@ -1556,11 +1617,11 @@ async def _extract_payment_account_from_order(page, order_no):
     payment_account = ''
     payment_method = ''
 
-    rows = page.locator('table tbody tr')
+    rows = page.locator('table tr')
     for i in range(await rows.count()):
         r = rows.nth(i)
         try:
-            cells = r.locator('th, td')
+            cells = r.locator(':scope > th, :scope > td')
             count = await cells.count()
             if count < 2:
                 continue
@@ -1576,11 +1637,18 @@ async def _extract_payment_account_from_order(page, order_no):
             continue
 
     if not payment_account:
-        # 兼容没有 th/td 标准结构的版本：用“帳號/账号”文字附近的 td。
-        for label in ['帳號', '账号', '收款号', '收款號']:
-            loc = page.get_by_text(label, exact=True).first
+        # 兼容字段名不是标准第一格的版本：找“帳號”文字，再向最近的 tr 取第二格。
+        for label in ['帳號', '账号', '帐号', '收款号', '收款號', '收款账号', '收款帳號']:
             try:
-                if await loc.count():
+                loc = page.get_by_text(label, exact=True).first
+                if not await loc.count():
+                    continue
+                tr = loc.locator('xpath=ancestor::tr[1]').first
+                if await tr.count():
+                    vals = tr.locator(':scope > th, :scope > td')
+                    if await vals.count() >= 2:
+                        payment_account = _clean_text_value(await vals.nth(1).inner_text())
+                if not payment_account:
                     parent = loc.locator('xpath=..').first
                     vals = parent.locator('td, span, div')
                     for j in range(await vals.count()):
@@ -1621,6 +1689,514 @@ def _payment_account_matches(expected, actual):
     b = _normalize_payment_account(actual)
     return bool(a and b and a == b)
 
+
+
+async def _jj_open_pdd(page):
+    """打开 JJ 的拼多多订单管理页面。优先按菜单文字/链接 href 定位，不写死平台名称。"""
+    candidates = [
+        "a:has-text('拼多多订单管理')",
+        "a:has-text('拼多多訂單管理')",
+        "a:has-text('拼多多订单')",
+        "a:has-text('拼多多訂單')",
+        "a[href*='pinduoduo']",
+        "a[href*='pdd']",
+    ]
+    for selector in candidates:
+        loc = page.locator(selector).first
+        try:
+            if await loc.count() and await loc.is_visible():
+                await loc.click()
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(500)
+                return
+        except Exception:
+            continue
+    if not any(x in page.url.lower() for x in ["pinduoduo", "pdd"]):
+        raise Exception("JJ 后台找不到【拼多多订单管理】页面入口")
+
+
+async def _jj_search_page_order(page, order_no, kind, form_ids=()):
+    """在拼多多订单管理里搜索一个订单号。复用出货管理的订单号字段兼容策略。"""
+    selectors = []
+    if kind == "platform":
+        selectors = [
+            "#q_id_eq", "input[name='q[id_eq]']", "#q_id", "input[name='q[id]']",
+            "#q_platform_order_id_eq", "input[name='q[platform_order_id_eq]']",
+            "#q_platform_order_no_eq", "input[name='q[platform_order_no_eq]']",
+            "input[name*='platform_order']", "input[placeholder*='平台订单']",
+            "input[placeholder*='平台訂單']",
+        ]
+        label_texts = ["平台订单号", "平台訂單號", "平台订单", "平台訂單"]
+    else:
+        selectors = [
+            "#q_merchant_order_id_eq", "input[name='q[merchant_order_id_eq]']",
+            "#q_merchant_order_no_eq", "input[name='q[merchant_order_no_eq]']",
+            "#q_merchant_order_id_or_order_trade_id_eq",
+            "input[name='q[merchant_order_id_or_order_trade_id_eq]']",
+            "#q_merchant_order_id_or_order_trade_id",
+            "input[name='q[merchant_order_id_or_order_trade_id]']",
+            "input[name*='merchant_order']", "input[name*='order_trade_id']",
+            "input[placeholder*='商户订单']", "input[placeholder*='商戶訂單']",
+            "input[placeholder*='其他订单']", "input[placeholder*='其他訂單']",
+        ]
+        label_texts = ["商户订单号", "商戶訂單號", "其他订单号", "其他訂單號"]
+
+    inp = await _first_visible(page, selectors, timeout=5000)
+    if not inp:
+        for txt in label_texts:
+            lab = page.locator(f"label:has-text('{txt}')").first
+            try:
+                if await lab.count():
+                    target_id = await lab.get_attribute("for")
+                    if target_id:
+                        target = page.locator(f"#{target_id}").first
+                        if await target.count():
+                            inp = target
+                            break
+                    target = lab.locator("xpath=..//input[1]").first
+                    if await target.count():
+                        inp = target
+                        break
+            except Exception:
+                pass
+    if not inp:
+        raise Exception(f"JJ 拼多多订单管理找不到【{'平台订单号' if kind == 'platform' else '商户订单号'}】输入框")
+
+    await inp.fill("")
+    await inp.fill(order_no)
+
+    form = None
+    for fid in form_ids:
+        f = page.locator(fid).first
+        try:
+            if await f.count():
+                form = f
+                break
+        except Exception:
+            pass
+    if form is None:
+        # 常见命名；没有也可以直接按 Enter。
+        for fid in ["#pinduoduo_order_search", "#pdd_order_search", "form[action*='pinduoduo']", "form[action*='pdd']"]:
+            f = page.locator(fid).first
+            try:
+                if await f.count():
+                    form = f
+                    break
+            except Exception:
+                pass
+
+    search_btn = None
+    if form is not None:
+        search_btn = await _first_visible(form, [
+            "input[type='submit']", "button[type='submit']",
+            "input[value*='搜']", "button:has-text('搜索')", "button:has-text('搜尋')",
+        ], timeout=3000)
+    try:
+        if search_btn:
+            await search_btn.click()
+        else:
+            await inp.press("Enter")
+    except Exception:
+        await inp.press("Enter")
+
+    await page.wait_for_timeout(800)
+
+
+async def _jj_query_pdd_order(single_order_no, task_id):
+    """查询 JJ 拼多多订单管理。
+
+    找到成功订单 -> 返回提现所需资料；找到失败订单 -> 返回 status=失败；
+    完全找不到 -> 返回 None，让上层决定如何提示。
+    拼多多流程不核对收款号。
+    """
+    if not JJ_ADMIN_URL:
+        raise Exception("未检测到环境变量 JJ_ADMIN_URL！")
+    if not JJ_ADMIN_USER or not JJ_ADMIN_PASS:
+        raise Exception("未检测到 JJ_ADMIN_USER / JJ_ADMIN_PASS！")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-blink-features=AutomationControlled"]
+        )
+        try:
+            context = await browser.new_context()
+            page = await context.new_page()
+            page.set_default_timeout(20000)
+            if task_id in ACTIVE_TASKS:
+                ACTIVE_TASKS[task_id]["page"] = page
+
+            await _login_generic(page, JJ_ADMIN_URL, JJ_ADMIN_USER, JJ_ADMIN_PASS, use_totp=True)
+
+            await _jj_open_pdd(page)
+            # 拼多多订单管理同样解暗锁，并把建立日期范围拉到最近一年。
+            await _jj_unlock_search_range(page)
+            await _jj_set_one_year_date(page)
+
+            # 先平台订单号，再商户订单号；一旦找到即停止本页继续搜索。
+            await _jj_search_page_order(page, single_order_no, "platform",
+                                        form_ids=("#pinduoduo_order_search", "#pdd_order_search"))
+            headers, cells = await _extract_jj_row(page, single_order_no)
+            result_row = await _locate_jj_result_row(page, single_order_no)
+
+            if not cells:
+                await _jj_search_page_order(page, single_order_no, "other",
+                                            form_ids=("#pinduoduo_order_search", "#pdd_order_search"))
+                headers, cells = await _extract_jj_row(page, single_order_no)
+                result_row = await _locate_jj_result_row(page, single_order_no)
+
+            if not cells:
+                return None
+
+            # 读取目标行文字/HTML，仅针对目标订单判断状态。
+            row_text = ""
+            row_html = ""
+            if result_row is not None and await result_row.count():
+                row_text = _clean_text_value(await result_row.inner_text())
+                try:
+                    row_html = await result_row.inner_html()
+                except Exception:
+                    pass
+
+            status_text = _cell_by_header(headers, cells, ["状态", "狀態"])
+            direct_cells = []
+            if result_row is not None and await result_row.count():
+                try:
+                    tds = result_row.locator(":scope > td")
+                    direct_cells = [_clean_text_value(await tds.nth(i).inner_text()) for i in range(await tds.count())]
+                except Exception:
+                    direct_cells = []
+            if direct_cells:
+                cells = direct_cells
+
+            if len(cells) > 13:
+                status_text = cells[13]
+            status_source = " | ".join(x for x in [status_text, row_text, row_html] if x)
+
+            # 目标行优先；只判断成功/失败，不把页面其它统计文字算进去。
+            is_success = bool(re.search(r"成功", status_source, re.I))
+            is_failed = bool(re.search(r"(?:失败|失敗)", status_source, re.I)) and not is_success
+            if not is_success and not is_failed:
+                # 最后只扫描当前目标行各 cell。
+                for cell in cells:
+                    if re.search(r"成功", cell, re.I):
+                        is_success = True
+                        status_text = cell
+                        break
+                    if re.search(r"(?:失败|失敗)", cell, re.I):
+                        is_failed = True
+                        status_text = cell
+                        break
+
+            if not is_success and not is_failed:
+                raise Exception(f"JJ 拼多多订单状态无法判断：{row_text[:1000] or '无状态资料'}")
+
+            # 当前拼多多页面字段可能略有差异，优先 header，再按常见列位置兜底。
+            order_display = _cell_by_header(headers, cells, [
+                "订单号", "訂單號", "平台订单", "平台訂單", "商户订单", "商戶訂單"
+            ]) or single_order_no
+            amount = _cell_by_header(headers, cells, ["交易金额", "交易金額", "订单金额", "訂單金額", "金额", "金額"])
+            created = _cell_by_header(headers, cells, [
+                "提交时间", "提交時間", "建立时间", "建立時間", "创建时间", "創建時間"
+            ])
+            completed = _cell_by_header(headers, cells, [
+                "成功时间", "成功時間", "完成时间", "完成時間"
+            ])
+            recipient_raw = _cell_by_header(headers, cells, [
+                "收件人", "收件人姓名", "收件人姓名", "姓名", "实名", "實名", "商户会员", "商戶會員"
+            ])
+
+            # 兼容没有 thead 的页面：优先按截图/页面常见列读取。
+            if result_row is not None and await result_row.count():
+                try:
+                    tds = result_row.locator(":scope > td")
+                    n = await tds.count()
+                    if n:
+                        direct = [_clean_text_value(await tds.nth(i).inner_text()) for i in range(n)]
+                        # 常见订单管理表：提交/成功/订单号/.../金额；只在 header 没取到时使用。
+                        if not created and len(direct) > 0:
+                            created = direct[0]
+                        if not completed and len(direct) > 1:
+                            completed = direct[1]
+                        if not amount:
+                            for d in direct:
+                                m = re.search(r"(\d+(?:\.\d+)?)\s*(?:CNY|CN¥|元)", d, re.I)
+                                if m:
+                                    amount = m.group(1)
+                                    break
+                        if not recipient_raw:
+                            for d in direct:
+                                if _looks_like_human_name(d):
+                                    recipient_raw = d
+                                    break
+                except Exception:
+                    pass
+
+            # 成功时间是提现表单的完成时间。
+            completed_dt = _parse_jj_datetime(completed)
+            created_dt = _parse_jj_datetime(created)
+
+            if is_failed:
+                return {
+                    "status": "失败",
+                    "order_no": order_display,
+                    "amount": amount or "",
+                    "created": created or "",
+                    "created_dt": created_dt,
+                    "completed": completed or "",
+                    "completed_dt": completed_dt,
+                    "recipient": _safe_manager_name(recipient_raw),
+                    "payment_account": "",
+                    "payment_method": "",
+                    "payment_url": "",
+                    "shipment": "",
+                }
+
+            if not amount:
+                raise Exception(f"JJ 拼多多成功订单【{single_order_no}】没有读取到金额。")
+            if not completed_dt:
+                raise Exception(f"JJ 拼多多成功订单【{single_order_no}】没有读取到成功时间。")
+
+            return {
+                "status": "成功",
+                "order_no": order_display,
+                "amount": amount,
+                "created": created or "",
+                "created_dt": created_dt,
+                "completed": completed or "",
+                "completed_dt": completed_dt,
+                "recipient": _safe_manager_name(recipient_raw),
+                "payment_account": "",
+                "payment_method": "",
+                "payment_url": "",
+                "shipment": "",
+            }
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+
+
+def _same_form_datetime(actual, target):
+    a = (actual or "").strip().replace("/", "-").replace("T", " ")
+    t = (target or "").strip().replace("/", "-").replace("T", " ")
+    return a[:16] == t[:16]
+
+
+async def _find_input_by_label(page, labels):
+    for label_text in labels:
+        for lab in [
+            page.locator(f"label:has-text('{label_text}')").first,
+            page.locator(f"th:has-text('{label_text}')").first,
+        ]:
+            try:
+                if await lab.count():
+                    target_id = await lab.get_attribute("for")
+                    if target_id:
+                        target = page.locator(f"#{target_id}").first
+                        if await target.count():
+                            return target
+                    target = lab.locator("xpath=following::input[1]").first
+                    if await target.count():
+                        return target
+                    target = lab.locator("xpath=ancestor::tr[1]//input[1]").first
+                    if await target.count():
+                        return target
+            except Exception:
+                pass
+    return None
+
+async def _single_withdraw(account, jj_result, task_id=None):
+    """单笔商城：制作商户提现管理。
+
+    拼多多订单成功才调用；不核对收款号；银行账户保持空白。
+    完成时间严格使用 JJ 拼多多订单管理的成功/完成时间。
+    """
+    if not SINGLE_ADMIN_URL:
+        raise Exception("未检测到环境变量 SINGLE_ADMIN_URL！")
+    if not SINGLE_ADMIN_USER or not SINGLE_ADMIN_PASS:
+        raise Exception("未检测到 SINGLE_ADMIN_USER / SINGLE_ADMIN_PASS！")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-blink-features=AutomationControlled"]
+        )
+        try:
+            page = await browser.new_page()
+            page.set_default_timeout(20000)
+            if task_id and task_id in ACTIVE_TASKS:
+                ACTIVE_TASKS[task_id]["page"] = page
+
+            await _login_generic(page, SINGLE_ADMIN_URL, SINGLE_ADMIN_USER, SINGLE_ADMIN_PASS)
+
+            # 优先从左侧菜单进入“商户提现管理”，避免猜路径。
+            menu = await _first_visible(page, [
+                "a:has-text('商户提现管理')",
+                "a:has-text('商戶提現管理')",
+                "a:has-text('提现管理')",
+                "a:has-text('提現管理')",
+                "a[href*='withdraw']",
+            ], timeout=5000)
+            if menu:
+                await menu.click()
+                await page.wait_for_load_state("domcontentloaded")
+            else:
+                for url in [
+                    f"{SINGLE_ADMIN_ROOT}/withdraw_orders/new",
+                    f"{SINGLE_ADMIN_ROOT}/withdraws/new",
+                    f"{SINGLE_ADMIN_ROOT}/withdraw_orders",
+                    f"{SINGLE_ADMIN_ROOT}/withdraws",
+                ]:
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded")
+                        if await page.locator("select[name*='merchant_id'], #withdraw_order_merchant_id, #withdraw_merchant_id").count():
+                            break
+                    except Exception:
+                        continue
+
+            # 如果目前是列表页，寻找新增/提现按钮。
+            merchant_select = await _first_visible(page, [
+                "#withdraw_order_merchant_id",
+                "select[name='withdraw_order[merchant_id]']",
+                "#withdraw_merchant_id",
+                "select[name*='withdraw'][name*='merchant_id']",
+                "select[name*='merchant_id']",
+            ], timeout=4000)
+            if not merchant_select:
+                add_link = await _first_visible(page, [
+                    "a:has-text('新增提现')", "a:has-text('新增提現')",
+                    "a:has-text('提现')", "a:has-text('提現')",
+                    "a[href*='/withdraw_orders/new']", "a[href*='/withdraws/new']",
+                ], timeout=5000)
+                if add_link:
+                    await add_link.click()
+                    await page.wait_for_load_state("domcontentloaded")
+                else:
+                    for url in [
+                        f"{SINGLE_ADMIN_ROOT}/withdraw_orders/new",
+                        f"{SINGLE_ADMIN_ROOT}/withdraws/new",
+                    ]:
+                        try:
+                            await page.goto(url, wait_until="domcontentloaded")
+                            if await page.locator("select[name*='merchant_id'], #withdraw_order_merchant_id, #withdraw_merchant_id").count():
+                                break
+                        except Exception:
+                            continue
+
+            merchant_select = await _first_visible(page, [
+                "#withdraw_order_merchant_id",
+                "select[name='withdraw_order[merchant_id]']",
+                "#withdraw_merchant_id",
+                "select[name*='withdraw'][name*='merchant_id']",
+                "select[name*='merchant_id']",
+            ], timeout=10000)
+            if not merchant_select:
+                raise Exception("商户提现页面找不到【商户】下拉框。")
+
+            await _select_select2_by_text(page, merchant_select, account, "提现商户")
+            try:
+                await merchant_select.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
+            except Exception:
+                pass
+            await page.wait_for_timeout(800)
+
+            # 银行账户按照你的要求：保持空白，不选择、不填写。
+
+            # 金额：优先精确字段，再按 label 兜底。
+            amount_input = await _first_visible(page, [
+                "#withdraw_order_total_amount",
+                "#withdraw_order_amount",
+                "#withdraw_total_amount",
+                "input[name='withdraw_order[total_amount]']",
+                "input[name='withdraw_order[amount]']",
+                "input[name*='withdraw'][name*='amount']",
+                "input[name*='amount']",
+            ], timeout=5000)
+            if not amount_input:
+                amount_input = await _find_input_by_label(page, ["金额", "金額", "提现金额", "提現金額"])
+            if not amount_input:
+                raise Exception("商户提现页面找不到【金额】输入框。")
+
+            amount = re.sub(r"[^0-9.]", "", str(jj_result.get("amount", "")))
+            if not amount:
+                raise Exception("拼多多订单金额为空。")
+            await amount_input.fill(amount)
+
+            # 完成时间 = JJ 拼多多订单管理成功时间。
+            completed_dt = jj_result.get("completed_dt")
+            if not completed_dt:
+                raise Exception("拼多多成功订单缺少成功时间。")
+            completed_input = await _first_visible(page, [
+                "#withdraw_order_completed_at",
+                "#withdraw_completed_at",
+                "input[name='withdraw_order[completed_at]']",
+                "input[name*='completed_at']",
+                "input[name*='success_at']",
+            ], timeout=5000)
+            if not completed_input:
+                completed_input = await _find_input_by_label(page, ["完成时间", "完成時間", "成功时间", "成功時間"])
+            if completed_input:
+                completed_text = completed_dt.strftime("%Y-%m-%dT%H:%M")
+                await completed_input.fill(completed_text)
+                actual = await completed_input.input_value()
+                if not _same_form_datetime(actual, completed_text):
+                    await completed_input.evaluate(
+                        """(el, value) => {
+                            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                            setter.call(el, value);
+                            el.dispatchEvent(new Event('input', {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                            el.dispatchEvent(new Event('blur', {bubbles:true}));
+                        }""", completed_text)
+                    actual = await completed_input.input_value()
+                if not _same_form_datetime(actual, completed_text):
+                    raise Exception(f"提现完成时间写入失败：目标={completed_text}，实际={actual}")
+
+            # 订单号若提现表单有此字段则填写；没有就跳过。
+            order_input = await _first_visible(page, [
+                "#withdraw_order_order_no",
+                "#withdraw_order_platform_order_no",
+                "input[name='withdraw_order[order_no]']",
+                "input[name*='order_no']",
+                "input[name*='order_id']",
+            ], timeout=2000)
+            if order_input:
+                await order_input.fill(str(jj_result.get("order_no") or ""))
+
+            # 收件人/姓名若表单存在，按 JJ 姓名填写；数字/非人名已经转为管理员代收。
+            recipient_input = await _first_visible(page, [
+                "#withdraw_order_recipient_name",
+                "#withdraw_order_name",
+                "input[name='withdraw_order[recipient_name]']",
+                "input[name='withdraw_order[name]']",
+                "input[name*='recipient_name']",
+            ], timeout=2000)
+            if recipient_input:
+                await recipient_input.fill(jj_result.get("recipient") or MANAGER_RECEIVE_NAME)
+
+            submit = await _first_visible(page, [
+                "input[type='submit'][name='commit'][value='送出']",
+                "input[type='submit'][value='送出']",
+                "input[name='commit']",
+                "button[type='submit']",
+            ], timeout=8000)
+            if not submit:
+                raise Exception("商户提现页面找不到【送出】按钮。")
+
+            await submit.click()
+            await page.wait_for_load_state("domcontentloaded")
+            return "已送出"
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 async def _query_jj_order(single_order_no, task_id):
     if not JJ_ADMIN_URL:
@@ -1672,6 +2248,8 @@ async def _query_jj_order(single_order_no, task_id):
             if not cells:
                 raise Exception(f"JJ 找不到订单：{single_order_no}")
 
+            result_row = await _locate_jj_result_row(page, single_order_no)
+
             # ===== JJ 状态判断：必须只从“目标订单那一行”读取 =====
             # 你提供的 DevTools 已确认：目标结果是
             # <tr id="guest_payment_order_<完整UUID>"> ... </tr>
@@ -1680,14 +2258,11 @@ async def _query_jj_order(single_order_no, task_id):
             status_text = _cell_by_header(headers, cells, ["状态", "狀態"])
             full_row = " | ".join(cells)
 
-            exact_status_row = None
+            exact_status_row = result_row
             row_status_text = ""
             row_html = ""
             try:
-                exact_status_row = page.locator(
-                    f"xpath=//tr[@id='guest_payment_order_{single_order_no}']"
-                ).first
-                if await exact_status_row.count():
+                if exact_status_row is not None and await exact_status_row.count():
                     row_status_text = _clean_text_value(await exact_status_row.inner_text())
                     try:
                         row_html = await exact_status_row.inner_html()
@@ -1817,10 +2392,8 @@ async def _query_jj_order(single_order_no, task_id):
 
             # 直接从目标 tr 读取固定列；这是当前 JJ 页面最可靠的来源。
             try:
-                exact_data_row = page.locator(
-                    f"xpath=//tr[@id='guest_payment_order_{single_order_no}']"
-                ).first
-                if await exact_data_row.count():
+                exact_data_row = result_row
+                if exact_data_row is not None and await exact_data_row.count():
                     direct_cells = exact_data_row.locator(":scope > td")
                     direct_count = await direct_cells.count()
                     if direct_count >= 8:
@@ -1900,27 +2473,52 @@ async def _query_jj_order(single_order_no, task_id):
                         shipment = m.group(1)
                         break
 
-            # 【新增】无论成功/失败，都进入订单对应的出货平台详情页核对收款号。
-            # 淘宝、京东、数字等平台名称可以不同，但详情链接统一走 /payment_settings/。
-            payment_detail = await _extract_payment_account_from_order(page, single_order_no)
+            # 失败订单：只回报失败，不进入收款号核对、充值或运单处理。
+            if is_failed and not is_success:
+                return {
+                    "status": "失败",
+                    "order_no": order_no or single_order_no,
+                    "recipient": "",
+                    "amount": amount or "",
+                    "shipment": "",
+                    "created": created or "",
+                    "created_dt": None,
+                    "completed": completed or "",
+                    "completed_dt": None,
+                    "payment_account": "",
+                    "payment_method": "",
+                    "payment_url": "",
+                    "raw_headers": headers,
+                    "raw_cells": cells,
+                }
+
+            # 成功订单才进入对应的出货平台详情页核对收款号。
+            payment_detail = await _extract_payment_account_from_order(
+                page, single_order_no, result_row=result_row
+            )
             payment_account = payment_detail['account']
 
-            if is_success and not created_dt:
+            if not created_dt:
                 raise Exception(f"JJ 成功订单无法读取【提交时间】：{created[:200]}")
             if not amount:
                 raise Exception("JJ 订单没有读取到交易金额。")
 
-            delivery = _random_delivery_time(created_dt) if is_success else None
+            # 商城充值页面的“完成时间” = JJ 后台订单的“完成时间/成功时间”。
+            completed_dt = _parse_jj_datetime(completed)
+            if not completed_dt:
+                raise Exception(f"JJ 成功订单无法读取【完成时间/成功时间】：{completed[:200]}")
 
             return {
-                "status": "成功" if is_success else "失败",
+                "status": "成功",
                 "order_no": order_no or single_order_no,
                 "recipient": _safe_manager_name(recipient_raw),
                 "amount": amount,
-                "shipment": shipment if is_success else "",
-                "created": created or completed,
+                "shipment": shipment,
+                "created": created,
                 "created_dt": created_dt,
-                "delivery": delivery,
+                "completed": completed,
+                "completed_dt": completed_dt,
+                "delivery": completed_dt,
                 "payment_account": payment_account,
                 "payment_method": payment_detail.get("method", ""),
                 "payment_url": payment_detail.get("url", ""),
@@ -2183,31 +2781,24 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
                 raise Exception("JJ 订单金额为空。")
             await page.locator("#deposit_order_total_amount").first.fill(amount)
 
-            # 配送时间 = JJ【提交时间】后 1~2 天，08:00~18:00；失败订单留空。
-            # 充值页面通常是 datetime-local，必须填写 ISO 格式 YYYY-MM-DDTHH:MM。
+            # 商城“完成时间” = JJ 后台订单的成功/完成时间。
             if status == "成功":
-                delivery_dt = jj_result.get("delivery")
-                if not delivery_dt:
-                    raise Exception("成功订单缺少配送时间。")
-                delivery_input = page.locator("#deposit_order_completed_at").first
-                if await delivery_input.count():
-                    delivery_text = delivery_dt.strftime("%Y-%m-%dT%H:%M")
-                    await delivery_input.fill(delivery_text)
-                    # 确认实际值已经写进去；避免浏览器控件拒绝格式后默默保留当前时间。
-                    actual_delivery = await delivery_input.input_value()
-                    # 后台可能把 datetime-local 显示成 YYYY/MM/DD HH:MM，
-                    # 与目标 YYYY-MM-DDTHH:MM 是同一时间；这里统一解析后比较。
-                    def _same_form_datetime(actual, target):
-                        a = (actual or "").strip()
-                        t = (target or "").strip()
-                        if a[:16] == t[:16]:
-                            return True
-                        a_norm = a.replace("/", "-").replace("T", " ")
-                        t_norm = t.replace("/", "-").replace("T", " ")
-                        return a_norm[:16] == t_norm[:16]
+                completed_dt = jj_result.get("completed_dt") or jj_result.get("delivery")
+                if not completed_dt:
+                    raise Exception("成功订单缺少 JJ 后台完成时间/成功时间。")
+                completed_input = page.locator("#deposit_order_completed_at").first
+                if await completed_input.count():
+                    completed_text = completed_dt.strftime("%Y-%m-%dT%H:%M")
+                    await completed_input.fill(completed_text)
+                    actual_completed = await completed_input.input_value()
 
-                    if not _same_form_datetime(actual_delivery, delivery_text):
-                        await delivery_input.evaluate(
+                    def _same_form_datetime(actual, target):
+                        a = (actual or "").strip().replace("/", "-").replace("T", " ")
+                        t = (target or "").strip().replace("/", "-").replace("T", " ")
+                        return a[:16] == t[:16]
+
+                    if not _same_form_datetime(actual_completed, completed_text):
+                        await completed_input.evaluate(
                             """(el, value) => {
                                 const setter = Object.getOwnPropertyDescriptor(
                                     HTMLInputElement.prototype, 'value'
@@ -2217,12 +2808,12 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None):
                                 el.dispatchEvent(new Event('change', {bubbles:true}));
                                 el.dispatchEvent(new Event('blur', {bubbles:true}));
                             }""",
-                            delivery_text,
+                            completed_text,
                         )
-                        actual_delivery = await delivery_input.input_value()
-                    if not _same_form_datetime(actual_delivery, delivery_text):
+                        actual_completed = await completed_input.input_value()
+                    if not _same_form_datetime(actual_completed, completed_text):
                         raise Exception(
-                            f"配送时间写入失败：目标={delivery_text}，实际={actual_delivery}"
+                            f"完成时间写入失败：目标={completed_text}，实际={actual_completed}"
                         )
 
             # 建立时间 = JJ【提交时间】。充值页面通常是 datetime-local，
@@ -2550,22 +3141,53 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
 
                 order_numbers = parsed_info.get("single_order_nos") or [parsed_info["single_order_no"]]
                 expected_payment_account = _payment_account_from_info(parsed_info)
-                jj_results = []
+                recharge_results = []
+                withdraw_results = []
+                failed_pdd_results = []
+                failed_outbound_results = []
+                not_found_results = []
 
-                try:
-                    for idx, order_no in enumerate(order_numbers, 1):
-                        await status_msg.edit_text(
-                            result_text +
-                            f"\n\n⏳ 正在查询第 {idx}/{len(order_numbers)} 笔订单：<code>{html.escape(order_no)}</code>",
-                            reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton("⏳ 正在查询订单...", callback_data="ignore")]
-                            ]),
-                            parse_mode="HTML", disable_web_page_preview=True
-                        )
-                        jj_result = await _query_jj_order(order_no, task_id)
-                        jj_results.append(jj_result)
+                # 重要：绝大多数订单来自出货管理，所以每一笔都先查出货管理。
+                # 只有出货管理完全找不到，才进入拼多多订单管理。
+                for idx, order_no in enumerate(order_numbers, 1):
+                    await status_msg.edit_text(
+                        result_text +
+                        f"\n\n⏳ 正在查询第 {idx}/{len(order_numbers)} 笔订单：<code>{html.escape(order_no)}</code>\n"
+                        "查询顺序：出货管理 → 拼多多订单管理",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⏳ 正在查询订单...", callback_data="ignore")]
+                        ]),
+                        parse_mode="HTML", disable_web_page_preview=True
+                    )
 
-                        actual_payment_account = jj_result.get("payment_account", "")
+                    # --------------------------------------------------
+                    # A. 先查 JJ 出货管理
+                    # --------------------------------------------------
+                    try:
+                        outbound_result = await _query_jj_order(order_no, task_id)
+                    except Exception as outbound_error:
+                        # “找不到订单”属于正常分流条件；其他错误才是真正的查询异常。
+                        outbound_error_text = str(outbound_error)
+                        if "找不到订单" in outbound_error_text or "找不到" in outbound_error_text and "订单" in outbound_error_text:
+                            outbound_result = None
+                        else:
+                            safe_err = html.escape(outbound_error_text)
+                            await status_msg.edit_text(
+                                result_text +
+                                f"\n\n⚠️ <b>出货管理查询异常</b>\n订单号：<code>{html.escape(order_no)}</code>\n<code>{safe_err}</code>",
+                                reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
+                                parse_mode="HTML", disable_web_page_preview=True
+                            )
+                            return
+
+                    if outbound_result is not None:
+                        # 出货管理命中 = 充值流程，成功订单必须核对收款号。
+                        if outbound_result.get("status") == "失败":
+                            # 出货管理命中后属于充值流程；如果该页出现失败状态，不能误报成拼多多失败。
+                            failed_outbound_results.append(outbound_result)
+                            continue
+
+                        actual_payment_account = outbound_result.get("payment_account", "")
                         if not _payment_account_matches(expected_payment_account, actual_payment_account):
                             expected_display = html.escape(expected_payment_account or "未读取")
                             actual_display = html.escape(actual_payment_account or "未读取")
@@ -2579,50 +3201,115 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                                 parse_mode="HTML", disable_web_page_preview=True
                             )
                             return
-                except Exception as jj_error:
-                    safe_jj = html.escape(str(jj_error))
-                    await status_msg.edit_text(
-                        result_text + f"\n\n⚠️ <b>订单查询失败</b>\n<code>{safe_jj}</code>",
-                        reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
-                        parse_mode="HTML", disable_web_page_preview=True
-                    )
-                    return
 
-                # 所有订单都核对通过后才开始充值，避免其中一笔收款号不一致却继续入账。
-                await status_msg.edit_text(
-                    result_text +
-                    f"\n\n⏳ <b>{len(jj_results)} 笔订单已全部核对通过</b>，正在自动填写充值...",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⏳ 正在处理充值...", callback_data="ignore")]
-                    ]),
-                    parse_mode="HTML", disable_web_page_preview=True
-                )
+                        try:
+                            await status_msg.edit_text(
+                                result_text +
+                                f"\n\n⏳ 第 {idx}/{len(order_numbers)} 笔：<b>出货管理命中</b>\n"
+                                "订单状态：<b>成功</b>，收款号核对通过，正在制作商户充值...",
+                                reply_markup=InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("⏳ 正在制作充值...", callback_data="ignore")]
+                                ]),
+                                parse_mode="HTML", disable_web_page_preview=True
+                            )
+                            recharge_result = await _single_recharge(final_account, outbound_result, parsed_info, task_id)
+                            recharge_results.append((outbound_result, recharge_result))
+                        except Exception as recharge_error:
+                            safe_recharge = html.escape(str(recharge_error))
+                            await status_msg.edit_text(
+                                result_text +
+                                f"\n\n第 {idx}/{len(order_numbers)} 笔订单：<code>{html.escape(order_no)}</code>" +
+                                "\n订单状态：<b>成功</b>" +
+                                f"\n❌ <b>新增充值失败</b>\n<code>{safe_recharge}</code>",
+                                reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
+                                parse_mode="HTML", disable_web_page_preview=True
+                            )
+                            return
+                        continue
 
-                recharge_results = []
-                for idx, jj_result in enumerate(jj_results, 1):
-                    status_label = jj_result["status"]
+                    # --------------------------------------------------
+                    # B. 出货管理没找到 → 查 JJ 拼多多订单管理
+                    # --------------------------------------------------
                     try:
-                        recharge_result = await _single_recharge(final_account, jj_result, parsed_info, task_id)
-                    except Exception as recharge_error:
-                        safe_recharge = html.escape(str(recharge_error))
+                        pdd_result = await _jj_query_pdd_order(order_no, task_id)
+                    except Exception as pdd_error:
+                        safe_pdd = html.escape(str(pdd_error))
                         await status_msg.edit_text(
                             result_text +
-                            f"\n\n第 {idx}/{len(jj_results)} 笔订单：<b>{html.escape(jj_result.get('order_no', order_numbers[idx-1]))}</b>" +
-                            f"\n订单状态：<b>{html.escape(status_label)}</b>" +
-                            f"\n❌ <b>新增充值失败</b>\n<code>{safe_recharge}</code>",
+                            f"\n\n⚠️ <b>拼多多订单查询异常</b>\n订单号：<code>{html.escape(order_no)}</code>\n<code>{safe_pdd}</code>",
                             reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
                             parse_mode="HTML", disable_web_page_preview=True
                         )
                         return
-                    recharge_results.append((jj_result, recharge_result))
 
-                lines = [result_text, "", f"订单核对：<b>{len(jj_results)} 笔全部通过</b>"]
-                for idx, (jj_result, recharge_result) in enumerate(recharge_results, 1):
-                    lines.append(
-                        f"第 {idx} 笔：<code>{html.escape(jj_result.get('order_no', order_numbers[idx-1]))}</code> "
-                        f"状态：<b>{html.escape(jj_result['status'])}</b>，"
-                        f"充值结果：<b>{html.escape(recharge_result)}</b>"
-                    )
+                    if pdd_result is None:
+                        not_found_results.append(order_no)
+                        continue
+
+                    # 拼多多命中后，不做收款号核对。
+                    if pdd_result.get("status") == "失败":
+                        failed_pdd_results.append(pdd_result)
+                        continue
+
+                    try:
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⏳ 第 {idx}/{len(order_numbers)} 笔：<b>拼多多订单管理命中</b>\n"
+                            "订单状态：<b>成功</b>，正在制作商户提现...",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("⏳ 正在制作提现...", callback_data="ignore")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        withdraw_result = await _single_withdraw(final_account, pdd_result, task_id)
+                        withdraw_results.append((pdd_result, withdraw_result))
+                    except Exception as withdraw_error:
+                        safe_withdraw = html.escape(str(withdraw_error))
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n第 {idx}/{len(order_numbers)} 笔订单：<code>{html.escape(order_no)}</code>" +
+                            "\n订单状态：<b>成功</b>" +
+                            f"\n❌ <b>新增提现失败</b>\n<code>{safe_withdraw}</code>",
+                            reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        return
+
+                # 所有订单都按“命中页面决定制作类型”完成后，再统一汇总。
+                lines = [result_text, ""]
+                if recharge_results:
+                    lines.append(f"商户充值：<b>{len(recharge_results)} 笔</b>")
+                    for idx, (jj_result, recharge_result) in enumerate(recharge_results, 1):
+                        lines.append(
+                            f"充值 {idx}：<code>{html.escape(jj_result.get('order_no', ''))}</code> "
+                            f"→ <b>{html.escape(recharge_result)}</b>"
+                        )
+
+                if withdraw_results:
+                    lines.append(f"商户提现：<b>{len(withdraw_results)} 笔</b>")
+                    for idx, (jj_result, withdraw_result) in enumerate(withdraw_results, 1):
+                        lines.append(
+                            f"提现 {idx}：<code>{html.escape(jj_result.get('order_no', ''))}</code> "
+                            f"→ <b>{html.escape(withdraw_result)}</b>"
+                        )
+
+                if failed_outbound_results:
+                    lines.append("")
+                    lines.append("⚠️ <b>出货订单失败：</b>")
+                    for jj_result in failed_outbound_results:
+                        lines.append(f"<code>{html.escape(jj_result.get('order_no', '') or '未知订单号')}</code>")
+
+                if failed_pdd_results:
+                    lines.append("")
+                    lines.append("⚠️ <b>拼多多订单失败：</b>")
+                    for jj_result in failed_pdd_results:
+                        lines.append(f"<code>{html.escape(jj_result.get('order_no', '') or '未知订单号')}</code>")
+
+                if not_found_results:
+                    lines.append("")
+                    lines.append("⚠️ <b>订单未找到：</b>")
+                    for order_no in not_found_results:
+                        lines.append(f"<code>{html.escape(order_no)}</code>")
 
                 await status_msg.edit_text(
                     "\n".join(lines),
