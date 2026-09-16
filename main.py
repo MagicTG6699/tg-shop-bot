@@ -1085,24 +1085,116 @@ async def _create_single_shop(info: dict, task_id: str):
 
 
 async def _jj_open_outbound(page):
-    # 用户截图显示的菜单是「出货管理」
-    candidates = [
-        "a:has-text('出货管理')",
-        "a:has-text('出貨管理')",
-        "a[href*='guest_payment_orders']",
+    """打开 JJ 的【出货管理】实际子页面。
+
+    注意：截图确认左侧有两层同名文字：
+      进货/出货类父菜单（带展开箭头）
+      └─ 出货管理（真正进入 guest_payment_orders 的子菜单）
+
+    不能直接点击第一个 a:has-text('出货管理')，否则只会展开/收起父菜单，
+    后面就会因为仍停留在首页而找不到订单号输入框。
+    """
+    _debug_log(f"[出货] 开始打开出货管理；当前 URL={page.url}")
+
+    # 已经在正确页面，直接继续。
+    if "guest_payment_orders" in (page.url or "").lower():
+        _debug_log(f"[出货] 当前已经是 guest_payment_orders 页面；URL={page.url}")
+        return
+
+    # ① 先找到“出货管理”的父菜单并确保它展开。
+    parent_selectors = [
+        "li.treeview:has(> a span:text-is('出货管理')) > a",
+        "li.treeview:has(> a span:text-is('出貨管理')) > a",
+        "li.treeview:has(> a:has-text('出货管理')) > a",
+        "li.treeview:has(> a:has-text('出貨管理')) > a",
     ]
-    for selector in candidates:
+    parent_opened = False
+    for selector in parent_selectors:
         loc = page.locator(selector).first
         try:
-            if await loc.is_visible():
+            if not await loc.count() or not await loc.is_visible():
+                continue
+            parent_li = loc.locator("..").first
+            cls = (await parent_li.get_attribute("class") or "").lower()
+            aria = await loc.get_attribute("aria-expanded")
+            child_visible = False
+            for child_selector in [
+                "ul.treeview-menu li a:has-text('出货管理')",
+                "ul.treeview-menu li a:has-text('出貨管理')",
+            ]:
+                child = parent_li.locator(child_selector).first
+                if await child.count() and await child.is_visible():
+                    child_visible = True
+                    break
+            if child_visible or "menu-open" in cls or "active" in cls or aria == "true":
+                parent_opened = True
+                _debug_log(f"[出货] 父菜单已展开；class={cls!r}, aria-expanded={aria!r}")
+                break
+            await loc.click(force=True)
+            await page.wait_for_timeout(500)
+            parent_opened = True
+            _debug_log(f"[出货] 已点击父菜单展开【出货管理】")
+            break
+        except Exception as e:
+            _debug_log(f"[出货] 父菜单候选失败 {selector}: {e!r}")
+
+    # ② 只点击父菜单下面的“真正子菜单”，避免误点同名父菜单。
+    child_selectors = [
+        "li.treeview > ul.treeview-menu li a:has(> span:text-is('出货管理'))",
+        "li.treeview > ul.treeview-menu li a:has(> span:text-is('出貨管理'))",
+        "li.treeview > ul.treeview-menu li a:has-text('出货管理')",
+        "li.treeview > ul.treeview-menu li a:has-text('出貨管理')",
+    ]
+    for selector in child_selectors:
+        loc = page.locator(selector).first
+        try:
+            if await loc.count() and await loc.is_visible():
+                href = await loc.get_attribute("href")
+                _debug_log(f"[出货] 找到真正的【出货管理】子菜单，href={href!r}")
                 await loc.click()
                 await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(800)
+                _debug_log(f"[出货] 已进入出货管理；URL={page.url}")
+                if "guest_payment_orders" in (page.url or "").lower():
+                    return
+        except Exception as e:
+            _debug_log(f"[出货] 点击子菜单失败 {selector}: {e!r}")
+
+    # ③ href 精确兜底：只允许 guest_payment_orders，不再点击任意同名父菜单。
+    for selector in [
+        "a[href*='guest_payment_orders']",
+        "a[href*='/guest_payment_orders']",
+    ]:
+        loc = page.locator(selector).first
+        try:
+            if await loc.count() and await loc.is_visible():
+                href = await loc.get_attribute("href")
+                _debug_log(f"[出货] 通过 guest_payment_orders 链接进入；href={href!r}")
+                await loc.click()
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(800)
+                _debug_log(f"[出货] 进入出货管理；URL={page.url}")
                 return
-        except Exception:
-            continue
-    # 如果首页已经是出货管理，也继续
-    if "guest_payment_orders" not in page.url:
-        raise Exception("JJ 后台找不到【出货管理】页面入口")
+        except Exception as e:
+            _debug_log(f"[出货] guest_payment_orders 兜底失败: {e!r}")
+
+    # ④ 最后直接 URL 兜底。
+    jj_base = JJ_ADMIN_URL.rstrip('/')
+    if re.search(r'/admin$', jj_base, re.I):
+        fallback_url = jj_base + "/guest_payment_orders"
+    elif re.search(r'/sign_in$', jj_base, re.I):
+        fallback_url = re.sub(r'/sign_in$', '', jj_base, flags=re.I) + "/guest_payment_orders"
+    else:
+        fallback_url = jj_base + "/admin/guest_payment_orders"
+    try:
+        _debug_log(f"[出货] 菜单进入失败，直接打开兜底 URL={fallback_url}")
+        await page.goto(fallback_url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(800)
+    except Exception as e:
+        raise Exception(f"JJ 后台无法进入【出货管理】页面：{e!r}")
+
+    if "guest_payment_orders" not in (page.url or "").lower():
+        raise Exception(f"JJ 后台无法进入【出货管理】页面；当前URL={page.url}")
 
 
 async def _jj_unlock_search_range(page):
