@@ -1270,153 +1270,173 @@ async def _jj_open_outbound(page):
 
 
 async def _jj_unlock_search_range(page):
-    """JJ 出货/拼多多搜索页暗锁处理。
+    """可靠处理 JJ 搜索页的日期暗锁。
 
-    JJ 的特殊点：初始页面锁头区域有时不会立即显示 fa-lock，甚至可能暂时空白，
-    但必须实际点击 `.toggle-order-search-days-btn-placeholder` 才会解除暗锁。
-    因此：
-      1. 已明确看到 fa-unlock -> 直接通过；
-      2. 其他情况 -> 点击锁头容器（包括“空白但可点击”的状态）；
-      3. 点击后轮询确认 fa-unlock/状态变化；
-      4. 没有确认成功就返回 False，绝不在未解锁状态下继续搜索。
+    JJ 的暗锁控件是一个 toggle：
+      - 初始页面可能只看到空白 placeholder
+      - 点击实际可见的 placeholder / lock 后，页面 AJAX 切换为 unlock
+      - lock / unlock 两个 icon 可能同时存在于 DOM，其中一个只是 hide
+
+    因此这里绝对不使用 locator.first() 来决定状态，也不把“DOM 里存在
+    unlock-btn”当成已解锁。必须找到当前页面实际可见的控件，并在点击后
+    确认可见 unlock 出现、可见 lock 消失。
     """
-    containers = [
+    container_selectors = [
         ".toggle-order-search-days-btn-placeholder",
         ".toggle-search-days-btn-placeholder",
         ".toggle-order-search-days-btn",
     ]
-    unlock_selectors = [
-        ".toggle-order-search-days-btn-placeholder i.fa-unlock",
-        ".toggle-search-days-btn-placeholder i.fa-unlock",
-        ".toggle-order-search-days-btn i.fa-unlock",
-        "i.fa-unlock.unlock-btn",
-        "i.fas.fa-unlock.unlock-btn",
-        ".unlock-btn",
-        "i.fa-unlock",
-    ]
+
+    # 只在暗锁容器内部判断，避免页面其它地方的 FontAwesome unlock 图标干扰。
     lock_selectors = [
-        ".toggle-order-search-days-btn-placeholder i.fa-lock",
-        ".toggle-search-days-btn-placeholder i.fa-lock",
-        ".toggle-order-search-days-btn i.fa-lock",
-        "i.fa-lock.lock-btn",
-        "i.fas.fa-lock.lock-btn",
-        ".lock-btn",
-        "i.lock-btn",
+        ":scope i.fa-lock",
+        ":scope i.fas.fa-lock",
+        ":scope .lock-btn",
+        ":scope i.lock-btn",
+    ]
+    unlock_selectors = [
+        ":scope i.fa-unlock",
+        ":scope i.fas.fa-unlock",
+        ":scope .unlock-btn",
+        ":scope i.unlock-btn",
     ]
 
-    async def visible(selectors):
-        for sel in selectors:
+    async def visible_instances(selector):
+        """返回 selector 下所有实际可见实例；绝不只取 .first。"""
+        result = []
+        try:
+            loc = page.locator(selector)
+            count = await loc.count()
+            for i in range(count):
+                item = loc.nth(i)
+                try:
+                    if await item.is_visible():
+                        result.append(item)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return result
+
+    async def visible_container():
+        """找到真正可见、可操作的暗锁 placeholder。"""
+        for selector in container_selectors:
+            items = await visible_instances(selector)
+            for item in items:
+                try:
+                    box = await item.bounding_box()
+                    if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                        return item, selector
+                except Exception:
+                    continue
+        return None, ""
+
+    async def icon_visible(container, selectors):
+        for selector in selectors:
             try:
-                loc = page.locator(sel).first
-                if await loc.count() and await loc.is_visible():
-                    return loc, sel
+                loc = container.locator(selector)
+                count = await loc.count()
+                for i in range(count):
+                    item = loc.nth(i)
+                    if await item.is_visible():
+                        return item, selector
             except Exception:
                 continue
         return None, ""
 
-    async def has_unlock():
-        loc, sel = await visible(unlock_selectors)
-        if loc is not None:
-            return True, f"visible unlock={sel}"
-        for sel in containers:
+    async def inspect_state():
+        container, container_sel = await visible_container()
+        if container is None:
+            return False, "找不到可见暗锁容器"
+
+        unlock, unlock_sel = await icon_visible(container, unlock_selectors)
+        lock, lock_sel = await icon_visible(container, lock_selectors)
+
+        # 明确的可见 unlock 才算解锁。
+        if unlock is not None and lock is None:
+            return True, f"{container_sel} 内可见 unlock={unlock_sel}"
+
+        # 两个 icon 同时在 DOM 中是正常的，但如果 lock 仍然可见，必须视为锁定。
+        if lock is not None:
+            return False, f"{container_sel} 内可见 lock={lock_sel}"
+
+        # 初始状态可能是“空白 placeholder”：没有 lock，也没有 unlock。
+        # 这不是解锁，必须实际点击。
+        return False, f"{container_sel} 可见但尚无 lock/unlock 图标（空白状态）"
+
+    async def click_real_control():
+        container, container_sel = await visible_container()
+        if container is None:
+            _debug_log("[JJ] 找不到可见的暗锁 placeholder")
+            return False, ""
+
+        # 如果已经是 unlock，不要再点击一次把它切回去。
+        unlock, _ = await icon_visible(container, unlock_selectors)
+        lock, _ = await icon_visible(container, lock_selectors)
+        if unlock is not None and lock is None:
+            return True, container_sel + " [already-unlocked]"
+
+        # 第一优先：点击容器本身。这正是用户手动点击的区域，且兼容“初始空白”。
+        click_targets = [container]
+
+        # 如果容器 click 没反应，再尝试当前可见 lock/icon。
+        if lock is not None:
+            click_targets.append(lock)
+
+        for target in click_targets:
             try:
-                loc = page.locator(sel).first
-                if not await loc.count() or not await loc.is_visible():
-                    continue
-                cls = (await loc.get_attribute("class") or "").lower()
-                html_text = (await loc.evaluate("el => el.outerHTML") or "").lower()
-                data_locked = (await loc.get_attribute("data-locked") or "").strip().lower()
-                data_unlocked = (await loc.get_attribute("data-unlocked") or "").strip().lower()
-                aria = (await loc.get_attribute("aria-pressed") or "").strip().lower()
-                if data_unlocked in ("true", "1", "yes"):
-                    return True, f"{sel} data-unlocked={data_unlocked}"
-                if data_locked in ("false", "0", "no"):
-                    return True, f"{sel} data-locked={data_locked}"
-                if "fa-unlock" in cls or "fa-unlock" in html_text:
-                    return True, f"{sel} contains fa-unlock"
-                if aria in ("true", "1") and "fa-lock" not in html_text:
-                    return True, f"{sel} aria-pressed={aria}"
-            except Exception:
-                continue
-        return False, ""
-
-    # 页面刚打开后给菜单/搜索区一点时间完成初始化。
-    await page.wait_for_timeout(300)
-
-    unlocked, evidence = await has_unlock()
-    if unlocked:
-        _debug_log(f"[JJ] 暗锁已是解锁状态：{evidence}")
-        return True
-
-    # 关键修正：不要求先看到 fa-lock。
-    # JJ 初始可能是空白，但点击整个 placeholder 才会真正解锁。
-    click_candidates = containers + lock_selectors
-    clicked = False
-    clicked_sel = ""
-    before_html = ""
-    for sel in containers:
-        try:
-            loc = page.locator(sel).first
-            if await loc.count() and await loc.is_visible():
-                before_html = await loc.evaluate("el => el.outerHTML") or ""
-                break
-        except Exception:
-            pass
-
-    for sel in click_candidates:
-        try:
-            loc = page.locator(sel).first
-            if not await loc.count() or not await loc.is_visible():
-                continue
-            await loc.click(force=True, timeout=3000)
-            clicked = True
-            clicked_sel = sel
-            _debug_log(f"[JJ] 已实际点击暗锁：{sel}")
-            break
-        except Exception as e:
-            _debug_log(f"[JJ] 点击暗锁失败 {sel}: {e!r}")
-
-    if not clicked:
-        # JS click 兜底，兼容图标区域被透明层覆盖的情况。
-        for sel in click_candidates:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() and await loc.is_visible():
-                    await loc.evaluate("el => el.click()")
-                    clicked = True
-                    clicked_sel = sel + " [js]"
-                    _debug_log(f"[JJ] 已使用 JS click 暗锁：{sel}")
-                    break
-            except Exception as e:
-                _debug_log(f"[JJ] JS click 暗锁失败 {sel}: {e!r}")
-
-    if not clicked:
-        _debug_log("[JJ] 找不到可点击的暗锁容器")
-        return False
-
-    # 点击后最长等待 8 秒；必须看到 unlock 或明确解锁状态才算成功。
-    for i in range(80):
-        await page.wait_for_timeout(100)
-        unlocked, evidence = await has_unlock()
-        if unlocked:
-            _debug_log(f"[JJ] 暗锁确认解除：{evidence}；等待={(i+1)*0.1:.1f}s")
-            return True
-
-        # 某些版本会替换整个 placeholder；DOM 变化后再立即检查一次。
-        if before_html:
-            try:
-                loc, _ = await visible(containers)
-                if loc is not None:
-                    current_html = await loc.evaluate("el => el.outerHTML") or ""
-                    if current_html != before_html:
-                        unlocked, evidence = await has_unlock()
-                        if unlocked:
-                            _debug_log(f"[JJ] 暗锁 DOM 已替换并确认解除：{evidence}")
-                            return True
+                await target.scroll_into_view_if_needed(timeout=2000)
             except Exception:
                 pass
+            try:
+                await target.click(force=True, timeout=3000)
+                return True, container_sel
+            except Exception as e:
+                _debug_log(f"[JJ] 暗锁普通 click 失败：{e!r}")
 
-    _debug_log(f"[JJ] 点击暗锁后 8 秒仍未确认解除：{clicked_sel}")
+            # 某些模板外层有透明元素挡住 Playwright click，使用 DOM click 作为兜底。
+            try:
+                await target.evaluate("el => el.click()")
+                return True, container_sel + " [js-click]"
+            except Exception as e:
+                _debug_log(f"[JJ] 暗锁 JS click 失败：{e!r}")
+
+        return False, ""
+
+    # 给页面首屏 JS / AJAX 一点初始化时间。
+    await page.wait_for_timeout(500)
+
+    # 最多尝试 3 次，每次都重新读取“实际可见”的控件状态。
+    for attempt in range(1, 4):
+        unlocked, evidence = await inspect_state()
+        _debug_log(f"[JJ] 暗锁状态检查 #{attempt}: {evidence}")
+        if unlocked:
+            _debug_log(f"[JJ] 暗锁已经确认解锁：{evidence}")
+            return True
+
+        clicked, clicked_by = await click_real_control()
+        if not clicked:
+            _debug_log(f"[JJ] 第 {attempt} 次无法点击实际暗锁控件")
+            await page.wait_for_timeout(500)
+            continue
+
+        _debug_log(f"[JJ] 第 {attempt} 次已实际点击暗锁：{clicked_by}")
+
+        # 点击后等待 AJAX / class 切换。
+        for i in range(100):
+            await page.wait_for_timeout(100)
+            unlocked, evidence = await inspect_state()
+            if unlocked:
+                _debug_log(f"[JJ] 暗锁确认解除：{evidence}；等待={(i + 1) * 0.1:.1f}s")
+                return True
+
+        _debug_log(f"[JJ] 第 {attempt} 次点击后 10 秒仍未看到明确 unlock")
+
+        # 如果仍锁定，下一轮重新找当前可见实例，不复用旧 locator。
+        # 绝不盲目连续 click 同一个旧节点。
+        await page.wait_for_timeout(300)
+
+    _debug_log("[JJ] 暗锁连续 3 次都未确认解除；禁止继续搜索")
     return False
 
 
