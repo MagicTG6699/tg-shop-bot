@@ -1270,100 +1270,189 @@ async def _jj_open_outbound(page):
 
 
 async def _jj_unlock_search_range(page):
-    """解开 JJ 搜索日期范围暗锁，并验证真的已经解锁。
+    """针对 JJ 当前页面真正执行“暗锁解锁”。
 
-    JJ 页面截图确认锁头位于 `.toggle-order-search-days-btn-placeholder`。
-    不能只点击后就认为成功；这里会等待图标/DOM 状态真正变成 unlock。
+    重点修正：JJ 的锁头在不同页面/不同前端版本中，不一定会把
+    ``fa-lock`` 直接替换成 ``fa-unlock``。因此不能只靠图标 class 判断。
+    本函数会同时检查：
+      1) 锁头/容器是否出现 unlock 状态；
+      2) 日期输入框的 readonly / disabled 状态是否解除；
+      3) 点击后是否触发了 DOM 属性变化；
+      4) 必要时分别点击图标、容器，并使用 JS click 兜底。
+
+    真正能不能搜到一年前的订单，最后仍由 _jj_set_one_year_date() 验证。
     """
-    selectors = [
+    lock_containers = [
         ".toggle-order-search-days-btn-placeholder",
         ".toggle-search-days-btn-placeholder",
         ".toggle-order-search-days-btn",
-        ".lock-btn",
+    ]
+    lock_icons = [
         "i.fa-lock.lock-btn",
+        "i.fas.fa-lock.lock-btn",
+        ".toggle-order-search-days-btn-placeholder i.fa-lock",
+        ".toggle-search-days-btn-placeholder i.fa-lock",
+        ".toggle-order-search-days-btn i.fa-lock",
+        ".lock-btn",
     ]
 
-    def _norm_class(value):
+    date_selectors = [
+        "#q_created_at_gte",
+        "input[name='q[created_at_gte]']",
+        "input[id*='created_at_gte']",
+        "input[name*='created_at_gte']",
+        "#q_created_at_lte",
+        "input[name='q[created_at_lte]']",
+        "input[id*='created_at_lte']",
+        "input[name*='created_at_lte']",
+    ]
+
+    def norm_class(value):
         return re.sub(r"\s+", " ", (value or "").strip().lower())
 
-    async def unlocked_state(container):
-        # 直接检查解锁 icon。
-        for sel in [".fa-unlock", "i.fa-unlock", ".unlock-btn"]:
+    async def get_date_state():
+        states = []
+        for sel in date_selectors:
             try:
-                loc = container.locator(sel).first
+                loc = page.locator(sel).first
+                if not await loc.count():
+                    continue
+                states.append({
+                    "selector": sel,
+                    "disabled": await loc.is_disabled(),
+                    "readonly": bool(await loc.get_attribute("readonly") is not None),
+                    "value": await loc.input_value(),
+                })
+            except Exception:
+                continue
+        return states
+
+    async def inspect_state():
+        """返回 (is_unlocked, evidence)。不要只看 fa-unlock。"""
+        # A. 明确的 unlock 图标/按钮。
+        for sel in [
+            ".toggle-order-search-days-btn-placeholder .fa-unlock",
+            ".toggle-search-days-btn-placeholder .fa-unlock",
+            ".toggle-order-search-days-btn .fa-unlock",
+            "i.fa-unlock",
+            ".unlock-btn",
+        ]:
+            try:
+                loc = page.locator(sel).first
                 if await loc.count():
-                    return True
+                    cls = norm_class(await loc.get_attribute("class"))
+                    if "fa-lock" not in cls or "unlock" in cls:
+                        return True, f"unlock selector={sel}, class={cls!r}"
             except Exception:
                 pass
-        # 再检查容器/子元素 class 与 HTML，兼容不同 FontAwesome/模板版本。
-        try:
-            cls = _norm_class(await container.get_attribute("class"))
-            if "unlock" in cls and "lock" not in cls.replace("unlock", ""):
-                return True
-            outer = (await container.evaluate("el => el.outerHTML") or "").lower()
-            if "fa-unlock" in outer or "unlock-btn" in outer:
-                return True
-        except Exception:
-            pass
-        return False
 
-    # 先确认页面是否已经是解锁状态。
-    for selector in selectors:
-        loc = page.locator(selector).first
-        try:
-            if await loc.count() and await loc.is_visible():
-                if await unlocked_state(loc):
-                    _debug_log("[JJ] 暗锁已经是解锁状态")
-                    return True
-        except Exception:
-            continue
+        # B. 检查锁容器的 class / data / aria / HTML。
+        for sel in lock_containers + lock_icons:
+            try:
+                loc = page.locator(sel).first
+                if not await loc.count():
+                    continue
+                cls = norm_class(await loc.get_attribute("class"))
+                html_text = (await loc.evaluate("el => el.outerHTML") or "").lower()
+                for attr in ["data-locked", "aria-pressed", "aria-expanded", "data-unlocked"]:
+                    val = (await loc.get_attribute(attr) or "").strip().lower()
+                    if attr == "data-unlocked" and val in ("true", "1", "yes"):
+                        return True, f"{attr}={val}"
+                    if attr == "data-locked" and val in ("false", "0", "no"):
+                        return True, f"{attr}={val}"
+                if "fa-unlock" in cls:
+                    return True, f"class={cls!r}"
+                if "fa-unlock" in html_text or "unlock-btn" in html_text:
+                    return True, "outerHTML contains unlock state"
+            except Exception:
+                continue
 
-    # 如果没有容器，直接检查全页 unlock 图标。
-    try:
-        for selector in [".fa-unlock", "i.fa-unlock", ".unlock-btn"]:
-            loc = page.locator(selector).first
-            if await loc.count() and await loc.is_visible():
-                _debug_log("[JJ] 页面已经存在解锁图标")
-                return True
-    except Exception:
-        pass
+        # C. 很多版本真正的“解锁”表现是日期框解除 readonly/disabled，
+        # 即使图标 class 仍然叫 fa-lock，也应视为解锁成功。
+        states = await get_date_state()
+        usable = [x for x in states if not x["disabled"] and not x["readonly"]]
+        if len(usable) >= 2:
+            return True, f"date inputs editable ({len(usable)}/{len(states)})"
 
-    # 找到锁头后只点击一次，然后轮询验证，避免“点击了但页面还没完成切换”。
-    clicked_container = None
-    for selector in selectors:
-        loc = page.locator(selector).first
+        return False, "仍检测到锁定状态 / 日期输入框仍不可编辑"
+
+    # 已经解锁就不要重复点击。
+    unlocked, evidence = await inspect_state()
+    if unlocked:
+        _debug_log(f"[JJ] 暗锁当前已可用：{evidence}")
+        return True
+
+    before_date_state = await get_date_state()
+    before_signature = "|".join(
+        f"{x['disabled']}:{x['readonly']}:{x['value']}" for x in before_date_state
+    )
+
+    # 先尝试最精确的图标，再尝试 placeholder / 容器。
+    click_candidates = lock_icons + lock_containers
+    clicked = False
+    clicked_selector = ""
+    for sel in click_candidates:
         try:
-            if await loc.count() and await loc.is_visible():
-                clicked_container = loc
+            loc = page.locator(sel).first
+            if not await loc.count():
+                continue
+            # 即使 Playwright 判定不可见，也允许最后通过 JS click 触发页面事件。
+            if await loc.is_visible():
                 await loc.click(force=True)
-                _debug_log(f"[JJ] 已点击暗锁：{selector}")
+                clicked = True
+                clicked_selector = sel
+                _debug_log(f"[JJ] 已点击暗锁：{sel}")
                 break
         except Exception as e:
-            _debug_log(f"[JJ] 点击暗锁失败 {selector}: {e!r}")
+            _debug_log(f"[JJ] 点击暗锁失败 {sel}: {e!r}")
 
-    if clicked_container is None:
+    # 如果正常 click 没成功，再用 JS click 触发绑定在元素上的事件。
+    if not clicked:
+        for sel in lock_icons + lock_containers:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count():
+                    await loc.evaluate("el => el.click()")
+                    clicked = True
+                    clicked_selector = sel + " [js-click]"
+                    _debug_log(f"[JJ] 已使用 JS click 暗锁：{sel}")
+                    break
+            except Exception as e:
+                _debug_log(f"[JJ] JS click 暗锁失败 {sel}: {e!r}")
+
+    if not clicked:
+        _debug_log("[JJ] 页面找不到可触发的暗锁")
         return False
 
-    # 最多等待约 3 秒，让前端 JS 完成锁头切换。
-    for _ in range(30):
+    # 点击后给前端 AJAX / class / readonly 状态充分时间。
+    # 先看状态变化，不要求一定出现 fa-unlock。
+    for i in range(80):
         await page.wait_for_timeout(100)
+
+        unlocked, evidence = await inspect_state()
+        if unlocked:
+            _debug_log(f"[JJ] 暗锁已确认可用：{evidence}；等待={(i+1)*0.1:.1f}s")
+            return True
+
+        # 检查日期框属性签名是否发生变化；如果页面没有 fa-unlock，
+        # 但前端确实已经切换状态，也允许继续由日期范围验证。
         try:
-            if await unlocked_state(clicked_container):
-                _debug_log("[JJ] 暗锁已确认解锁")
-                return True
-        except Exception:
-            pass
-        try:
-            # 某些模板点击后会替换整个节点，所以重新找全页 unlock。
-            for selector in [".fa-unlock", "i.fa-unlock", ".unlock-btn"]:
-                loc = page.locator(selector).first
-                if await loc.count() and await loc.is_visible():
-                    _debug_log("[JJ] 暗锁已确认解锁（节点已替换）")
+            current_state = await get_date_state()
+            current_signature = "|".join(
+                f"{x['disabled']}:{x['readonly']}:{x['value']}" for x in current_state
+            )
+            if current_signature != before_signature:
+                editable = [x for x in current_state if not x["disabled"] and not x["readonly"]]
+                if len(editable) >= 2:
+                    _debug_log(
+                        f"[JJ] 暗锁触发后日期控件状态已变化并可编辑：{clicked_selector}"
+                    )
                     return True
+            before_signature = current_signature
         except Exception:
             pass
 
-    _debug_log("[JJ] 点击暗锁后未能确认 unlock 状态")
+    _debug_log(f"[JJ] 暗锁点击后 8 秒仍未确认解锁：clicked={clicked_selector}")
     return False
 
 
@@ -1448,27 +1537,44 @@ async def _jj_set_one_year_date(page):
 
 
 async def _jj_prepare_search_range(page):
-    """统一准备 JJ 搜索范围：解暗锁 + 最近一年日期，并在失败时重载页面重试一次。"""
-    unlocked = await _jj_unlock_search_range(page)
-    date_ok = await _jj_set_one_year_date(page)
-    if date_ok:
-        return True
+    """准备 JJ 搜索范围。
 
-    # 日期没有真正写进去，而且暗锁状态也无法确认时，不直接再点一次。
-    # 因为如果第一次点击其实已经成功，只是图标切换慢，第二次点击可能反而重新上锁。
-    # 这里改为刷新当前 JJ 页面，让页面回到初始锁定状态，再完整执行一次。
+    最终以“最近一年日期真的写入并被页面接受”为有效标准；
+    不因为锁头 icon 没有改 class 就误判，也不在暗锁未处理时盲目搜索。
+    """
+    unlocked = await _jj_unlock_search_range(page)
     if not unlocked:
-        _debug_log("[JJ] 暗锁/日期验证失败，刷新当前 JJ 页面后完整重试一次")
+        _debug_log("[JJ] 第一次未确认暗锁，刷新页面后重新进入完整解锁流程")
         try:
             await page.reload(wait_until="domcontentloaded")
-            await page.wait_for_timeout(300)
-            retry_unlocked = await _jj_unlock_search_range(page)
-            retry_date_ok = await _jj_set_one_year_date(page)
-            if retry_unlocked and retry_date_ok:
-                return True
+            await page.wait_for_timeout(800)
+            unlocked = await _jj_unlock_search_range(page)
         except Exception as e:
-            _debug_log(f"[JJ] 刷新后重新准备搜索范围失败: {e!r}")
+            _debug_log(f"[JJ] 刷新后解暗锁失败：{e!r}")
+    if not unlocked:
+        return False
 
+    # 真正的最终验证：日期必须接受最近一年，而不是只看锁头图标。
+    date_ok = await _jj_set_one_year_date(page)
+    if date_ok:
+        _debug_log("[JJ] 暗锁可用 + 最近一年日期已确认写入")
+        return True
+
+    # 日期没有接受，通常代表暗锁实际没有解除或前端 AJAX 尚未完成。
+    # 再刷新一次，重新点击暗锁并重新设置日期。
+    _debug_log("[JJ] 最近一年日期验证失败；刷新后重新执行暗锁 + 日期流程")
+    try:
+        await page.reload(wait_until="domcontentloaded")
+        await page.wait_for_timeout(800)
+        retry_unlocked = await _jj_unlock_search_range(page)
+        if not retry_unlocked:
+            return False
+        retry_date_ok = await _jj_set_one_year_date(page)
+        if retry_date_ok:
+            _debug_log("[JJ] 刷新后暗锁可用 + 最近一年日期均已确认")
+            return True
+    except Exception as e:
+        _debug_log(f"[JJ] 刷新后重新准备搜索范围失败：{e!r}")
     return False
 
 
@@ -2693,11 +2799,8 @@ async def _single_withdraw(account, jj_result, task_id=None, session=None):
             raise Exception("商户提现页面找不到【商户】下拉框。")
 
         await _select_select2_by_text(page, merchant_select, account, "提现商户")
-        try:
-            await merchant_select.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
-        except Exception:
-            pass
-        await page.wait_for_timeout(200)
+        # Select2 选择结果本身已经会触发 change；不要重复触发。
+        await _wait_single_merchant_transition(page, merchant_select, account, form_kind="提现")
 
         # 银行账户按照你的要求：保持空白，不选择、不填写。
 
@@ -2815,9 +2918,9 @@ async def _query_jj_order(single_order_no, task_id, session=None):
         await page.goto(jj_outbound_url, wait_until="domcontentloaded")
         await page.wait_for_timeout(400)
 
-        # 先解锁，再把建立日期范围拉回一年。
-        await _jj_unlock_search_range(page)
-        date_set = await _jj_set_one_year_date(page)
+        # 必须先确认暗锁真的解除，再把建立日期范围拉回一年。
+        if not await _jj_prepare_search_range(page):
+            raise Exception("JJ 出货管理无法确认暗锁已解除 / 最近一年日期范围已生效。")
 
         # 先查平台订单号。
         await _jj_search(page, single_order_no, "platform")
@@ -3291,9 +3394,26 @@ async def _select_select2_by_text(page, native_select, target_text, label_name="
                         found_any = True
                         if target.lower() in txt.lower() or txt.lower() in target.lower() or norm(target) in norm(txt):
                             await item.click(force=True)
-                            await page.wait_for_timeout(500)
-                            if await verify_selected():
-                                return True
+                            # 单笔商城选择商户后会有明显 AJAX / 页面切换延迟。
+                            # 不要 500ms 后就判定失败，最多轮询 10 秒，确认原生 select 真正产生 value。
+                            for _merchant_wait in range(50):
+                                await page.wait_for_timeout(200)
+                                if await verify_selected():
+                                    return True
+                                # 某些 Select2 模板原生 option 更新更慢，但显示文字已经完成。
+                                try:
+                                    rendered = page.locator(
+                                        ".select2-container--default .select2-selection__rendered, "
+                                        ".select2-selection__rendered"
+                                    ).last
+                                    if await rendered.count() and await rendered.is_visible():
+                                        rtxt = _clean_text_value(await rendered.inner_text())
+                                        if target.lower() in rtxt.lower() or norm(target) in norm(rtxt):
+                                            await page.wait_for_timeout(300)
+                                            if await verify_selected():
+                                                return True
+                                except Exception:
+                                    pass
                     except Exception:
                         continue
             if found_any:
@@ -3321,6 +3441,95 @@ def _payment_account_from_info(info):
         return info.get("digital_account", "")
     return info.get("alipay_account", "")
 
+
+
+async def _wait_single_merchant_transition(page, merchant_select, account, form_kind="充值"):
+    """等待单笔商城选择商户后的异步处理/跳转完成。
+
+    单笔商城的充值、提现页面在 Select2 选中商户后，后台不会立刻准备好后续表单，
+    而是会经过 AJAX/JS 处理并短暂卡顿后才完成页面状态切换。
+    这里不固定 sleep 很久，而是：
+      1) 至少给前端 1 秒完成第一轮事件；
+      2) 轮询最多 10 秒，确认商户仍为目标值且后续表单已经可用；
+      3) 如果页面发生导航，等待导航后的 DOM 稳定；
+      4) 超时才报错，避免把“正在加载”误判成“商户不存在”。
+    """
+    target = _clean_text_value(str(account or ""))
+    if not target:
+        raise Exception(f"{form_kind}商户目标为空。")
+
+    await page.wait_for_timeout(1000)
+
+    # 两类页面都至少应该存在这些后续字段中的一部分。
+    if form_kind == "充值":
+        readiness_selectors = [
+            "#deposit_order_shipment_info_id",
+            "#deposit_order_total_amount",
+            "#deposit_order_created_at",
+            "#deposit_order_completed_at",
+        ]
+    else:
+        readiness_selectors = [
+            "#withdraw_order_total_amount",
+            "#withdraw_order_amount",
+            "#withdraw_total_amount",
+            "input[name*='withdraw'][name*='amount']",
+        ]
+
+    async def selected_matches():
+        try:
+            value = await merchant_select.input_value()
+        except Exception:
+            value = ""
+        if not value:
+            return False
+        try:
+            checked = merchant_select.locator("option:checked").first
+            if await checked.count():
+                text = _clean_text_value(await checked.inner_text())
+                if target.lower() in text.lower() or re.sub(r"\s+", "", target).lower() in re.sub(r"\s+", "", text).lower():
+                    return True
+        except Exception:
+            pass
+        return True
+
+    last_url = page.url
+    for _ in range(45):  # 9 秒轮询
+        await page.wait_for_timeout(200)
+
+        # 导航完成后，重新等待 DOM。
+        if page.url != last_url:
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+            last_url = page.url
+
+        if not await selected_matches():
+            continue
+
+        # 商户选中 + 后续表单出现 = 异步切换完成。
+        for sel in readiness_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible():
+                    return
+            except Exception:
+                continue
+
+        # 有些页面后续字段不是 visible，但已经存在；此时也说明 DOM 已稳定。
+        for sel in readiness_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count():
+                    return
+            except Exception:
+                continue
+
+    raise Exception(
+        f"{form_kind}选择商户【{target}】后后台异步处理/跳转超过 10 秒，未进入可填写状态。"
+        f" 当前URL：{page.url}"
+    )
 
 async def _single_recharge(account, jj_result, payment_info=None, task_id=None, session=None):
     """重新登录单笔商城并填写充值；不依赖建店时已关闭的浏览器页面。"""
@@ -3402,12 +3611,9 @@ async def _single_recharge(account, jj_result, payment_info=None, task_id=None, 
         except Exception as e:
             raise Exception(f"充值商户选择失败：{e}")
 
-        # 触发 select2 / Rails 的 change。
-        try:
-            await merchant_select.evaluate("el => { el.dispatchEvent(new Event('change', {bubbles:true})); }")
-        except Exception:
-            pass
-        await page.wait_for_timeout(400)
+        # Select2 选择结果本身已经会触发 change；不要再次手动触发，
+        # 避免后台的异步商户切换逻辑被执行两次。
+        await _wait_single_merchant_transition(page, merchant_select, account, form_kind="充值")
 
         # 【重要】充值页面的【銀行帳戶】按照用户最新确认：保持空白，不填写。
         # Telegram 中的支付宝/数字/银行卡资料仍可用于建店流程；
@@ -3917,6 +4123,18 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                             recharge_results.append((outbound_result, recharge_result))
                             if outbound_result.get("status") == "失败":
                                 failed_outbound_results.append(outbound_result)
+                            # 每制作完一笔立即回报，然后才进入下一笔。
+                            await status_msg.edit_text(
+                                result_text +
+                                f"\n\n✅ 第 {idx}/{len(order_numbers)} 笔订单制作完成：<code>{html.escape(order_no)}</code>"
+                                f"\n类型：商户充值"
+                                f"\n状态：{html.escape(outbound_result.get('status') or '未知')}"
+                                "\n\n⏳ 准备进入下一笔订单...",
+                                reply_markup=InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                                ]),
+                                parse_mode="HTML", disable_web_page_preview=True
+                            )
                         except Exception as recharge_error:
                             recharge_error_text = str(recharge_error) or repr(recharge_error)
                             recharge_error_results.append((order_no, recharge_error_text))
@@ -3924,6 +4142,16 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                                 f"[充值] 当前订单新增充值失败，继续下一笔: order={order_no}, repr={recharge_error!r}"
                             )
                             _debug_log(traceback.format_exc())
+                            await status_msg.edit_text(
+                                result_text +
+                                f"\n\n⚠️ 第 {idx}/{len(order_numbers)} 笔订单充值失败，已继续下一笔"
+                                f"\n订单号：<code>{html.escape(order_no)}</code>"
+                                f"\n原因：{html.escape(recharge_error_text)}",
+                                reply_markup=InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                                ]),
+                                parse_mode="HTML", disable_web_page_preview=True
+                            )
                             continue
                         continue
 
@@ -3963,6 +4191,18 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         )
                         withdraw_result = await _single_withdraw(final_account, pdd_result, task_id, session=single_session)
                         withdraw_results.append((pdd_result, withdraw_result))
+                        # 每制作完一笔立即回报，然后才进入下一笔。
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n✅ 第 {idx}/{len(order_numbers)} 笔订单制作完成：<code>{html.escape(order_no)}</code>"
+                            "\n类型：商户提现"
+                            "\n状态：成功"
+                            "\n\n⏳ 准备进入下一笔订单...",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
                     except Exception as withdraw_error:
                         withdraw_error_text = str(withdraw_error) or repr(withdraw_error)
                         withdraw_error_results.append((order_no, withdraw_error_text))
@@ -3970,6 +4210,16 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                             f"[提现] 当前订单新增提现失败，继续下一笔: order={order_no}, repr={withdraw_error!r}"
                         )
                         _debug_log(traceback.format_exc())
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⚠️ 第 {idx}/{len(order_numbers)} 笔订单提现失败，已继续下一笔"
+                            f"\n订单号：<code>{html.escape(order_no)}</code>"
+                            f"\n原因：{html.escape(withdraw_error_text)}",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
                         continue
 
                 # 所有订单都按“命中页面决定制作类型”完成后，再统一汇总。
