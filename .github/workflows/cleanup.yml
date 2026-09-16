@@ -1,0 +1,84 @@
+name: TG Shop Bot Cleanup
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: '30 */3 * * *'
+
+
+# 允许删除 GitHub Actions 运行记录
+permissions:
+  actions: write
+  contents: read
+
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ==========================================
+      # 自动清理 TG Shop Bot 历史运行记录
+      # ==========================================
+      - name: 清理旧的 TG Shop Bot 运行记录
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+
+          echo "=========================================="
+          echo "开始清理 TG Shop Bot 历史运行记录"
+          echo "=========================================="
+
+          echo ""
+          echo "Repository: ${{ github.repository }}"
+          echo ""
+
+          # 获取 TG Shop Bot 最近 100 笔已经结束的运行
+          #
+          # GitHub 的 completed 包含：
+          # - success
+          # - failure
+          # - cancelled
+          # - 其他已经结束的结果
+          #
+          # 正在运行中的任务不会被列入。
+          RUNS=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "TG Shop Bot" \
+            --limit 100 \
+            --json databaseId,status,createdAt \
+            --jq '.[] | select(.status == "completed") | .databaseId')
+
+          COUNT=0
+
+          echo "开始检查历史记录..."
+          echo ""
+
+          for RUN_ID in $RUNS; do
+
+            COUNT=$((COUNT + 1))
+
+            if [ "$COUNT" -le 10 ]; then
+
+              echo "保留第 ${COUNT} 笔：${RUN_ID}"
+
+            else
+
+              echo "删除第 ${COUNT} 笔旧记录：${RUN_ID}"
+
+              gh run delete "$RUN_ID" \
+                --repo "${{ github.repository }}" \
+                --confirm || true
+
+            fi
+
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "清理完成"
+          echo "保留最新 10 笔已结束记录"
+          echo "=========================================="
