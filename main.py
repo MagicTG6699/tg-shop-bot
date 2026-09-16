@@ -3595,7 +3595,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                 await status_msg.edit_text(
                     result_text,
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⏳ 正在查询 JJ 订单...", callback_data="ignore")]
+                        [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
                     ]),
                     parse_mode="HTML", disable_web_page_preview=True
                 )
@@ -3621,7 +3621,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         f"\n\n⏳ 正在查询第 {idx}/{len(order_numbers)} 笔订单：<code>{html.escape(order_no)}</code>\n"
                         "查询顺序：出货管理 → 拼多多订单管理",
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("⏳ 正在查询订单...", callback_data="ignore")]
+                            [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
                         ]),
                         parse_mode="HTML", disable_web_page_preview=True
                     )
@@ -3673,7 +3673,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                                 f"\n\n⏳ 第 {idx}/{len(order_numbers)} 笔：<b>出货管理命中</b>\n"
                                 "订单状态：<b>成功</b>，收款号核对通过，正在制作商户充值...",
                                 reply_markup=InlineKeyboardMarkup([
-                                    [InlineKeyboardButton("⏳ 正在制作充值...", callback_data="ignore")]
+                                    [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
                                 ]),
                                 parse_mode="HTML", disable_web_page_preview=True
                             )
@@ -3719,7 +3719,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                             f"\n\n⏳ 第 {idx}/{len(order_numbers)} 笔：<b>拼多多订单管理命中</b>\n"
                             "订单状态：<b>成功</b>，正在制作商户提现...",
                             reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton("⏳ 正在制作提现...", callback_data="ignore")]
+                                [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
                             ]),
                             parse_mode="HTML", disable_web_page_preview=True
                         )
