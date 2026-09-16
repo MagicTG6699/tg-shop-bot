@@ -202,6 +202,7 @@ def _extract_order_numbers(text: str):
 
 
 # 2. 文本解析与格式校验（全面优化简繁体兼容与格式判断）
+# 收款号判定：先识别平台账号，再按支付宝/银行/数字的字段语义识别实际收款号，避免多个“账号”串号。
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
     errors = []
@@ -589,7 +590,7 @@ async def create_and_setup_shop(info: dict, task_id: str) -> tuple[str, str]:
                 try:
                     await coro
                 except Exception as sub_e:
-                    print(f"⚠️ [{step_name}] 执行失败或超时（不影响建店主体）: {sub_e}")
+                    _debug_log(f"[{step_name}] 执行失败或超时（不影响建店主体）: {sub_e}")
 
             # 4. 批量商品
             async def step_items():
@@ -4532,10 +4533,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 6. 主程序入口
 def main():
     if not BOT_TOKEN:
-        print("❌ 未检测到 BOT_TOKEN 环境变量！")
+        _debug_log("未检测到 BOT_TOKEN 环境变量！")
         sys.exit(1)
 
-    print("🤖 Telegram 机器人服务运行中...")
+    _debug_log("Telegram 机器人服务运行中...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     msg_filter = filters.TEXT & (~filters.COMMAND)
 
