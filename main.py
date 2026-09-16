@@ -1270,17 +1270,20 @@ async def _jj_open_outbound(page):
 
 
 async def _jj_unlock_search_range(page):
-    """针对 JJ 当前页面真正执行“暗锁解锁”。
+    """严格处理 JJ 搜索暗锁。
 
-    重点修正：JJ 的锁头在不同页面/不同前端版本中，不一定会把
-    ``fa-lock`` 直接替换成 ``fa-unlock``。因此不能只靠图标 class 判断。
-    本函数会同时检查：
-      1) 锁头/容器是否出现 unlock 状态；
-      2) 日期输入框的 readonly / disabled 状态是否解除；
-      3) 点击后是否触发了 DOM 属性变化；
-      4) 必要时分别点击图标、容器，并使用 JS click 兜底。
+    关键点：JJ 的日期输入框即使在暗锁状态下也可能仍然是可编辑的，
+    因此“日期框可编辑”绝不能当成“暗锁已经解除”。
 
-    真正能不能搜到一年前的订单，最后仍由 _jj_set_one_year_date() 验证。
+    当前截图已确认真正的锁头 DOM 位于：
+      .toggle-order-search-days-btn-placeholder i.fa-lock
+
+    流程：
+      1. 如果页面仍有可见的 fa-lock，必须先点击锁头；
+      2. 等待锁头 DOM / class / aria / data 状态发生解锁变化；
+      3. 如果锁头 class 不变化，也等待前端事件完成，但不把“日期框可编辑”
+         单独当成解锁证据；
+      4. 最终是否能查到一年前订单，由 _jj_set_one_year_date + 实际搜索结果验证。
     """
     lock_containers = [
         ".toggle-order-search-days-btn-placeholder",
@@ -1288,127 +1291,145 @@ async def _jj_unlock_search_range(page):
         ".toggle-order-search-days-btn",
     ]
     lock_icons = [
-        "i.fa-lock.lock-btn",
-        "i.fas.fa-lock.lock-btn",
         ".toggle-order-search-days-btn-placeholder i.fa-lock",
         ".toggle-search-days-btn-placeholder i.fa-lock",
         ".toggle-order-search-days-btn i.fa-lock",
+        "i.fa-lock.lock-btn",
+        "i.fas.fa-lock.lock-btn",
         ".lock-btn",
+        "i.lock-btn",
     ]
-
-    date_selectors = [
-        "#q_created_at_gte",
-        "input[name='q[created_at_gte]']",
-        "input[id*='created_at_gte']",
-        "input[name*='created_at_gte']",
-        "#q_created_at_lte",
-        "input[name='q[created_at_lte]']",
-        "input[id*='created_at_lte']",
-        "input[name*='created_at_lte']",
+    unlock_selectors = [
+        ".toggle-order-search-days-btn-placeholder i.fa-unlock",
+        ".toggle-search-days-btn-placeholder i.fa-unlock",
+        ".toggle-order-search-days-btn i.fa-unlock",
+        "i.fa-unlock.lock-btn",
+        ".unlock-btn",
     ]
 
     def norm_class(value):
         return re.sub(r"\s+", " ", (value or "").strip().lower())
 
-    async def get_date_state():
-        states = []
-        for sel in date_selectors:
+    async def visible_locator(selectors):
+        for sel in selectors:
             try:
                 loc = page.locator(sel).first
-                if not await loc.count():
-                    continue
-                states.append({
-                    "selector": sel,
-                    "disabled": await loc.is_disabled(),
-                    "readonly": bool(await loc.get_attribute("readonly") is not None),
-                    "value": await loc.input_value(),
-                })
+                if await loc.count() and await loc.is_visible():
+                    return loc, sel
             except Exception:
                 continue
-        return states
+        return None, ""
 
-    async def inspect_state():
-        """返回 (is_unlocked, evidence)。不要只看 fa-unlock。"""
-        # A. 明确的 unlock 图标/按钮。
-        for sel in [
-            ".toggle-order-search-days-btn-placeholder .fa-unlock",
-            ".toggle-search-days-btn-placeholder .fa-unlock",
-            ".toggle-order-search-days-btn .fa-unlock",
-            "i.fa-unlock",
-            ".unlock-btn",
-        ]:
+    async def lock_snapshot():
+        """返回页面锁状态，不把日期框 editable 当作解锁。"""
+        # 明确的 unlock 图标优先。
+        loc, sel = await visible_locator(unlock_selectors)
+        if loc is not None:
             try:
-                loc = page.locator(sel).first
-                if await loc.count():
-                    cls = norm_class(await loc.get_attribute("class"))
-                    if "fa-lock" not in cls or "unlock" in cls:
-                        return True, f"unlock selector={sel}, class={cls!r}"
+                return {
+                    "unlocked": True,
+                    "has_visible_lock": False,
+                    "evidence": f"visible unlock selector={sel}",
+                }
             except Exception:
                 pass
 
-        # B. 检查锁容器的 class / data / aria / HTML。
-        for sel in lock_containers + lock_icons:
+        # 只要明确看到 fa-lock，就认为仍然需要解锁。
+        for sel in lock_icons:
+            try:
+                loc = page.locator(sel).first
+                if not await loc.count() or not await loc.is_visible():
+                    continue
+                cls = norm_class(await loc.get_attribute("class"))
+                html_text = (await loc.evaluate("el => el.outerHTML") or "").lower()
+                if "fa-lock" in cls or "fa-lock" in html_text:
+                    return {
+                        "unlocked": False,
+                        "has_visible_lock": True,
+                        "evidence": f"visible lock selector={sel}, class={cls!r}",
+                    }
+            except Exception:
+                continue
+
+        # 检查容器的明确状态属性。
+        for sel in lock_containers:
             try:
                 loc = page.locator(sel).first
                 if not await loc.count():
                     continue
+                if not await loc.is_visible():
+                    continue
                 cls = norm_class(await loc.get_attribute("class"))
                 html_text = (await loc.evaluate("el => el.outerHTML") or "").lower()
-                for attr in ["data-locked", "aria-pressed", "aria-expanded", "data-unlocked"]:
-                    val = (await loc.get_attribute(attr) or "").strip().lower()
-                    if attr == "data-unlocked" and val in ("true", "1", "yes"):
-                        return True, f"{attr}={val}"
-                    if attr == "data-locked" and val in ("false", "0", "no"):
-                        return True, f"{attr}={val}"
-                if "fa-unlock" in cls:
-                    return True, f"class={cls!r}"
-                if "fa-unlock" in html_text or "unlock-btn" in html_text:
-                    return True, "outerHTML contains unlock state"
+                data_locked = (await loc.get_attribute("data-locked") or "").strip().lower()
+                data_unlocked = (await loc.get_attribute("data-unlocked") or "").strip().lower()
+                aria_pressed = (await loc.get_attribute("aria-pressed") or "").strip().lower()
+
+                if data_unlocked in ("true", "1", "yes"):
+                    return {"unlocked": True, "has_visible_lock": False,
+                            "evidence": f"{sel} data-unlocked={data_unlocked}"}
+                if data_locked in ("false", "0", "no"):
+                    return {"unlocked": True, "has_visible_lock": False,
+                            "evidence": f"{sel} data-locked={data_locked}"}
+                if "fa-unlock" in cls or "fa-unlock" in html_text:
+                    return {"unlocked": True, "has_visible_lock": False,
+                            "evidence": f"{sel} contains unlock"}
+                if aria_pressed in ("true", "1") and "fa-lock" not in html_text:
+                    return {"unlocked": True, "has_visible_lock": False,
+                            "evidence": f"{sel} aria-pressed={aria_pressed}"}
             except Exception:
                 continue
 
-        # C. 很多版本真正的“解锁”表现是日期框解除 readonly/disabled，
-        # 即使图标 class 仍然叫 fa-lock，也应视为解锁成功。
-        states = await get_date_state()
-        usable = [x for x in states if not x["disabled"] and not x["readonly"]]
-        if len(usable) >= 2:
-            return True, f"date inputs editable ({len(usable)}/{len(states)})"
+        # 没看到锁头，也没有明确的锁定状态：允许进入日期设置。
+        return {
+            "unlocked": True,
+            "has_visible_lock": False,
+            "evidence": "页面未检测到可见 fa-lock，允许继续验证日期范围",
+        }
 
-        return False, "仍检测到锁定状态 / 日期输入框仍不可编辑"
-
-    # 已经解锁就不要重复点击。
-    unlocked, evidence = await inspect_state()
-    if unlocked:
-        _debug_log(f"[JJ] 暗锁当前已可用：{evidence}")
+    # ★ JJ 这里有一个特殊行为：未点击前，锁头区域可能只显示空白，
+    # 但真正点击整个 .toggle-order-search-days-btn-placeholder 后才会出现 unlock。
+    # 因此“没有检测到 fa-lock”绝对不能直接视为已解锁。
+    # 只有明确看到 fa-unlock，才可以直接继续；否则必须尝试点击锁头容器。
+    snap = await lock_snapshot()
+    if snap["unlocked"] and not snap["has_visible_lock"] and "visible unlock" in snap.get("evidence", ""):
+        _debug_log(f"[JJ] 已明确检测到 unlock：{snap['evidence']}")
         return True
+    _debug_log(f"[JJ] 未明确检测到 unlock，必须点击暗锁/锁头容器；当前状态={snap}")
 
-    before_date_state = await get_date_state()
-    before_signature = "|".join(
-        f"{x['disabled']}:{x['readonly']}:{x['value']}" for x in before_date_state
-    )
+    before_html = ""
+    try:
+        loc, _ = await visible_locator(lock_containers)
+        if loc is not None:
+            before_html = (await loc.evaluate("el => el.outerHTML") or "")
+    except Exception:
+        pass
 
-    # 先尝试最精确的图标，再尝试 placeholder / 容器。
-    click_candidates = lock_icons + lock_containers
     clicked = False
     clicked_selector = ""
+
+    # 第一优先：点击整个锁头容器。
+    # JJ 未点击时图标可能为空白，单独找 fa-lock 会漏掉这种情况。
+    # 如果页面已经是 unlock，上面已经 return；所以这里点击不会把已解锁状态重新锁回去。
+    click_candidates = lock_containers + lock_icons
     for sel in click_candidates:
         try:
             loc = page.locator(sel).first
             if not await loc.count():
                 continue
-            # 即使 Playwright 判定不可见，也允许最后通过 JS click 触发页面事件。
-            if await loc.is_visible():
-                await loc.click(force=True)
-                clicked = True
-                clicked_selector = sel
-                _debug_log(f"[JJ] 已点击暗锁：{sel}")
-                break
+            if not await loc.is_visible():
+                continue
+            await loc.click(force=True)
+            clicked = True
+            clicked_selector = sel
+            _debug_log(f"[JJ] 已点击暗锁：{sel}")
+            break
         except Exception as e:
             _debug_log(f"[JJ] 点击暗锁失败 {sel}: {e!r}")
 
-    # 如果正常 click 没成功，再用 JS click 触发绑定在元素上的事件。
+    # Playwright click 没成功时使用 JS click。
     if not clicked:
-        for sel in lock_icons + lock_containers:
+        for sel in click_candidates:
             try:
                 loc = page.locator(sel).first
                 if await loc.count():
@@ -1421,38 +1442,37 @@ async def _jj_unlock_search_range(page):
                 _debug_log(f"[JJ] JS click 暗锁失败 {sel}: {e!r}")
 
     if not clicked:
-        _debug_log("[JJ] 页面找不到可触发的暗锁")
+        _debug_log("[JJ] 页面存在锁定状态，但没有找到可点击的暗锁元素")
         return False
 
-    # 点击后给前端 AJAX / class / readonly 状态充分时间。
-    # 先看状态变化，不要求一定出现 fa-unlock。
+    # 点击后最多等待 8 秒，确认锁头真正消失/变成 unlock。
     for i in range(80):
         await page.wait_for_timeout(100)
-
-        unlocked, evidence = await inspect_state()
-        if unlocked:
-            _debug_log(f"[JJ] 暗锁已确认可用：{evidence}；等待={(i+1)*0.1:.1f}s")
+        snap = await lock_snapshot()
+        if snap["unlocked"] and not snap["has_visible_lock"]:
+            _debug_log(
+                f"[JJ] 暗锁已确认解除：{snap['evidence']}；"
+                f"等待={(i + 1) * 0.1:.1f}s；点击={clicked_selector}"
+            )
             return True
 
-        # 检查日期框属性签名是否发生变化；如果页面没有 fa-unlock，
-        # 但前端确实已经切换状态，也允许继续由日期范围验证。
+        # 有些前端会替换整个容器；检测 outerHTML 是否发生变化。
         try:
-            current_state = await get_date_state()
-            current_signature = "|".join(
-                f"{x['disabled']}:{x['readonly']}:{x['value']}" for x in current_state
-            )
-            if current_signature != before_signature:
-                editable = [x for x in current_state if not x["disabled"] and not x["readonly"]]
-                if len(editable) >= 2:
-                    _debug_log(
-                        f"[JJ] 暗锁触发后日期控件状态已变化并可编辑：{clicked_selector}"
-                    )
-                    return True
-            before_signature = current_signature
+            loc, _ = await visible_locator(lock_containers)
+            if loc is not None:
+                current_html = (await loc.evaluate("el => el.outerHTML") or "")
+                if before_html and current_html != before_html:
+                    # DOM 有变化后再重新检查一次；仍有 fa-lock 就不能算成功。
+                    snap2 = await lock_snapshot()
+                    if snap2["unlocked"] and not snap2["has_visible_lock"]:
+                        _debug_log(
+                            f"[JJ] 暗锁 DOM 已变化并确认解除；等待={(i + 1) * 0.1:.1f}s"
+                        )
+                        return True
         except Exception:
             pass
 
-    _debug_log(f"[JJ] 暗锁点击后 8 秒仍未确认解锁：clicked={clicked_selector}")
+    _debug_log(f"[JJ] 点击暗锁后 8 秒仍未确认解除：{clicked_selector}")
     return False
 
 
@@ -4089,6 +4109,19 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         _debug_log(traceback.format_exc())
                         outbound_error_text = str(outbound_error) or repr(outbound_error)
                         outbound_error_results.append((order_no, outbound_error_text))
+                        # 关键：当前订单任何查询异常都必须马上回报，绝不能静默跳到下一笔。
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⚠️ 第 {idx}/{len(order_numbers)} 笔订单出货管理查询异常，已跳过当前订单"
+                            f"\n订单号：<code>{html.escape(order_no)}</code>"
+                            f"\n原因：{html.escape(outbound_error_text)}"
+                            "\n\n⏳ 准备进入下一笔订单...",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        await asyncio.sleep(0.3)
                         continue
 
                     if outbound_result is not None:
@@ -4107,6 +4140,19 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                                 f"[出货] 收款号不符，跳过当前充值并继续下一笔: "
                                 f"order={order_no}, expected={expected_payment_account!r}, actual={actual_payment_account!r}"
                             )
+                            await status_msg.edit_text(
+                                result_text +
+                                f"\n\n⚠️ 第 {idx}/{len(order_numbers)} 笔订单收款号不符，已跳过当前订单"
+                                f"\n订单号：<code>{html.escape(order_no)}</code>"
+                                f"\n预期：<code>{html.escape(expected_payment_account or '未读取')}</code>"
+                                f"\nJJ：<code>{html.escape(actual_payment_account or '未读取')}</code>"
+                                "\n\n⏳ 准备进入下一笔订单...",
+                                reply_markup=InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                                ]),
+                                parse_mode="HTML", disable_web_page_preview=True
+                            )
+                            await asyncio.sleep(0.3)
                             continue
 
                         try:
@@ -4168,15 +4214,49 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         _debug_log("[PDD] 完整 Traceback 结束")
                         pdd_error_text = str(pdd_error) or repr(pdd_error) or "未知异常（str 为空）"
                         pdd_error_results.append((order_no, pdd_error_text))
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⚠️ 第 {idx}/{len(order_numbers)} 笔订单拼多多订单管理查询异常，已跳过当前订单"
+                            f"\n订单号：<code>{html.escape(order_no)}</code>"
+                            f"\n原因：{html.escape(pdd_error_text)}"
+                            "\n\n⏳ 准备进入下一笔订单...",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        await asyncio.sleep(0.3)
                         continue
 
                     if pdd_result is None:
                         not_found_results.append(order_no)
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⚠️ 第 {idx}/{len(order_numbers)} 笔订单未找到"
+                            f"\n订单号：<code>{html.escape(order_no)}</code>"
+                            "\n已完成当前订单处理，准备进入下一笔...",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        await asyncio.sleep(0.3)
                         continue
 
                     # 拼多多命中后，不做收款号核对。
                     if pdd_result.get("status") == "失败":
                         failed_pdd_results.append(pdd_result)
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⚠️ 第 {idx}/{len(order_numbers)} 笔：拼多多订单失败"
+                            f"\n订单号：<code>{html.escape(order_no)}</code>"
+                            "\n不制作提现，准备进入下一笔订单...",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        await asyncio.sleep(0.3)
                         continue
 
                     try:
