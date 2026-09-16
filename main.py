@@ -2934,52 +2934,35 @@ async def _query_jj_order(single_order_no, task_id):
                         shipment = m.group(1)
                         break
 
-            # 失败订单：只回报失败，不进入收款号核对、充值或运单处理。
-            if is_failed and not is_success:
-                return {
-                    "status": "失败",
-                    "order_no": order_no or single_order_no,
-                    "recipient": "",
-                    "amount": amount or "",
-                    "shipment": "",
-                    "created": created or "",
-                    "created_dt": None,
-                    "completed": completed or "",
-                    "completed_dt": None,
-                    "payment_account": "",
-                    "payment_method": "",
-                    "payment_url": "",
-                    "raw_headers": headers,
-                    "raw_cells": cells,
-                }
-
-            # 成功订单才进入对应的出货平台详情页核对收款号。
+            # 出货管理只要找到订单，不论成功或失败，都要进入“收款帐户”详情页核对帳號。
+            # 失败订单没有運單號/配送时间是正常状态；这些字段保持空白，但仍然要继续制作本笔充值。
             payment_detail = await _extract_payment_account_from_order(
                 page, single_order_no, result_row=result_row
             )
             payment_account = payment_detail['account']
 
             if not created_dt:
-                raise Exception(f"JJ 成功订单无法读取【提交时间】：{created[:200]}")
+                raise Exception(f"JJ 出货订单无法读取【提交时间】：{created[:200]}")
             if not amount:
-                raise Exception("JJ 订单没有读取到交易金额。")
+                raise Exception("JJ 出货订单没有读取到交易金额。")
 
-            # 商城充值页面的“完成时间” = JJ 后台订单的“完成时间/成功时间”。
-            completed_dt = _parse_jj_datetime(completed)
-            if not completed_dt:
+            # 只有成功订单才要求完成时间；失败订单没有配送/完成时间是正常的。
+            completed_dt = _parse_jj_datetime(completed) if is_success else None
+            if is_success and not completed_dt:
                 raise Exception(f"JJ 成功订单无法读取【完成时间/成功时间】：{completed[:200]}")
 
             return {
-                "status": "成功",
+                "status": "成功" if is_success else "失败",
                 "order_no": order_no or single_order_no,
                 "recipient": _safe_manager_name(recipient_raw),
                 "amount": amount,
-                "shipment": shipment,
+                # 失败订单没有運單號/配送时间；保持空白。
+                "shipment": shipment if is_success else "",
                 "created": created,
                 "created_dt": created_dt,
-                "completed": completed,
-                "completed_dt": completed_dt,
-                "delivery": completed_dt,
+                "completed": completed if is_success else "",
+                "completed_dt": completed_dt if is_success else None,
+                "delivery": completed_dt if is_success else None,
                 "payment_account": payment_account,
                 "payment_method": payment_detail.get("method", ""),
                 "payment_url": payment_detail.get("url", ""),
@@ -3647,12 +3630,9 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         continue
 
                     if outbound_result is not None:
-                        # 出货管理命中 = 充值流程，成功订单必须核对收款号。
-                        if outbound_result.get("status") == "失败":
-                            # 出货管理命中后属于充值流程；如果该页出现失败状态，不能误报成拼多多失败。
-                            failed_outbound_results.append(outbound_result)
-                            continue
-
+                        # 出货管理命中 = 商户充值流程。
+                        # 成功订单有運單號/配送时间；失败订单没有这两项是正常的。
+                        # 两种状态都必须先核对收款帐户「帳號」，核对后制作当前订单，随后继续下一笔。
                         actual_payment_account = outbound_result.get("payment_account", "")
                         if not _payment_account_matches(expected_payment_account, actual_payment_account):
                             # 收款号不符只记录当前订单，必须继续制作下一笔订单。
@@ -3671,7 +3651,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                             await status_msg.edit_text(
                                 result_text +
                                 f"\n\n⏳ 第 {idx}/{len(order_numbers)} 笔：<b>出货管理命中</b>\n"
-                                "订单状态：<b>成功</b>，收款号核对通过，正在制作商户充值...",
+                                f"订单状态：<b>{html.escape(outbound_result.get('status') or '未知')}</b>，收款号核对通过，正在制作商户充值...",
                                 reply_markup=InlineKeyboardMarkup([
                                     [InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{task_id}")]
                                 ]),
@@ -3679,6 +3659,8 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                             )
                             recharge_result = await _single_recharge(final_account, outbound_result, parsed_info, task_id)
                             recharge_results.append((outbound_result, recharge_result))
+                            if outbound_result.get("status") == "失败":
+                                failed_outbound_results.append(outbound_result)
                         except Exception as recharge_error:
                             recharge_error_text = str(recharge_error) or repr(recharge_error)
                             recharge_error_results.append((order_no, recharge_error_text))
@@ -3800,7 +3782,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
 
                 if failed_outbound_results:
                     lines.append("")
-                    lines.append("⚠️ <b>出货订单失败：</b>")
+                    lines.append("⚠️ <b>出货订单状态为失败（已按失败订单流程制作充值）：</b>")
                     for jj_result in failed_outbound_results:
                         lines.append(f"<code>{html.escape(jj_result.get('order_no', '') or '未知订单号')}</code>")
 
