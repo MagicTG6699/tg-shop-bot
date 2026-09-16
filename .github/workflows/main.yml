@@ -10,12 +10,6 @@ on:
     - cron: '0 */3 * * *'
 
 
-# 允许 Workflow 删除旧的 Actions 运行记录
-permissions:
-  contents: read
-  actions: write
-
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -87,60 +81,3 @@ jobs:
 
         run: |
           python -u main.py
-
-
-      # ==========================================
-      # 自动清理旧的 GitHub Actions 运行记录
-      # ==========================================
-      #
-      # 规则：
-      # 1. 只处理已经 completed 的运行记录
-      # 2. 最近 10 笔已完成记录保留
-      # 3. 第 11 笔以及更旧的已完成记录删除
-      # 4. 正在运行中的记录不会删除
-      # 5. 不会影响 main.py / Telegram Bot / Secrets
-      #
-      - name: 清理旧的运行记录
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-        run: |
-          echo "=========================================="
-          echo "开始清理旧的 GitHub Actions 运行记录"
-          echo "=========================================="
-
-          echo "Workflow: ${{ github.workflow }}"
-          echo "Repository: ${{ github.repository }}"
-          echo ""
-
-          # 获取最近的已完成运行记录
-          RUNS=$(gh run list \
-            --repo "${{ github.repository }}" \
-            --workflow "${{ github.workflow }}" \
-            --limit 100 \
-            --json databaseId,status \
-            --jq '.[] | select(.status == "completed") | .databaseId')
-
-          COUNT=0
-
-          for RUN_ID in $RUNS; do
-            COUNT=$((COUNT + 1))
-
-            # 最近 10 笔已完成记录保留
-            if [ "$COUNT" -le 10 ]; then
-              echo "保留第 ${COUNT} 笔已完成记录：${RUN_ID}"
-            else
-              echo "删除旧记录：${RUN_ID}"
-
-              gh run delete "$RUN_ID" \
-                --repo "${{ github.repository }}" \
-                --confirm || true
-            fi
-          done
-
-          echo ""
-          echo "=========================================="
-          echo "清理完成"
-          echo "保留最近 10 笔已完成记录"
-          echo "=========================================="
