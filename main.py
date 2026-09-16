@@ -36,7 +36,7 @@ match = re.search(r'https?://[^\s\]\)\>\"\']+', raw_admin_url)
 BASE_ADMIN_URL = match.group(0).rstrip('/') if match else raw_admin_url.rstrip('/')
 
 # 单笔商城 / JJ 订单后台配置
-# v21：订单独立查询；成功/失败分流；收款号按详情表格读取；商城完成时间=JJ成功时间
+# v34：JJ 查询会话复用 + 暗锁/日期范围验证 + 查询异常自动重登恢复
 SINGLE_ADMIN_USER = os.environ.get("SINGLE_ADMIN_USER", "").strip()
 SINGLE_ADMIN_PASS = os.environ.get("SINGLE_ADMIN_PASS", "").strip()
 
@@ -120,6 +120,11 @@ class _ReusableBrowserSession:
         self.context = None
         self.browser = None
         self.playwright = None
+
+    async def reset(self, url, username, password, task_id=None):
+        """重置当前浏览器会话并重新登录。只用于查询阶段的恢复，避免坏页面状态影响下一笔。"""
+        await self.close()
+        return await self.start(url, username, password, task_id=task_id)
 
 # 【建店专用排队锁】：同时只允许 1 个建店任务在后台运行，后续建店请求自动排队
 BUILD_SHOP_SEMAPHORE = asyncio.Semaphore(1)
@@ -1265,8 +1270,11 @@ async def _jj_open_outbound(page):
 
 
 async def _jj_unlock_search_range(page):
-    """解开 JJ 出货管理的日期范围限制。"""
-    # 页面截图对应的锁按钮容器。优先点击容器，避免直接点隐藏 icon。
+    """解开 JJ 搜索日期范围暗锁，并验证真的已经解锁。
+
+    JJ 页面截图确认锁头位于 `.toggle-order-search-days-btn-placeholder`。
+    不能只点击后就认为成功；这里会等待图标/DOM 状态真正变成 unlock。
+    """
     selectors = [
         ".toggle-order-search-days-btn-placeholder",
         ".toggle-search-days-btn-placeholder",
@@ -1274,38 +1282,99 @@ async def _jj_unlock_search_range(page):
         ".lock-btn",
         "i.fa-lock.lock-btn",
     ]
+
+    def _norm_class(value):
+        return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+    async def unlocked_state(container):
+        # 直接检查解锁 icon。
+        for sel in [".fa-unlock", "i.fa-unlock", ".unlock-btn"]:
+            try:
+                loc = container.locator(sel).first
+                if await loc.count():
+                    return True
+            except Exception:
+                pass
+        # 再检查容器/子元素 class 与 HTML，兼容不同 FontAwesome/模板版本。
+        try:
+            cls = _norm_class(await container.get_attribute("class"))
+            if "unlock" in cls and "lock" not in cls.replace("unlock", ""):
+                return True
+            outer = (await container.evaluate("el => el.outerHTML") or "").lower()
+            if "fa-unlock" in outer or "unlock-btn" in outer:
+                return True
+        except Exception:
+            pass
+        return False
+
+    # 先确认页面是否已经是解锁状态。
     for selector in selectors:
         loc = page.locator(selector).first
         try:
             if await loc.count() and await loc.is_visible():
-                cls = (await loc.get_attribute("class") or "").lower()
-                if "unlock" in cls:
-                    return
-                await loc.click(force=True)
-                await page.wait_for_timeout(200)
-                return
+                if await unlocked_state(loc):
+                    _debug_log("[JJ] 暗锁已经是解锁状态")
+                    return True
         except Exception:
             continue
 
-    # 如果已经是解锁状态就不用处理。
-    for selector in [".unlock-btn", "i.fa-unlock", ".fa-unlock"]:
+    # 如果没有容器，直接检查全页 unlock 图标。
+    try:
+        for selector in [".fa-unlock", "i.fa-unlock", ".unlock-btn"]:
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                _debug_log("[JJ] 页面已经存在解锁图标")
+                return True
+    except Exception:
+        pass
+
+    # 找到锁头后只点击一次，然后轮询验证，避免“点击了但页面还没完成切换”。
+    clicked_container = None
+    for selector in selectors:
         loc = page.locator(selector).first
         try:
             if await loc.count() and await loc.is_visible():
-                return
+                clicked_container = loc
+                await loc.click(force=True)
+                _debug_log(f"[JJ] 已点击暗锁：{selector}")
+                break
+        except Exception as e:
+            _debug_log(f"[JJ] 点击暗锁失败 {selector}: {e!r}")
+
+    if clicked_container is None:
+        return False
+
+    # 最多等待约 3 秒，让前端 JS 完成锁头切换。
+    for _ in range(30):
+        await page.wait_for_timeout(100)
+        try:
+            if await unlocked_state(clicked_container):
+                _debug_log("[JJ] 暗锁已确认解锁")
+                return True
+        except Exception:
+            pass
+        try:
+            # 某些模板点击后会替换整个节点，所以重新找全页 unlock。
+            for selector in [".fa-unlock", "i.fa-unlock", ".unlock-btn"]:
+                loc = page.locator(selector).first
+                if await loc.count() and await loc.is_visible():
+                    _debug_log("[JJ] 暗锁已确认解锁（节点已替换）")
+                    return True
         except Exception:
             pass
 
+    _debug_log("[JJ] 点击暗锁后未能确认 unlock 状态")
+    return False
+
 
 async def _jj_set_one_year_date(page):
-    """设置 JJ 建立日期范围为最近一年。兼容不同版本页面的 ID/name。"""
+    """设置 JJ 建立日期范围为最近一年，并验证输入值确实写入成功。"""
     from datetime import timezone
     tz8 = timezone(timedelta(hours=8))
     now = datetime.now(tz8)
     start = now - timedelta(days=365)
 
     async def find_input(selectors):
-        # 先查主页面，再查 iframe；同时兼容截图中的精确 ID、name 和旧版字段。
         contexts = [page] + list(page.frames)
         for ctx in contexts:
             for selector in selectors:
@@ -1331,13 +1400,9 @@ async def _jj_set_one_year_date(page):
     ])
 
     if start_input is None or end_input is None:
-        # 不要因为日期控件的前端版本差异直接让整笔订单失败。
-        # 返回 False，由上层继续使用订单号查询；若控件存在则一定设置一年范围。
+        _debug_log("[JJ] 找不到建立日期范围输入框，无法验证一年范围")
         return False
 
-    # JJ 這個搜尋頁的日期欄位是一般文字欄位，實際頁面顯示格式為
-    # YYYY/MM/DD HH:MM。不要把 ISO datetime 直接塞進去，否則 Rails/Ransack
-    # 可能會把條件解析成空值或錯誤格式。
     start_value = start.strftime("%Y/%m/%d %H:%M")
     end_value = now.strftime("%Y/%m/%d %H:%M")
 
@@ -1353,16 +1418,58 @@ async def _jj_set_one_year_date(page):
             value,
         )
 
+    def norm_dt(v):
+        return re.sub(r"[^0-9]", "", v or "")[:12]
+
     await set_value(start_input, start_value)
     await set_value(end_input, end_value)
-    await page.wait_for_timeout(200)
+
+    # 给日期控件一点时间处理 input/change 事件。
+    for _ in range(10):
+        await page.wait_for_timeout(100)
+        try:
+            actual_start = await start_input.input_value()
+            actual_end = await end_input.input_value()
+            if norm_dt(actual_start) == norm_dt(start_value) and norm_dt(actual_end) == norm_dt(end_value):
+                _debug_log(f"[JJ] 建立日期已验证：{actual_start!r} -> {actual_end!r}")
+                return True
+        except Exception:
+            pass
+
     try:
         actual_start = await start_input.input_value()
         actual_end = await end_input.input_value()
-        _debug_log(f"[JJ] 建立日期已設定：{actual_start!r} -> {actual_end!r}")
     except Exception:
-        pass
-    return True
+        actual_start, actual_end = "", ""
+    _debug_log(
+        f"[JJ] 建立日期验证失败：目标={start_value!r}->{end_value!r}，实际={actual_start!r}->{actual_end!r}"
+    )
+    return False
+
+
+async def _jj_prepare_search_range(page):
+    """统一准备 JJ 搜索范围：解暗锁 + 最近一年日期，并在失败时重载页面重试一次。"""
+    unlocked = await _jj_unlock_search_range(page)
+    date_ok = await _jj_set_one_year_date(page)
+    if date_ok:
+        return True
+
+    # 日期没有真正写进去，而且暗锁状态也无法确认时，不直接再点一次。
+    # 因为如果第一次点击其实已经成功，只是图标切换慢，第二次点击可能反而重新上锁。
+    # 这里改为刷新当前 JJ 页面，让页面回到初始锁定状态，再完整执行一次。
+    if not unlocked:
+        _debug_log("[JJ] 暗锁/日期验证失败，刷新当前 JJ 页面后完整重试一次")
+        try:
+            await page.reload(wait_until="domcontentloaded")
+            await page.wait_for_timeout(300)
+            retry_unlocked = await _jj_unlock_search_range(page)
+            retry_date_ok = await _jj_set_one_year_date(page)
+            if retry_unlocked and retry_date_ok:
+                return True
+        except Exception as e:
+            _debug_log(f"[JJ] 刷新后重新准备搜索范围失败: {e!r}")
+
+    return False
 
 
 async def _jj_find_order_input(page, kind):
@@ -2304,10 +2411,9 @@ async def _jj_query_pdd_order(single_order_no, task_id, session=None):
         await _jj_open_pdd(page)
         _debug_log(f"[PDD] 已进入拼多多页面；URL={page.url}")
         # 拼多多订单管理同样解暗锁，并把建立日期范围拉到最近一年。
-        await _jj_unlock_search_range(page)
-        _debug_log("[PDD] 搜索日期暗锁处理完成")
-        await _jj_set_one_year_date(page)
-        _debug_log("[PDD] 已设置最近一年日期范围")
+        if not await _jj_prepare_search_range(page):
+            raise Exception("JJ 拼多多订单管理无法确认暗锁/最近一年日期范围已生效。")
+        _debug_log("[PDD] 搜索日期暗锁与最近一年范围已验证")
 
         # 拼多多页面只有一个“订单号”搜索框：只搜索一次。
         # 不再套用出货管理的“平台订单号 / 商户订单号”双字段逻辑。
@@ -3580,6 +3686,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def _jj_query_with_recovery(query_func, order_no, task_id, session):
+    """查询阶段专用恢复：首次遇到非“找不到订单”异常时，重建 JJ Session 后重试一次。
+
+    这是只读查询恢复，不用于充值/提现提交，避免表单已送出后重复制作。
+    """
+    try:
+        return await query_func(order_no, task_id, session=session)
+    except JJOrderNotFound:
+        raise
+    except Exception as first_error:
+        _debug_log(f"[JJ] 查询异常，准备重建 Session 后重试一次：order={order_no}, error={first_error!r}")
+        try:
+            await session.reset(JJ_ADMIN_URL, JJ_ADMIN_USER, JJ_ADMIN_PASS, task_id=task_id)
+        except Exception as reset_error:
+            raise first_error from reset_error
+        return await query_func(order_no, task_id, session=session)
+
+
 # 建店 Worker 包装（含排队锁控制）
 async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False):
     try:
@@ -3646,7 +3770,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                     # A. 先查 JJ 出货管理
                     # --------------------------------------------------
                     try:
-                        outbound_result = await _query_jj_order(order_no, task_id, session=jj_session)
+                        outbound_result = await _jj_query_with_recovery(_query_jj_order, order_no, task_id, jj_session)
                     except JJOrderNotFound as outbound_not_found:
                         # 只有“出货管理真正没有找到订单”才允许分流到拼多多。
                         _debug_log(f"[出货] 确认未找到订单，才分流 PDD: order={order_no}")
@@ -3708,7 +3832,7 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                     # B. 出货管理没找到 → 查 JJ 拼多多订单管理
                     # --------------------------------------------------
                     try:
-                        pdd_result = await _jj_query_pdd_order(order_no, task_id, session=jj_session)
+                        pdd_result = await _jj_query_with_recovery(_jj_query_pdd_order, order_no, task_id, jj_session)
                     except Exception as pdd_error:
                         # PDD 当前订单查询异常也不应阻断后面的订单。
                         _debug_log(f"[PDD] 查询异常，当前订单记异常并继续下一笔: order={order_no}, repr={pdd_error!r}")
