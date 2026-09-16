@@ -2425,12 +2425,28 @@ async def _jj_query_pdd_order(single_order_no, task_id, session=None):
         )
         headers, cells = await _extract_jj_row(page, single_order_no)
         result_row = await _locate_jj_result_row(page, single_order_no)
+
+        # 有些 JJ 页面结果行已经出现，但通用解析器暂时拿不到 td；
+        # 不能因此误报“订单未找到”。只要已经精确定位到目标行，就以目标行为准。
+        if result_row is not None and await result_row.count() and not cells:
+            try:
+                direct_tds = result_row.locator(":scope > td")
+                direct_count = await direct_tds.count()
+                if direct_count:
+                    cells = [_clean_text_value(await direct_tds.nth(i).inner_text()) for i in range(direct_count)]
+                    table = result_row.locator("xpath=ancestor::table[1]").first
+                    if await table.count():
+                        ths = table.locator("thead > tr > th")
+                        headers = [_normalize_header(await ths.nth(i).inner_text()) for i in range(await ths.count())]
+            except Exception:
+                pass
+
         _debug_log(
             f"[PDD] 唯一【订单号】查询结果: cells={len(cells)}, "
             f"result_row={bool(result_row and await result_row.count()) if result_row is not None else False}"
         )
 
-        if not cells:
+        if not cells and (result_row is None or not await result_row.count()):
             _debug_log(f"[PDD] 订单未找到: {single_order_no}")
             return None
 
@@ -2846,6 +2862,16 @@ async def _query_jj_order(single_order_no, task_id, session=None):
                 except Exception as e:
                     _debug_log(f"[出货] 其他订单号目标结果行读取失败：{e!r}")
 
+        # 搜索后给 JJ 前端 AJAX/表格渲染一个短暂轮询窗口，避免偶发“页面已经搜到，
+        # 但 Playwright 恰好在结果尚未挂载时就判定不存在”。
+        if result_row is None or not await result_row.count():
+            for _ in range(20):
+                await page.wait_for_timeout(250)
+                result_row = await _locate_jj_result_row(page, single_order_no)
+                if result_row is not None and await result_row.count():
+                    _debug_log(f"[出货] 延迟轮询后找到目标订单：{single_order_no}")
+                    break
+
         # 只有真正找不到目标结果行，才认定 JJ 出货订单不存在。
         if result_row is None or not await result_row.count():
             raise JJOrderNotFound(f"JJ 找不到订单：{single_order_no}")
@@ -3120,35 +3146,65 @@ async def _query_jj_order(single_order_no, task_id, session=None):
         if own_session:
             await session.close()
 async def _select_select2_by_text(page, native_select, target_text, label_name="下拉框"):
-    """选择 Select2 动态下拉：先尝试原生 option，再打开 Select2 搜索并点击匹配结果。"""
+    """稳健选择 Select2 商户：支持原生 option、AJAX、搜索延迟，并最终验证真的选中。"""
     target = _clean_text_value(str(target_text or ""))
     if not target:
         raise Exception(f"{label_name}目标值为空。")
 
-    # 1) 原生 select option（Select2 背后仍通常保留这个 select）
-    try:
-        options = native_select.locator("option")
-        for i in range(await options.count()):
-            opt = options.nth(i)
-            value = await opt.get_attribute("value")
-            text = _clean_text_value(await opt.inner_text())
-            hay = f"{text} {value or ''}".lower()
-            if value and (target.lower() == text.lower() or target.lower() in hay):
-                try:
-                    await native_select.select_option(value=value)
-                    await native_select.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
-                    await page.wait_for_timeout(200)
-                    return True
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    def norm(v):
+        return re.sub(r"\s+", "", (v or "")).lower()
 
-    # 2) 找 native select 对应的 Select2 container 并打开
+    async def verify_selected():
+        try:
+            value = await native_select.input_value()
+        except Exception:
+            value = ""
+        if not value:
+            return False
+        try:
+            selected = native_select.locator("option:checked").first
+            if await selected.count():
+                text = _clean_text_value(await selected.inner_text())
+                if target.lower() in text.lower() or norm(target) in norm(text):
+                    return True
+        except Exception:
+            pass
+        # 有些 Select2 option 没有稳定文字，只要 value 已产生也视为候选成功；
+        # 但必须确保不是空值。
+        return bool(value)
+
+    async def scan_options():
+        try:
+            options = native_select.locator("option")
+            for i in range(await options.count()):
+                opt = options.nth(i)
+                value = await opt.get_attribute("value")
+                text = _clean_text_value(await opt.inner_text())
+                hay = f"{text} {value or ''}"
+                if value and (target.lower() == text.lower() or target.lower() in hay.lower() or norm(target) == norm(text)):
+                    try:
+                        await native_select.select_option(value=value)
+                        await native_select.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
+                        await page.wait_for_timeout(300)
+                        if await verify_selected():
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return False
+
+    # 第一次先检查当前已经加载的 option。
+    if await scan_options():
+        return True
+
+    # 找 Select2 容器。
     container = None
     candidates = [
         native_select.locator("xpath=following-sibling::span[contains(@class,'select2-container')]").first,
+        native_select.locator("xpath=following-sibling::*[contains(@class,'select2-container')]").first,
         native_select.locator("xpath=..//span[contains(@class,'select2-container')]").first,
+        native_select.locator("xpath=..//*[contains(@class,'select2-container')]").first,
     ]
     for c in candidates:
         try:
@@ -3158,60 +3214,103 @@ async def _select_select2_by_text(page, native_select, target_text, label_name="
         except Exception:
             pass
 
-    if container is not None:
+    sid = None
+    try:
+        sid = await native_select.get_attribute("id")
+    except Exception:
+        pass
+
+    # 最多重试 3 次：后台 AJAX 商户列表有明显延迟时，第一次打开可能还没有结果。
+    last_detail = ""
+    for attempt in range(3):
         try:
-            await container.click()
-        except Exception:
-            pass
-    else:
-        # 兜底：通过 select 的 select2 id / 相邻容器定位
-        try:
-            sid = await native_select.get_attribute("id")
-            if sid:
+            if container is not None:
+                await container.click(force=True)
+            elif sid:
                 c = page.locator(f"span.select2-container[aria-labelledby='select2-{sid}-container']").first
                 if await c.count():
-                    await c.click()
+                    await c.click(force=True)
+                else:
+                    # Select2 标准容器的最后兜底。
+                    c = page.locator(".select2-container").last
+                    if await c.count():
+                        await c.click(force=True)
+            else:
+                c = page.locator(".select2-container").last
+                if await c.count():
+                    await c.click(force=True)
+        except Exception as e:
+            last_detail = repr(e)
+
+        # 等待 Select2 搜索框出现；商户 AJAX 初始化本身可能需要一点时间。
+        search = page.locator(".select2-container--open input.select2-search__field, .select2-container--open input.select2-search_field, .select2-container--open input[type='search']").last
+        try:
+            await search.wait_for(state="visible", timeout=7000)
+        except Exception:
+            try:
+                search = page.locator("input.select2-search__field, input.select2-search_field").last
+                await search.wait_for(state="visible", timeout=3000)
+            except Exception as e:
+                last_detail = repr(e)
+                continue
+
+        try:
+            # type 比 fill 更接近真人输入，能触发旧版 Select2 的 keyup/change 监听。
+            await search.fill("")
+            await search.type(target, delay=35)
+        except Exception as e:
+            last_detail = repr(e)
+            continue
+
+        # AJAX 搜索结果轮询最长约 6 秒；不再只等 400ms。
+        for _ in range(30):
+            await page.wait_for_timeout(200)
+            if await scan_options():
+                return True
+
+            result_selectors = [
+                ".select2-container--open .select2-results__option",
+                ".select2-container--open li[role='option']",
+                ".select2-results__option",
+            ]
+            found_any = False
+            for sel in result_selectors:
+                results = page.locator(sel)
+                try:
+                    count = await results.count()
+                except Exception:
+                    continue
+                for i in range(count):
+                    item = results.nth(i)
+                    try:
+                        if not await item.is_visible():
+                            continue
+                        txt = _clean_text_value(await item.inner_text())
+                        if not txt or "正在搜尋" in txt or "Searching" in txt:
+                            continue
+                        found_any = True
+                        if target.lower() in txt.lower() or txt.lower() in target.lower() or norm(target) in norm(txt):
+                            await item.click(force=True)
+                            await page.wait_for_timeout(500)
+                            if await verify_selected():
+                                return True
+                    except Exception:
+                        continue
+            if found_any:
+                last_detail = "已有搜索结果，但没有匹配到目标商户"
+
+        # 这一轮没有成功，关闭下拉后重新打开，给 Select2/AJAX 一个干净状态。
+        try:
+            await search.press("Escape")
         except Exception:
             pass
+        await page.wait_for_timeout(300)
 
-    await page.wait_for_timeout(200)
+    # 最后一次检查：AJAX 结果可能已经插入 option，但页面事件晚了一点。
+    if await scan_options():
+        return True
 
-    search = page.locator("input.select2-search__field, input.select2-search_field").last
-    try:
-        await search.wait_for(state="visible", timeout=5000)
-    except Exception:
-        search = page.locator(".select2-container--open input[type='search'], .select2-container--open input.select2-search__field").last
-        await search.wait_for(state="visible", timeout=5000)
-
-    await search.fill(target)
-    await page.wait_for_timeout(400)
-
-    # 结果只在当前打开的 Select2 下拉里找，避免点到别的字段。
-    result_selectors = [
-        ".select2-container--open .select2-results__option",
-        ".select2-results__option",
-        ".select2-container--open li[role='option']",
-    ]
-    for sel in result_selectors:
-        results = page.locator(sel)
-        try:
-            count = await results.count()
-        except Exception:
-            continue
-        for i in range(count):
-            item = results.nth(i)
-            try:
-                if not await item.is_visible():
-                    continue
-                txt = _clean_text_value(await item.inner_text())
-                if target.lower() in txt.lower() or txt.lower() in target.lower():
-                    await item.click()
-                    await page.wait_for_timeout(200)
-                    return True
-            except Exception:
-                pass
-
-    raise Exception(f"{label_name}找不到【{target}】。")
+    raise Exception(f"{label_name}找不到【{target}】。{last_detail}" if last_detail else f"{label_name}找不到【{target}】。")
 
 
 def _payment_account_from_info(info):
