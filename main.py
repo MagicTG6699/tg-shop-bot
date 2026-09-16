@@ -69,6 +69,69 @@ SKIN_OPTIONS = {
 }
 
 
+def _extract_order_numbers(text: str):
+    """提取消息里的 JJ 订单号，最多 5 笔。
+
+    触发方式：
+    1. 单笔 / 單筆 : 订单号（可同一行放多个，用逗号、空格、分号等分隔）
+    2. 订单号 / 訂單號 / 平台订单号等字段
+    3. 消息中直接出现 UUID 格式订单号
+    """
+    clean = re.sub(r'mailto:', '', text or '', flags=re.IGNORECASE)
+    clean = re.sub(r'https?://[^\s]+', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'<[^>]+>', '', clean)
+
+    found = []
+
+    def add(value):
+        value = (value or '').strip().strip('`<>[](){}"\'“”‘’')
+        if not value:
+            return
+        # 优先从一段文字中抓 UUID；如果没有 UUID，再接受单个常规订单号 token。
+        uuids = re.findall(
+            r'(?i)(?<![0-9a-f])'
+            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+            r'(?![0-9a-f])', value
+        )
+        if uuids:
+            for x in uuids:
+                if x not in found:
+                    found.append(x)
+            return
+
+        # 同一字段支持多个订单号，避免把整段说明文字当成订单号。
+        parts = re.split(r'[\s,，;；|]+', value)
+        for part in parts:
+            part = part.strip().strip('`<>[](){}"\'“”‘’')
+            if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{7,127}', part):
+                if part not in found:
+                    found.append(part)
+
+    # 带标签的订单号：最可靠。
+    for line in clean.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(
+            r'(?i)^(?:单笔|單筆|订单号|訂單號|订单号码|訂單號碼|平台订单号|平台訂單號|平台订单|平台訂單)'
+            r'\s*[:：=]\s*(.+?)\s*$', line
+        )
+        if m:
+            add(m.group(1))
+
+    # 直接出现 UUID 也视为订单号，即使没有“单笔/订单号”文字。
+    uuid_hits = re.findall(
+        r'(?i)(?<![0-9a-f])'
+        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+        r'(?![0-9a-f])', clean
+    )
+    for x in uuid_hits:
+        if x not in found:
+            found.append(x)
+
+    return found
+
+
 # 2. 文本解析与格式校验（全面优化简繁体兼容与格式判断）
 def parse_and_validate_text(text: str) -> tuple[dict, str]:
     info = {}
@@ -294,14 +357,17 @@ def parse_and_validate_text(text: str) -> tuple[dict, str]:
         if not info.get("branch_name") and "支行" not in empty_fields:
             errors.append("• 缺少【支行名称】！")
 
-    # 单笔订单号：只有消息包含“单笔”字段时才走单笔商城
-    single_order_match = re.search(r'(?im)^[ \t]*(?:单笔|單筆)[ \t]*[:：][ \t]*(.+?)[ \t]*$', clean_text)
-    if single_order_match:
-        single_order_no = single_order_match.group(1).strip()
-        if single_order_no:
-            info["single_order_no"] = single_order_no
-        else:
-            errors.append("• 【单笔】订单号为空！")
+    # 单笔订单号：
+    # 不再要求一定出现“单笔”。只要检测到订单号，就自动走单笔商城。
+    order_numbers = _extract_order_numbers(clean_text)
+    if len(order_numbers) > 5:
+        errors.append("• 已超过单笔最大笔数")
+    elif order_numbers:
+        info["single_order_nos"] = order_numbers
+        # 保留旧字段，兼容其他旧流程。
+        info["single_order_no"] = order_numbers[0]
+    elif re.search(r'(?im)^\s*(?:单笔|單筆)\s*[:：=]\s*$', clean_text):
+        errors.append("• 【单笔】订单号为空！")
 
     if errors:
         error_summary = "❌ <b>建店失败！检测到以下输入错误：</b>\n\n" + "\n".join(errors)
@@ -1441,6 +1507,121 @@ def _cell_by_header(headers, cells, keywords):
     return ""
 
 
+async def _extract_payment_account_from_order(page, order_no):
+    """进入 JJ 订单对应的“出货平台/收款帐户”详情页，读取真实收款号。
+
+    不按“淘宝/京东/数字”等平台文字判断，因为平台种类和字体可能变化；
+    统一寻找该订单行里的 /payment_settings/ 链接。
+    """
+    row = page.locator(f"xpath=//tr[@id='guest_payment_order_{order_no}']").first
+    if not await row.count():
+        # 兼容 short-uuid DOM。
+        node = page.locator(f"span.short-uuid[data-origin-uuid='{order_no}']").first
+        if await node.count():
+            row = node.locator("xpath=ancestor::tr[1]").first
+
+    if not await row.count():
+        raise Exception(f"订单【{order_no}】找不到对应结果行，无法核对收款号。")
+
+    link = row.locator("a[href*='/payment_settings/']").first
+    if not await link.count():
+        # 截图确认“出货平台”在第 6 个外层 td；平台文字可能不同，仍以链接 href 为准。
+        cells = row.locator(":scope > td")
+        if await cells.count() > 6:
+            link = cells.nth(6).locator("a[href]").first
+
+    if not await link.count():
+        raise Exception(f"订单【{order_no}】找不到【出货平台】详情链接，无法核对收款号。")
+
+    href = await link.get_attribute("href")
+    if not href:
+        raise Exception(f"订单【{order_no}】的出货平台链接地址为空。")
+
+    # Playwright 对相对地址需要补当前站点 origin。
+    if href.startswith('/'):
+        origin = re.match(r'^(https?://[^/]+)', page.url)
+        href = (origin.group(1) if origin else '') + href
+    elif not re.match(r'^https?://', href, re.I):
+        base = re.sub(r'/[^/]*$', '/', page.url)
+        href = base + href.lstrip('/')
+
+    await page.goto(href, wait_until="domcontentloaded")
+    await page.wait_for_timeout(300)
+
+    # 详情页结构为“左边字段名称、右边字段值”。
+    account_labels = {
+        '帳號', '账号', '帳户', '账户', '收款号', '收款號',
+        '收款账号', '收款帳號', '收款帐号', '收款帳號',
+    }
+    payment_account = ''
+    payment_method = ''
+
+    rows = page.locator('table tbody tr')
+    for i in range(await rows.count()):
+        r = rows.nth(i)
+        try:
+            cells = r.locator('th, td')
+            count = await cells.count()
+            if count < 2:
+                continue
+            label = _clean_text_value(await cells.nth(0).inner_text())
+            value = _clean_text_value(await cells.nth(1).inner_text())
+            label_norm = re.sub(r'\s+', '', label)
+            if label_norm in {'收款方式', '收款方法'}:
+                payment_method = value
+            if label_norm in account_labels:
+                payment_account = value
+                break
+        except Exception:
+            continue
+
+    if not payment_account:
+        # 兼容没有 th/td 标准结构的版本：用“帳號/账号”文字附近的 td。
+        for label in ['帳號', '账号', '收款号', '收款號']:
+            loc = page.get_by_text(label, exact=True).first
+            try:
+                if await loc.count():
+                    parent = loc.locator('xpath=..').first
+                    vals = parent.locator('td, span, div')
+                    for j in range(await vals.count()):
+                        v = _clean_text_value(await vals.nth(j).inner_text())
+                        if v and v != label:
+                            payment_account = v
+                            break
+                if payment_account:
+                    break
+            except Exception:
+                continue
+
+    if not payment_account:
+        raise Exception(f"订单【{order_no}】的收款平台详情页找不到【帳號/收款号】。")
+
+    return {
+        'account': payment_account,
+        'method': payment_method,
+        'url': page.url,
+    }
+
+
+def _normalize_payment_account(value):
+    value = _clean_text_value(str(value or '')).strip()
+    if not value:
+        return ''
+    # 邮箱/账号通常不区分大小写；银行号/手机号则统一只比较数字。
+    if '@' in value:
+        return value.lower().replace(' ', '')
+    digits = re.sub(r'\D', '', value)
+    if digits:
+        return digits
+    return re.sub(r'\s+', '', value).lower()
+
+
+def _payment_account_matches(expected, actual):
+    a = _normalize_payment_account(expected)
+    b = _normalize_payment_account(actual)
+    return bool(a and b and a == b)
+
+
 async def _query_jj_order(single_order_no, task_id):
     if not JJ_ADMIN_URL:
         raise Exception("未检测到环境变量 JJ_ADMIN_URL！")
@@ -1719,6 +1900,11 @@ async def _query_jj_order(single_order_no, task_id):
                         shipment = m.group(1)
                         break
 
+            # 【新增】无论成功/失败，都进入订单对应的出货平台详情页核对收款号。
+            # 淘宝、京东、数字等平台名称可以不同，但详情链接统一走 /payment_settings/。
+            payment_detail = await _extract_payment_account_from_order(page, single_order_no)
+            payment_account = payment_detail['account']
+
             if is_success and not created_dt:
                 raise Exception(f"JJ 成功订单无法读取【提交时间】：{created[:200]}")
             if not amount:
@@ -1735,6 +1921,9 @@ async def _query_jj_order(single_order_no, task_id):
                 "created": created or completed,
                 "created_dt": created_dt,
                 "delivery": delivery,
+                "payment_account": payment_account,
+                "payment_method": payment_detail.get("method", ""),
+                "payment_url": payment_detail.get("url", ""),
                 "raw_headers": headers,
                 "raw_cells": cells,
             }
@@ -2290,7 +2479,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "数字", "數字", "数位", "數位", "支付宝", "支付寶", "银行", "銀行",
         "单笔", "單筆"
     ]
-    if not any(k in user_text for k in trigger_keywords):
+    # 有“单笔/订单号”或直接出现 UUID 订单号，都自动进入单笔商城。
+    has_order_number = bool(_extract_order_numbers(user_text))
+    if not any(k in user_text for k in trigger_keywords) and not has_order_number:
         return
 
     parsed_info, error_msg = parse_and_validate_text(user_text)
@@ -2299,7 +2490,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(error_msg, parse_mode="HTML", disable_web_page_preview=True)
         return
 
-    is_single = bool(parsed_info.get("single_order_no"))
+    is_single = bool(parsed_info.get("single_order_nos") or parsed_info.get("single_order_no"))
 
     task_id = f"{update.message.chat_id}_{update.message.message_id}"
     keyboard = InlineKeyboardMarkup([
@@ -2357,46 +2548,84 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                     parse_mode="HTML", disable_web_page_preview=True
                 )
 
+                order_numbers = parsed_info.get("single_order_nos") or [parsed_info["single_order_no"]]
+                expected_payment_account = _payment_account_from_info(parsed_info)
+                jj_results = []
+
                 try:
-                    jj_result = await _query_jj_order(parsed_info["single_order_no"], task_id)
+                    for idx, order_no in enumerate(order_numbers, 1):
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n⏳ 正在查询第 {idx}/{len(order_numbers)} 笔订单：<code>{html.escape(order_no)}</code>",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("⏳ 正在查询订单...", callback_data="ignore")]
+                            ]),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        jj_result = await _query_jj_order(order_no, task_id)
+                        jj_results.append(jj_result)
+
+                        actual_payment_account = jj_result.get("payment_account", "")
+                        if not _payment_account_matches(expected_payment_account, actual_payment_account):
+                            expected_display = html.escape(expected_payment_account or "未读取")
+                            actual_display = html.escape(actual_payment_account or "未读取")
+                            await status_msg.edit_text(
+                                result_text +
+                                "\n\n❌ <b>收款号与订单号不符</b>" +
+                                f"\n订单号：<code>{html.escape(order_no)}</code>" +
+                                f"\n输入收款号：<code>{expected_display}</code>" +
+                                f"\nJJ收款号：<code>{actual_display}</code>",
+                                reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
+                                parse_mode="HTML", disable_web_page_preview=True
+                            )
+                            return
                 except Exception as jj_error:
                     safe_jj = html.escape(str(jj_error))
                     await status_msg.edit_text(
-                        result_text + f"\n\n⚠️ <b>JJ 订单查询失败</b>\n<code>{safe_jj}</code>",
+                        result_text + f"\n\n⚠️ <b>订单查询失败</b>\n<code>{safe_jj}</code>",
                         reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
                         parse_mode="HTML", disable_web_page_preview=True
                     )
                     return
 
-                status_label = jj_result["status"]
+                # 所有订单都核对通过后才开始充值，避免其中一笔收款号不一致却继续入账。
                 await status_msg.edit_text(
-                    result_text + f"\n\n⏳ JJ订单状态：<b>{html.escape(status_label)}</b>，正在自动填写充值...",
+                    result_text +
+                    f"\n\n⏳ <b>{len(jj_results)} 笔订单已全部核对通过</b>，正在自动填写充值...",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("⏳ 正在处理充值...", callback_data="ignore")]
                     ]),
                     parse_mode="HTML", disable_web_page_preview=True
                 )
 
-                try:
-                    recharge_result = await _single_recharge(final_account, jj_result, parsed_info, task_id)
-                except Exception as recharge_error:
-                    safe_recharge = html.escape(str(recharge_error))
-                    await status_msg.edit_text(
-                        result_text +
-                        f"\n\nJJ订单状态：<b>{html.escape(status_label)}</b>"
-                        f"\n❌ <b>新增充值失败</b>\n<code>{safe_recharge}</code>",
-                        reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
-                        parse_mode="HTML", disable_web_page_preview=True
-                    )
-                    return
+                recharge_results = []
+                for idx, jj_result in enumerate(jj_results, 1):
+                    status_label = jj_result["status"]
+                    try:
+                        recharge_result = await _single_recharge(final_account, jj_result, parsed_info, task_id)
+                    except Exception as recharge_error:
+                        safe_recharge = html.escape(str(recharge_error))
+                        await status_msg.edit_text(
+                            result_text +
+                            f"\n\n第 {idx}/{len(jj_results)} 笔订单：<b>{html.escape(jj_result.get('order_no', order_numbers[idx-1]))}</b>" +
+                            f"\n订单状态：<b>{html.escape(status_label)}</b>" +
+                            f"\n❌ <b>新增充值失败</b>\n<code>{safe_recharge}</code>",
+                            reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
+                            parse_mode="HTML", disable_web_page_preview=True
+                        )
+                        return
+                    recharge_results.append((jj_result, recharge_result))
 
-                final_text = (
-                    result_text + "\n\n"
-                    f"JJ订单状态：<b>{html.escape(status_label)}</b>\n"
-                    f"充值结果：<b>{html.escape(recharge_result)}</b>"
-                )
+                lines = [result_text, "", f"订单核对：<b>{len(jj_results)} 笔全部通过</b>"]
+                for idx, (jj_result, recharge_result) in enumerate(recharge_results, 1):
+                    lines.append(
+                        f"第 {idx} 笔：<code>{html.escape(jj_result.get('order_no', order_numbers[idx-1]))}</code> "
+                        f"状态：<b>{html.escape(jj_result['status'])}</b>，"
+                        f"充值结果：<b>{html.escape(recharge_result)}</b>"
+                    )
+
                 await status_msg.edit_text(
-                    final_text,
+                    "\n".join(lines),
                     reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
                     parse_mode="HTML", disable_web_page_preview=True
                 )
@@ -2514,12 +2743,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=loading_keyboard)
 
         try:
-            await update_shop_skin(account, new_skin_name)
+            await update_shop_skin(account, new_skin_name, backend=backend)
             keyboard = build_main_keyboard(account, new_skin_name, backend=backend)
             await query.edit_message_reply_markup(reply_markup=keyboard)
         except Exception as e:
             print(f"⚠️ 商城界面切换失败 [{backend}] {account} -> {new_skin_name}: {e}")
-            keyboard = build_skin_options_keyboard(account, backend=backend)
+            keyboard = build_skin_options_keyboard(account, current_skin=new_skin_name, backend=backend)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             try:
                 await query.answer(f"⚠️ 切换失败：{str(e)[:180]}", show_alert=True)
