@@ -1268,8 +1268,11 @@ async def _jj_set_one_year_date(page):
         # 返回 False，由上层继续使用订单号查询；若控件存在则一定设置一年范围。
         return False
 
-    start_value = start.strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    end_value = now.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    # JJ 這個搜尋頁的日期欄位是一般文字欄位，實際頁面顯示格式為
+    # YYYY/MM/DD HH:MM。不要把 ISO datetime 直接塞進去，否則 Rails/Ransack
+    # 可能會把條件解析成空值或錯誤格式。
+    start_value = start.strftime("%Y/%m/%d %H:%M")
+    end_value = now.strftime("%Y/%m/%d %H:%M")
 
     async def set_value(loc, value):
         await loc.evaluate(
@@ -1286,6 +1289,12 @@ async def _jj_set_one_year_date(page):
     await set_value(start_input, start_value)
     await set_value(end_input, end_value)
     await page.wait_for_timeout(300)
+    try:
+        actual_start = await start_input.input_value()
+        actual_end = await end_input.input_value()
+        _debug_log(f"[JJ] 建立日期已設定：{actual_start!r} -> {actual_end!r}")
+    except Exception:
+        pass
     return True
 
 
@@ -1335,38 +1344,116 @@ async def _jj_find_order_input(page, kind):
 
 
 async def _jj_search(page, order_no, kind):
+    """JJ 出貨管理搜尋。
+
+    出貨管理有兩個订单号欄位：
+      1) 平台订单号 -> q[id_eq]
+      2) 其他订单号 -> q[merchant_order_id_or_order_trade_id_eq]
+
+    这里每次搜索都会先清空两个订单号字段，再只填写当前要搜索的字段，
+    并直接提交 #guest_payment_order_search。搜索完成后优先检查真实结果行：
+      tr#guest_payment_order_<完整UUID>
+    这是当前 JJ 页面 DevTools 已确认的最可靠结果判定方式。
+    """
     inp = await _jj_find_order_input(page, kind)
-    await inp.fill("")
-    await inp.fill(order_no)
-
-    # 搜索按钮必须限制在 guest_payment_order_search 表单内，避免点到页面其他按钮。
     form = page.locator("#guest_payment_order_search").first
-    search_btn = None
-    if await form.count():
-        search_btn = await _first_visible(form, [
-            "input[type='submit']",
-            "button[type='submit']",
-            "input[value*='搜']",
-            "button:has-text('搜索')",
-            "button:has-text('搜尋')",
-        ], timeout=3000)
+    if not await form.count():
+        raise Exception("JJ 出货管理找不到【guest_payment_order_search】搜索表单")
 
+    # 清空两个订单号栏位，避免前一次搜索条件残留。
+    all_order_inputs = [
+        "#q_id_eq",
+        "input[name='q[id_eq]']",
+        "#q_id",
+        "input[name='q[id]']",
+        "#q_merchant_order_id_or_order_trade_id_eq",
+        "input[name='q[merchant_order_id_or_order_trade_id_eq]']",
+        "#q_merchant_order_id_or_order_trade_id",
+        "input[name='q[merchant_order_id_or_order_trade_id]']",
+    ]
+    cleared = set()
+    for selector in all_order_inputs:
+        try:
+            loc = form.locator(selector).first
+            if await loc.count():
+                ident = await loc.get_attribute("id") or selector
+                if ident not in cleared:
+                    await loc.fill("")
+                    cleared.add(ident)
+        except Exception:
+            continue
+
+    await inp.fill(order_no)
+    _debug_log(
+        f"[JJ] 出货管理准备搜索：kind={kind}, order={order_no}, "
+        f"input_id={await inp.get_attribute('id')}, input_name={await inp.get_attribute('name')}"
+    )
+
+    # 记录提交前 URL，之后等待真正导航/结果刷新。
+    before_url = page.url
+    search_btn = await _first_visible(form, [
+        "input[type='submit']",
+        "button[type='submit']",
+        "input[value*='搜']",
+        "button:has-text('搜索')",
+        "button:has-text('搜尋')",
+    ], timeout=3000)
+
+    submitted = False
     try:
         if search_btn:
             await search_btn.click()
+            submitted = True
         else:
             await inp.press("Enter")
-    except Exception:
-        await inp.press("Enter")
-
-    # 搜索后等待真正的结果行出现；截图确认结果行 id 为 guest_payment_order_<UUID>。
-    try:
-        await page.locator(f"xpath=//tr[@id='guest_payment_order_{order_no}']").wait_for(state="attached", timeout=15000)
-    except Exception:
+            submitted = True
+    except Exception as e:
+        _debug_log(f"[JJ] 点击搜索按钮失败，改用 Enter：{e!r}")
         try:
-            await page.locator("span.short-uuid[data-origin-uuid]").first.wait_for(state="attached", timeout=5000)
+            await inp.press("Enter")
+            submitted = True
         except Exception:
-            await page.wait_for_timeout(1000)
+            pass
+
+    if not submitted:
+        raise Exception(f"JJ 出货管理【{kind}】搜索提交失败")
+
+    # 先给正常页面导航一点时间。
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(700)
+
+    _debug_log(f"[JJ] 出货管理搜索提交后 URL={page.url}")
+
+    # 结果行：当前页面已确认的真实 DOM。
+    exact_selector = f"xpath=//tr[@id='guest_payment_order_{order_no}']"
+    try:
+        await page.locator(exact_selector).wait_for(state="attached", timeout=15000)
+        _debug_log(f"[JJ] 出货管理直接找到目标结果行：guest_payment_order_{order_no}")
+        return
+    except Exception:
+        pass
+
+    # 如果输入的是其他订单号，结果 tr 的 id 可能不是输入值；用 short-uuid 的
+    # data-origin-uuid / 行文字继续等待一次。
+    try:
+        uuid_node = page.locator(
+            f"span.short-uuid[data-origin-uuid='{order_no}']"
+        ).first
+        if await uuid_node.count():
+            _debug_log(f"[JJ] 出货管理通过 data-origin-uuid 找到订单：{order_no}")
+            return
+    except Exception:
+        pass
+
+    # 最后等待页面刷新完成后再返回，让上层用 _locate_jj_result_row 做一次完整扫描。
+    await page.wait_for_timeout(1500)
+    _debug_log(
+        f"[JJ] 出货管理暂未定位到目标 tr：order={order_no}, "
+        f"before_url={before_url}, after_url={page.url}"
+    )
 
 
 
@@ -2575,17 +2662,54 @@ async def _query_jj_order(single_order_no, task_id):
 
             # 先查平台订单号。
             await _jj_search(page, single_order_no, "platform")
-            headers, cells = await _extract_jj_row(page, single_order_no)
 
-            # 如果平台订单号没有结果，再查其他订单号。
-            if not cells:
+            # 【关键修正】当前 JJ 页面已确认真实结果行就是：
+            # <tr id="guest_payment_order_<完整UUID>">
+            # 因此先直接定位这个 tr，再从这个 tr 读取所有字段。
+            result_row = await _locate_jj_result_row(page, single_order_no)
+            headers, cells = ([], [])
+            if result_row is not None and await result_row.count():
+                try:
+                    cells_loc = result_row.locator(":scope > td")
+                    cell_count = await cells_loc.count()
+                    cells = [_clean_text_value(await cells_loc.nth(i).inner_text())
+                             for i in range(cell_count)]
+                    table = result_row.locator("xpath=ancestor::table[1]").first
+                    if await table.count():
+                        ths = table.locator("thead > tr > th")
+                        headers = [_normalize_header(await ths.nth(i).inner_text())
+                                   for i in range(await ths.count())]
+                    _debug_log(f"[出货] 平台订单号直接命中结果行：cells={len(cells)}, result_row=True")
+                except Exception as e:
+                    _debug_log(f"[出货] 目标结果行读取失败：{e!r}")
+
+            # 如果平台订单号确实没有命中结果行，再查第二个“其他订单号”栏位。
+            if not result_row or not await result_row.count():
+                _debug_log(f"[出货] 平台订单号未命中结果行，改查【其他订单号】：order={single_order_no}")
                 await _jj_search(page, single_order_no, "other")
-                headers, cells = await _extract_jj_row(page, single_order_no)
+                result_row = await _locate_jj_result_row(page, single_order_no)
+                if result_row is not None and await result_row.count():
+                    try:
+                        cells_loc = result_row.locator(":scope > td")
+                        cell_count = await cells_loc.count()
+                        cells = [_clean_text_value(await cells_loc.nth(i).inner_text())
+                                 for i in range(cell_count)]
+                        table = result_row.locator("xpath=ancestor::table[1]").first
+                        if await table.count():
+                            ths = table.locator("thead > tr > th")
+                            headers = [_normalize_header(await ths.nth(i).inner_text())
+                                       for i in range(await ths.count())]
+                        _debug_log(f"[出货] 其他订单号命中结果行：cells={len(cells)}, result_row=True")
+                    except Exception as e:
+                        _debug_log(f"[出货] 其他订单号目标结果行读取失败：{e!r}")
 
-            if not cells:
+            # 只有真正找不到目标结果行，才认定 JJ 出货订单不存在。
+            if result_row is None or not await result_row.count():
                 raise JJOrderNotFound(f"JJ 找不到订单：{single_order_no}")
 
-            result_row = await _locate_jj_result_row(page, single_order_no)
+            # 极少数页面版本无法直接读取 td 时，再使用旧的通用解析器作为兜底。
+            if not cells:
+                headers, cells = await _extract_jj_row(page, single_order_no)
 
             # ===== JJ 状态判断：必须只从“目标订单那一行”读取 =====
             # 你提供的 DevTools 已确认：目标结果是
@@ -3483,6 +3607,11 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                 failed_pdd_results = []
                 failed_outbound_results = []
                 not_found_results = []
+                payment_mismatch_results = []
+                outbound_error_results = []
+                recharge_error_results = []
+                pdd_error_results = []
+                withdraw_error_results = []
 
                 # 重要：绝大多数订单来自出货管理，所以每一笔都先查出货管理。
                 # 只有出货管理完全找不到，才进入拼多多订单管理。
@@ -3508,19 +3637,14 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         _debug_log(f"[出货] not-found detail: {outbound_not_found!r}")
                         outbound_result = None
                     except Exception as outbound_error:
-                        # 任何“找到订单之后”的异常（例如收款号读取失败）都属于
-                        # 出货管理异常，绝不能因为文字里出现“找不到”就误分流 PDD。
-                        _debug_log(f"[出货] 查询/处理异常，禁止分流 PDD: order={order_no}, repr={outbound_error!r}")
+                        # 出货管理已经进入查询/处理阶段后，任何异常都只影响当前订单。
+                        # 特别是“收款帐户详情页读取失败”，绝不能误分流到 PDD，
+                        # 但也不能中断后面的订单；当前订单记为异常后继续下一笔。
+                        _debug_log(f"[出货] 查询/处理异常，当前订单记异常并继续下一笔，禁止分流 PDD: order={order_no}, repr={outbound_error!r}")
                         _debug_log(traceback.format_exc())
                         outbound_error_text = str(outbound_error) or repr(outbound_error)
-                        safe_err = html.escape(outbound_error_text)
-                        await status_msg.edit_text(
-                            result_text +
-                            f"\n\n⚠️ <b>出货管理查询异常</b>\n订单号：<code>{html.escape(order_no)}</code>\n<code>{safe_err}</code>",
-                            reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
-                            parse_mode="HTML", disable_web_page_preview=True
-                        )
-                        return
+                        outbound_error_results.append((order_no, outbound_error_text))
+                        continue
 
                     if outbound_result is not None:
                         # 出货管理命中 = 充值流程，成功订单必须核对收款号。
@@ -3531,18 +3655,17 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
 
                         actual_payment_account = outbound_result.get("payment_account", "")
                         if not _payment_account_matches(expected_payment_account, actual_payment_account):
-                            expected_display = html.escape(expected_payment_account or "未读取")
-                            actual_display = html.escape(actual_payment_account or "未读取")
-                            await status_msg.edit_text(
-                                result_text +
-                                "\n\n❌ <b>收款号与订单号不符</b>" +
-                                f"\n订单号：<code>{html.escape(order_no)}</code>" +
-                                f"\n输入收款号：<code>{expected_display}</code>" +
-                                f"\nJJ收款号：<code>{actual_display}</code>",
-                                reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
-                                parse_mode="HTML", disable_web_page_preview=True
+                            # 收款号不符只记录当前订单，必须继续制作下一笔订单。
+                            payment_mismatch_results.append({
+                                "order_no": order_no,
+                                "expected": expected_payment_account or "未读取",
+                                "actual": actual_payment_account or "未读取",
+                            })
+                            _debug_log(
+                                f"[出货] 收款号不符，跳过当前充值并继续下一笔: "
+                                f"order={order_no}, expected={expected_payment_account!r}, actual={actual_payment_account!r}"
                             )
-                            return
+                            continue
 
                         try:
                             await status_msg.edit_text(
@@ -3557,16 +3680,13 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                             recharge_result = await _single_recharge(final_account, outbound_result, parsed_info, task_id)
                             recharge_results.append((outbound_result, recharge_result))
                         except Exception as recharge_error:
-                            safe_recharge = html.escape(str(recharge_error))
-                            await status_msg.edit_text(
-                                result_text +
-                                f"\n\n第 {idx}/{len(order_numbers)} 笔订单：<code>{html.escape(order_no)}</code>" +
-                                "\n订单状态：<b>成功</b>" +
-                                f"\n❌ <b>新增充值失败</b>\n<code>{safe_recharge}</code>",
-                                reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
-                                parse_mode="HTML", disable_web_page_preview=True
+                            recharge_error_text = str(recharge_error) or repr(recharge_error)
+                            recharge_error_results.append((order_no, recharge_error_text))
+                            _debug_log(
+                                f"[充值] 当前订单新增充值失败，继续下一笔: order={order_no}, repr={recharge_error!r}"
                             )
-                            return
+                            _debug_log(traceback.format_exc())
+                            continue
                         continue
 
                     # --------------------------------------------------
@@ -3575,18 +3695,14 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                     try:
                         pdd_result = await _jj_query_pdd_order(order_no, task_id)
                     except Exception as pdd_error:
-                        _debug_log(f"[PDD] 查询异常 order={order_no}: repr={pdd_error!r}")
+                        # PDD 当前订单查询异常也不应阻断后面的订单。
+                        _debug_log(f"[PDD] 查询异常，当前订单记异常并继续下一笔: order={order_no}, repr={pdd_error!r}")
                         _debug_log("[PDD] 完整 Traceback 开始")
                         _debug_log(traceback.format_exc())
                         _debug_log("[PDD] 完整 Traceback 结束")
-                        safe_pdd = html.escape(str(pdd_error) or repr(pdd_error) or "未知异常（str 为空）")
-                        await status_msg.edit_text(
-                            result_text +
-                            f"\n\n⚠️ <b>拼多多订单查询异常</b>\n订单号：<code>{html.escape(order_no)}</code>\n<code>{safe_pdd}</code>",
-                            reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
-                            parse_mode="HTML", disable_web_page_preview=True
-                        )
-                        return
+                        pdd_error_text = str(pdd_error) or repr(pdd_error) or "未知异常（str 为空）"
+                        pdd_error_results.append((order_no, pdd_error_text))
+                        continue
 
                     if pdd_result is None:
                         not_found_results.append(order_no)
@@ -3610,16 +3726,13 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         withdraw_result = await _single_withdraw(final_account, pdd_result, task_id)
                         withdraw_results.append((pdd_result, withdraw_result))
                     except Exception as withdraw_error:
-                        safe_withdraw = html.escape(str(withdraw_error))
-                        await status_msg.edit_text(
-                            result_text +
-                            f"\n\n第 {idx}/{len(order_numbers)} 笔订单：<code>{html.escape(order_no)}</code>" +
-                            "\n订单状态：<b>成功</b>" +
-                            f"\n❌ <b>新增提现失败</b>\n<code>{safe_withdraw}</code>",
-                            reply_markup=build_main_keyboard(final_account, initial_skin, backend="single"),
-                            parse_mode="HTML", disable_web_page_preview=True
+                        withdraw_error_text = str(withdraw_error) or repr(withdraw_error)
+                        withdraw_error_results.append((order_no, withdraw_error_text))
+                        _debug_log(
+                            f"[提现] 当前订单新增提现失败，继续下一笔: order={order_no}, repr={withdraw_error!r}"
                         )
-                        return
+                        _debug_log(traceback.format_exc())
+                        continue
 
                 # 所有订单都按“命中页面决定制作类型”完成后，再统一汇总。
                 lines = [result_text, ""]
@@ -3637,6 +3750,52 @@ async def run_shop_worker(status_msg, parsed_info, task_id: str, is_single=False
                         lines.append(
                             f"提现 {idx}：<code>{html.escape(jj_result.get('order_no', ''))}</code> "
                             f"→ <b>{html.escape(withdraw_result)}</b>"
+                        )
+
+                if payment_mismatch_results:
+                    lines.append("")
+                    lines.append("❌ <b>收款号不符（这些订单未制作充值）：</b>")
+                    for item in payment_mismatch_results:
+                        lines.append(
+                            f"订单号：<code>{html.escape(item['order_no'])}</code>"
+                            f"\n　输入收款号：<code>{html.escape(item['expected'])}</code>"
+                            f"\n　JJ收款号：<code>{html.escape(item['actual'])}</code>"
+                        )
+
+                if outbound_error_results:
+                    lines.append("")
+                    lines.append("⚠️ <b>出货管理处理异常（已跳过并继续下一笔）：</b>")
+                    for order_no, error_text in outbound_error_results:
+                        lines.append(
+                            f"订单号：<code>{html.escape(order_no)}</code>"
+                            f"\n　原因：<code>{html.escape(error_text[:500])}</code>"
+                        )
+
+                if recharge_error_results:
+                    lines.append("")
+                    lines.append("⚠️ <b>商户充值制作失败（已跳过并继续下一笔）：</b>")
+                    for order_no, error_text in recharge_error_results:
+                        lines.append(
+                            f"订单号：<code>{html.escape(order_no)}</code>"
+                            f"\n　原因：<code>{html.escape(error_text[:500])}</code>"
+                        )
+
+                if pdd_error_results:
+                    lines.append("")
+                    lines.append("⚠️ <b>拼多多查询异常（已跳过并继续下一笔）：</b>")
+                    for order_no, error_text in pdd_error_results:
+                        lines.append(
+                            f"订单号：<code>{html.escape(order_no)}</code>"
+                            f"\n　原因：<code>{html.escape(error_text[:500])}</code>"
+                        )
+
+                if withdraw_error_results:
+                    lines.append("")
+                    lines.append("⚠️ <b>商户提现制作失败（已跳过并继续下一笔）：</b>")
+                    for order_no, error_text in withdraw_error_results:
+                        lines.append(
+                            f"订单号：<code>{html.escape(order_no)}</code>"
+                            f"\n　原因：<code>{html.escape(error_text[:500])}</code>"
                         )
 
                 if failed_outbound_results:
